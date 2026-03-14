@@ -1,184 +1,268 @@
 from PIL import Image, ImageDraw, ImageFont
-import io, os, asyncio, logging, pytz, aiohttp
-from datetime import datetime
-from telegram import Bot
+import io, os
 
-log = logging.getLogger(__name__)
+W, H = 960, 720
 
-BG        = "#0d0d0d"
-CARD_BG   = "#1a1a1a"
-CARD2_BG  = "#141414"
-WHITE     = "#ffffff"
-GRAY      = "#888888"
-LGRAY     = "#555555"
-GREEN     = "#1d9e75"
-RED       = "#e24b4a"
-AMBER     = "#f59e0b"
-BLUE      = "#3b82f6"
-
-W, H = 900, 1080
+BG_TOP    = (10, 10, 18)
+BG_BOT    = (18, 18, 30)
+CARD_BG   = (20, 20, 32)
+CARD2     = (14, 14, 22)
+LINE_COL  = (42, 42, 58)
+WHITE     = (255, 255, 255)
+LGRAY     = (100, 100, 120)
+DGRAY     = (50, 50, 65)
+GREEN     = (29, 158, 117)
+GREEN_DIM = (29, 158, 117, 30)
+RED       = (226, 75, 74)
+AMBER     = (245, 158, 11)
+BLUE      = (59, 130, 246)
 
 def load_font(size, bold=False):
-    paths = [
+    candidates = [
         f"/usr/share/fonts/truetype/dejavu/DejaVuSans{'-Bold' if bold else ''}.ttf",
         f"/usr/share/fonts/truetype/liberation/LiberationSans{'-Bold' if bold else '-Regular'}.ttf",
-        f"/System/Library/Fonts/Helvetica.ttc",
-        f"/System/Library/Fonts/Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
     ]
-    for p in paths:
+    for p in candidates:
         if os.path.exists(p):
-            return ImageFont.truetype(p, size)
+            try:
+                return ImageFont.truetype(p, size)
+            except:
+                pass
     return ImageFont.load_default()
 
 def rsi_color(v):
     if v > 70: return RED
     if v < 30: return GREEN
     if v < 40 or v > 60: return AMBER
-    return GRAY
+    return LGRAY
 
 def signal_color(action):
-    if "ПОКУПАТЬ" in action:    return GREEN
-    if "НАКАПЛИВАТЬ" in action: return BLUE
-    if "ПРОДАВАТЬ" in action:   return RED
-    if "ОСТОРОЖНО" in action:   return AMBER
-    return GRAY
+    if action == "ПОКУПАТЬ":    return GREEN
+    if action == "НАКАПЛИВАТЬ": return BLUE
+    if action == "ПРОДАВАТЬ":   return RED
+    if action == "ОСТОРОЖНО":   return AMBER
+    return LGRAY
 
-def fg_color(v):
-    if v <= 25: return RED
-    if v <= 45: return AMBER
-    if v <= 55: return GRAY
-    if v <= 75: return GREEN
-    return GREEN
+def draw_rect(draw, x1, y1, x2, y2, fill, radius=12):
+    r = radius
+    draw.rectangle([x1+r, y1, x2-r, y2], fill=fill)
+    draw.rectangle([x1, y1+r, x2, y2-r], fill=fill)
+    for cx, cy in [(x1,y1),(x2-2*r,y1),(x1,y2-2*r),(x2-2*r,y2-2*r)]:
+        draw.ellipse([cx, cy, cx+2*r, cy+2*r], fill=fill)
 
-def draw_rounded_rect(draw, xy, radius, fill):
-    x1,y1,x2,y2 = xy
-    draw.rectangle([x1+radius,y1,x2-radius,y2], fill=fill)
-    draw.rectangle([x1,y1+radius,x2,y2-radius], fill=fill)
-    draw.ellipse([x1,y1,x1+2*radius,y1+2*radius], fill=fill)
-    draw.ellipse([x2-2*radius,y1,x2,y1+2*radius], fill=fill)
-    draw.ellipse([x1,y2-2*radius,x1+2*radius,y2], fill=fill)
-    draw.ellipse([x2-2*radius,y2-2*radius,x2,y2], fill=fill)
+def draw_bar_full(draw, x, y, w, h, pct, color, bg=DGRAY):
+    draw_rect(draw, x, y, x+w, y+h, bg, h//2)
+    if pct > 0.01:
+        fw = max(int(w * min(pct, 1.0)), h)
+        draw_rect(draw, x, y, x+fw, y+h, color, h//2)
 
-def draw_bar(draw, x, y, w, h, pct, color, bg="#2a2a2a"):
-    draw_rounded_rect(draw, [x,y,x+w,y+h], h//2, bg)
-    if pct > 0:
-        fw = max(int(w * min(pct,1.0)), h)
-        draw_rounded_rect(draw, [x,y,x+fw,y+h], h//2, color)
+def text_w(draw, text, font):
+    bb = draw.textbbox((0,0), text, font=font)
+    return bb[2] - bb[0]
 
-def generate_dashboard(data: dict) -> bytes:
-    img  = Image.new("RGB", (W, H), BG)
+def generate_coin_card(coin: dict, global_data: dict) -> bytes:
+    img  = Image.new("RGB", (W, H), BG_TOP)
     draw = ImageDraw.Draw(img)
 
-    f32b = load_font(32, bold=True)
-    f28b = load_font(28, bold=True)
-    f24b = load_font(24, bold=True)
-    f22  = load_font(22)
-    f20b = load_font(20, bold=True)
-    f18  = load_font(18)
-    f16  = load_font(16)
-    f14  = load_font(14)
+    for y in range(H):
+        t = y / H
+        r = int(BG_TOP[0] + (BG_BOT[0]-BG_TOP[0])*t)
+        g = int(BG_TOP[1] + (BG_BOT[1]-BG_TOP[1])*t)
+        b = int(BG_TOP[2] + (BG_BOT[2]-BG_TOP[2])*t)
+        draw.line([(0,y),(W,y)], fill=(r,g,b))
 
-    # ── HEADER ────────────────────────────────────────────────────────────────
-    draw.text((40, 28), "TY SMITH", font=f32b, fill=WHITE)
-    draw.text((40, 66), "SIGNAL REPORT", font=f22, fill=GRAY)
-    now = data.get("time", "")
-    draw.text((W-40, 28), now, font=f18, fill=GRAY, anchor="ra")
-    draw.text((W-40, 54), "МСК", font=f14, fill=LGRAY, anchor="ra")
-    draw.line([(40, 100), (W-40, 100)], fill="#2a2a2a", width=1)
+    sig_col = signal_color(coin["action"])
 
-    # ── GLOBAL BLOCK ──────────────────────────────────────────────────────────
-    draw_rounded_rect(draw, [40, 112, W-40, 210], 10, CARD_BG)
+    for i in range(40):
+        alpha = int(15 * (1 - i/40))
+        draw.ellipse([W-220+i, -80+i, W+80-i, 220-i], fill=(*sig_col, alpha) if len(sig_col)==3 else sig_col)
 
-    fg    = data.get("fg", {})
-    dom   = data.get("dom", {})
-    fg_v  = fg.get("value", 50)
-    fg_l  = fg.get("label", "Neutral")
-    fg_d  = fg.get("delta", "0")
-    dom_v = dom.get("dom", 50.0)
-    dom_s = dom.get("sig", "")
+    fb = load_font(13, bold=True)
+    f = load_font(13)
+    f12 = load_font(12)
+    f11 = load_font(11)
+    f36b = load_font(36, bold=True)
+    f26b = load_font(26, bold=True)
+    f22b = load_font(22, bold=True)
+    f18b = load_font(18, bold=True)
+    f16b = load_font(16, bold=True)
+    f15b = load_font(15, bold=True)
 
-    draw.text((60, 125), "FEAR & GREED", font=f14, fill=GRAY)
-    draw.text((60, 145), str(fg_v), font=f28b, fill=fg_color(fg_v))
-    draw.text((60+60, 155), f"/100  {fg_l}  Δ{fg_d}", font=f16, fill=GRAY)
-    draw_bar(draw, 60, 182, 340, 8, fg_v/100, fg_color(fg_v))
+    PAD = 36
 
-    draw.line([(W//2, 118), (W//2, 202)], fill="#2a2a2a", width=1)
+    # ── SYMBOL + NAME ────────────────────────────────────────────────────────
+    draw_rect(draw, PAD, PAD, PAD+80, PAD+34, (*sig_col, 40) if False else CARD2, 8)
+    draw.rectangle([PAD, PAD, PAD+80, PAD+34], fill=CARD2)
+    draw.text((PAD+10, PAD+8), coin["symbol"], font=fb, fill=sig_col)
 
-    draw.text((W//2+20, 125), "BTC DOMINANCE", font=f14, fill=GRAY)
-    draw.text((W//2+20, 145), f"{dom_v}%", font=f28b, fill=BLUE)
-    short_sig = dom_s.split("—")[-1].strip() if "—" in dom_s else dom_s
-    draw.text((W//2+20, 178), short_sig[:32], font=f14, fill=GRAY)
-    draw_bar(draw, W//2+20, 195, 340, 8, dom_v/100, BLUE)
+    draw.text((PAD+90, PAD+8), "by TY SMITH SIGNALS", font=f11, fill=DGRAY)
 
-    # ── COIN CARDS ────────────────────────────────────────────────────────────
-    coins = data.get("coins", [])
-    cols, rows = 2, 2
-    cw = (W - 40 - 40 - 16) // 2
-    ch = 190
-    start_y = 226
+    price_str = f"${coin['price']:,.0f}"
+    draw.text((PAD, PAD+50), price_str, font=f36b, fill=WHITE)
 
-    for i, coin in enumerate(coins[:4]):
-        col = i % cols
-        row = i // cols
-        cx = 40 + col * (cw + 16)
-        cy = start_y + row * (ch + 14)
+    chg = coin["change"]
+    chg_str = f"+{chg:.2f}%" if chg >= 0 else f"{chg:.2f}%"
+    chg_col = GREEN if chg >= 0 else RED
+    pw = text_w(draw, price_str, f36b)
+    draw.rectangle([PAD+pw+16, PAD+62, PAD+pw+16+len(chg_str)*9+16, PAD+84], fill=CARD2)
+    draw.text((PAD+pw+24, PAD+64), chg_str, font=fb, fill=chg_col)
 
-        sig_col = signal_color(coin.get("action",""))
-        draw_rounded_rect(draw, [cx, cy, cx+cw, cy+ch], 10, CARD2_BG)
-        draw.rectangle([cx, cy, cx+4, cy+ch], fill=sig_col)
+    draw.text((PAD, PAD+98), f"Vol 24h: ${coin['vol']/1e9:.2f}B   Cap: ${coin['mcap']/1e9:.1f}B", font=f12, fill=LGRAY)
 
-        # Symbol + price
-        draw.text((cx+18, cy+14), coin["symbol"], font=f24b, fill=WHITE)
-        chg = coin.get("change", 0)
-        chg_col = GREEN if chg >= 0 else RED
-        chg_str = f"+{chg:.2f}%" if chg >= 0 else f"{chg:.2f}%"
-        draw.text((cx+18, cy+44), f"${coin['price']:,.0f}", font=f20b, fill=WHITE)
-        draw.text((cx+cw-16, cy+48), chg_str, font=f16, fill=chg_col, anchor="ra")
+    draw.line([(PAD, PAD+120), (W-PAD, PAD+120)], fill=LINE_COL, width=1)
 
-        draw.line([(cx+14, cy+72), (cx+cw-14, cy+72)], fill="#2a2a2a", width=1)
+    # ── SIGNAL BADGE ─────────────────────────────────────────────────────────
+    bx = W - PAD - 180
+    draw_rect(draw, bx, PAD+36, bx+180, PAD+110, CARD2, 12)
+    draw.rectangle([bx, PAD+36, bx+4, PAD+110], fill=sig_col)
+    draw.text((bx+16, PAD+42), "СИГНАЛ", font=f11, fill=LGRAY)
+    draw.text((bx+16, PAD+60), coin["action"], font=f18b, fill=sig_col)
+    draw.text((bx+16, PAD+86), f"Score: {coin['score']:+d}   {coin['conf']}", font=f11, fill=LGRAY)
 
-        # RSI bars
-        rsi_y = cy + 82
-        for label, val in [("RSI-6", coin.get("rsi6",50)), ("RSI-12", coin.get("rsi12",50)), ("RSI-24", coin.get("rsi24",50))]:
-            rc = rsi_color(val)
-            draw.text((cx+18, rsi_y), label, font=f14, fill=GRAY)
-            draw.text((cx+80, rsi_y), str(val), font=f14, fill=rc)
-            draw_bar(draw, cx+115, rsi_y+2, cw-145, 10, val/100, rc)
-            rsi_y += 22
+    # ── TARGET / STOP ────────────────────────────────────────────────────────
+    y0 = PAD + 136
+    draw_rect(draw, PAD, y0, (W-PAD*2-16)//2+PAD, y0+70, CARD2, 10)
+    draw.text((PAD+16, y0+10), "ЦЕЛЬ", font=f11, fill=LGRAY)
+    draw.text((PAD+16, y0+28), f"${coin['target']:,.0f}", font=f22b, fill=GREEN)
+    pct_t = (coin["target"]/coin["price"]-1)*100
+    draw.text((PAD+16, y0+54), f"+{pct_t:.1f}% от текущей цены", font=f11, fill=DGRAY)
 
-        draw.line([(cx+14, cy+154), (cx+cw-14, cy+154)], fill="#2a2a2a", width=1)
+    rx = (W-PAD*2-16)//2+PAD+16
+    draw_rect(draw, rx, y0, W-PAD, y0+70, CARD2, 10)
+    draw.text((rx+16, y0+10), "СТОП-ЛОСС", font=f11, fill=LGRAY)
+    draw.text((rx+16, y0+28), f"${coin['stop']:,.0f}", font=f22b, fill=RED)
+    pct_s = (coin["stop"]/coin["price"]-1)*100
+    draw.text((rx+16, y0+54), f"{pct_s:.1f}% от текущей цены", font=f11, fill=DGRAY)
 
-        # Funding + Signal
-        fr = coin.get("funding_rate", None)
-        fr_src = coin.get("funding_src", "")
-        if fr is not None:
-            fr_col = RED if fr>0.1 else AMBER if fr>0.05 else GREEN
-            draw.text((cx+18, cy+160), f"Funding ({fr_src}): {fr:+.4f}%", font=f14, fill=fr_col)
-        else:
-            draw.text((cx+18, cy+160), "Funding: недоступен", font=f14, fill=LGRAY)
+    # ── RSI SECTION ──────────────────────────────────────────────────────────
+    y1 = y0 + 86
+    draw.text((PAD, y1), "RSI АНАЛИЗ", font=f11, fill=LGRAY)
 
-        # Signal badge
-        action = coin.get("action", "НЕЙТРАЛЬНО")
-        short_action = action.split(" ",1)[1] if " " in action else action
-        badge_w = len(short_action)*9 + 20
-        bx = cx + cw - badge_w - 14
-        draw_rounded_rect(draw, [bx, cy+14, bx+badge_w, cy+36], 8, sig_col+"33")
-        draw.text((bx+badge_w//2, cy+25), short_action, font=f14, fill=sig_col, anchor="mm")
+    rsi_data = [
+        ("RSI-6",  coin["rsi6"],  "скальпинг"),
+        ("RSI-12", coin["rsi12"], "интрадей"),
+        ("RSI-24", coin["rsi24"], "свинг"),
+    ]
+    bar_x  = PAD
+    bar_y  = y1 + 22
+    bar_w  = (W - PAD*2 - 32) // 3
 
-        # Target / Stop
-        t_str = f"🎯 ${coin['target']:,.0f}"
-        s_str = f"🛡 ${coin['stop']:,.0f}"
-        draw.text((cx+18, cy+ch-22), t_str, font=f14, fill=GREEN)
-        draw.text((cx+cw//2, cy+ch-22), s_str, font=f14, fill=RED)
+    for idx, (label, val, timeframe) in enumerate(rsi_data):
+        bx2 = bar_x + idx*(bar_w+16)
+        draw_rect(draw, bx2, bar_y, bx2+bar_w, bar_y+72, CARD2, 10)
+        rc = rsi_color(val)
+        draw.text((bx2+14, bar_y+10), label, font=fb, fill=WHITE)
+        draw.text((bx2+bar_w-14, bar_y+10), timeframe, font=f11, fill=LGRAY)
+        draw.text((bx2+14, bar_y+30), str(val), font=f26b, fill=rc)
+        draw_bar_full(draw, bx2+14, bar_y+58, bar_w-28, 6, val/100, rc)
 
-    # ── FOOTER ────────────────────────────────────────────────────────────────
-    fy = start_y + rows*(ch+14) + 10
-    draw.line([(40, fy), (W-40, fy)], fill="#2a2a2a", width=1)
-    next_h = data.get("next_hour", "")
-    draw.text((40, fy+12), f"Следующий отчёт: {next_h} МСК", font=f16, fill=GRAY)
-    draw.text((W-40, fy+12), "Не является финансовой рекомендацией", font=f14, fill=LGRAY, anchor="ra")
+    r6,r12,r24 = coin["rsi6"],coin["rsi12"],coin["rsi24"]
+    comment_y = bar_y + 80
+    if r6<35 and r12<35 and r24<35:
+        comment = "Все RSI ниже 35 — очень сильный сигнал входа"
+        cc = GREEN
+    elif r6>65 and r12>65 and r24>65:
+        comment = "Все RSI выше 65 — рынок перегрет, осторожно"
+        cc = RED
+    elif abs(r6-r24) > 20:
+        comment = f"RSI расходятся ({r6} vs {r24}) — рынок в переходе"
+        cc = AMBER
+    else:
+        comment = "RSI согласованы — тренд стабилен"
+        cc = LGRAY
+    draw.rectangle([PAD, comment_y, PAD+4, comment_y+24], fill=cc)
+    draw.text((PAD+12, comment_y+4), comment, font=f12, fill=cc)
+
+    # ── INDICATORS ROW ───────────────────────────────────────────────────────
+    y2 = comment_y + 38
+    draw.line([(PAD, y2), (W-PAD, y2)], fill=LINE_COL, width=1)
+    y2 += 12
+
+    indicators = []
+
+    macd = coin.get("macd", 0)
+    macd_str = f"+{macd}" if macd > 0 else str(macd)
+    macd_col = GREEN if macd > 0 else RED
+    indicators.append(("MACD", macd_str, "бычий" if macd>0 else "медвежий", macd_col))
+
+    fr = coin.get("funding_rate")
+    fr_src = coin.get("funding_src","")
+    if fr is not None:
+        fr_str = f"{fr:+.4f}%"
+        if fr > 0.1: fr_col = RED
+        elif fr > 0.05: fr_col = AMBER
+        else: fr_col = GREEN
+        indicators.append((f"FUNDING ({fr_src})", fr_str, coin.get("funding_interp","")[:14], fr_col))
+    else:
+        indicators.append(("FUNDING", "N/A", "нет данных", DGRAY))
+
+    bb_pos = coin.get("bb_pos","н/д")
+    if "нижней" in bb_pos: bb_col = GREEN
+    elif "верхней" in bb_pos: bb_col = RED
+    else: bb_col = AMBER
+    indicators.append(("BOLLINGER", bb_pos[:12], "позиция", bb_col))
+
+    ind_w = (W - PAD*2 - 32) // 3
+    for idx, (lbl, val, sub, col) in enumerate(indicators):
+        ix = PAD + idx*(ind_w+16)
+        draw_rect(draw, ix, y2, ix+ind_w, y2+68, CARD2, 10)
+        draw.text((ix+14, y2+10), lbl, font=f11, fill=LGRAY)
+        draw.text((ix+14, y2+28), val, font=f15b, fill=col)
+        draw.text((ix+14, y2+50), sub, font=f11, fill=DGRAY)
+
+    # ── GLOBAL ROW ───────────────────────────────────────────────────────────
+    y3 = y2 + 84
+    draw.line([(PAD, y3), (W-PAD, y3)], fill=LINE_COL, width=1)
+    y3 += 12
+
+    fg  = global_data.get("fg", {})
+    dom = global_data.get("dom", {})
+
+    gw = (W - PAD*2 - 48) // 4
+    globals_data = []
+
+    if fg.get("ok"):
+        fv = fg["value"]
+        if fv <= 25: fc = RED
+        elif fv <= 45: fc = AMBER
+        elif fv <= 55: fc = LGRAY
+        else: fc = GREEN
+        globals_data.append(("FEAR & GREED", str(fv)+"/100", fg["label"], fc))
+    else:
+        globals_data.append(("FEAR & GREED", "N/A", "", DGRAY))
+
+    if dom.get("ok"):
+        globals_data.append(("BTC DOM", f"{dom['dom']}%", dom["sig"][:16], BLUE))
+        globals_data.append(("РЫНОК", f"${dom['mcap']:,.0f}B", "капитализация", LGRAY))
+        globals_data.append(("ОБЪЁМ 24H", f"${dom['vol']:,.0f}B", "торговый", LGRAY))
+    else:
+        globals_data += [("BTC DOM","N/A","",DGRAY),("РЫНОК","N/A","",DGRAY),("ОБЪЁМ","N/A","",DGRAY)]
+
+    for idx, (lbl, val, sub, col) in enumerate(globals_data):
+        gx = PAD + idx*(gw+16)
+        draw_rect(draw, gx, y3, gx+gw, y3+68, CARD2, 10)
+        draw.text((gx+14, y3+10), lbl, font=f11, fill=LGRAY)
+        draw.text((gx+14, y3+28), val, font=f15b, fill=col)
+        draw.text((gx+14, y3+50), sub[:16], font=f11, fill=DGRAY)
+
+    # ── FOOTER ───────────────────────────────────────────────────────────────
+    now_str = global_data.get("time","")
+    next_h  = global_data.get("next_hour","")
+    draw.line([(PAD, H-36), (W-PAD, H-36)], fill=LINE_COL, width=1)
+    draw.text((PAD, H-26), "TY SMITH SIGNALS  •  Не является финансовой рекомендацией", font=f11, fill=DGRAY)
+    tw = text_w(draw, f"{now_str} МСК  •  след. {next_h}", f11)
+    draw.text((W-PAD-tw, H-26), f"{now_str} МСК  •  след. {next_h}", font=f11, fill=DGRAY)
 
     buf = io.BytesIO()
-    img.save(buf, format="PNG", quality=95)
+    img.save(buf, format="PNG")
     buf.seek(0)
     return buf.read()
+
+def generate_all_cards(data: dict) -> list:
+    cards = []
+    for coin in data.get("coins", []):
+        img_bytes = generate_coin_card(coin, data)
+        cards.append(img_bytes)
+    return cards

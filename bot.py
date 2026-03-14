@@ -5,7 +5,7 @@ import aiohttp
 from telegram import Bot
 from telegram.constants import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from dashboard import generate_dashboard
+from dashboard import generate_all_cards
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -47,18 +47,8 @@ async def fetch_fear_greed():
         y = data["data"][1]
         val = int(t["value"])
         delta = val - int(y["value"])
-        if val <= 20:
-            emoji = "EXTREME FEAR"
-        elif val <= 40:
-            emoji = "FEAR"
-        elif val <= 60:
-            emoji = "NEUTRAL"
-        elif val <= 80:
-            emoji = "GREED"
-        else:
-            emoji = "EXTREME GREED"
         sign = "+" if delta >= 0 else ""
-        return {"value": val, "label": t["value_classification"], "emoji": emoji, "delta": f"{sign}{delta}", "ok": True}
+        return {"value": val, "label": t["value_classification"], "delta": f"{sign}{delta}", "ok": True}
     except Exception as e:
         log.error(f"FG error: {e}")
         return {"ok": False}
@@ -77,7 +67,7 @@ async def fetch_dominance():
             sig = "Альты могут расти"
         else:
             sig = "Альт-сезон!"
-        return {"dom": round(dom, 1), "sig": sig, "mcap": round(mcap/1e9, 0), "vol": round(vol/1e9, 0), "ok": True}
+        return {"dom": round(dom,1), "sig": sig, "mcap": round(mcap/1e9,0), "vol": round(vol/1e9,0), "ok": True}
     except Exception as e:
         log.error(f"DOM error: {e}")
         return {"ok": False}
@@ -88,16 +78,16 @@ async def fetch_funding_bybit(symbol):
         data = await get(url)
         rate = float(data["result"]["list"][0]["fundingRate"]) * 100
         if rate > 0.15:
-            interp = "Перегрев лонгов - риск слива"
+            interp = "Перегрев лонгов"
         elif rate > 0.05:
             interp = "Лонги доминируют"
         elif rate > -0.02:
             interp = "Нейтрально"
         elif rate > -0.08:
-            interp = "Шорты доминируют - возможен сквиз"
+            interp = "Шорты доминируют"
         else:
             interp = "Перегрев шортов"
-        return {"rate": round(rate, 4), "interp": interp, "ok": True, "source": "Bybit"}
+        return {"rate": round(rate,4), "interp": interp, "ok": True, "source": "Bybit"}
     except:
         return {"ok": False}
 
@@ -107,16 +97,16 @@ async def fetch_funding_okx(symbol):
         data    = await get(f"https://www.okx.com/api/v5/public/funding-rate?instId={okx_sym}")
         rate    = float(data["data"][0]["fundingRate"]) * 100
         if rate > 0.15:
-            interp = "Перегрев лонгов - риск слива"
+            interp = "Перегрев лонгов"
         elif rate > 0.05:
             interp = "Лонги доминируют"
         elif rate > -0.02:
             interp = "Нейтрально"
         elif rate > -0.08:
-            interp = "Шорты доминируют - возможен сквиз"
+            interp = "Шорты доминируют"
         else:
             interp = "Перегрев шортов"
-        return {"rate": round(rate, 4), "interp": interp, "ok": True, "source": "OKX"}
+        return {"rate": round(rate,4), "interp": interp, "ok": True, "source": "OKX"}
     except:
         return {"ok": False}
 
@@ -155,17 +145,17 @@ def calc_macd(closes):
         return e
     if len(closes) < 26:
         return 0, 0, 0
-    m = [a - b for a, b in zip(ema(closes, 12), ema(closes, 26))]
+    m = [a - b for a, b in zip(ema(closes,12), ema(closes,26))]
     s = ema(m, 9)
-    return round(m[-1], 2), round(s[-1], 2), round(m[-1] - s[-1], 2)
+    return round(m[-1],2), round(s[-1],2), round(m[-1]-s[-1],2)
 
 def bollinger(closes, p=20):
     if len(closes) < p:
         return None, None, None
     w   = closes[-p:]
     mid = sum(w) / p
-    std = (sum((x - mid) ** 2 for x in w) / p) ** 0.5
-    return round(mid - 2*std, 0), round(mid, 0), round(mid + 2*std, 0)
+    std = (sum((x-mid)**2 for x in w) / p) ** 0.5
+    return round(mid-2*std,0), round(mid,0), round(mid+2*std,0)
 
 def rsi_label(v):
     if v > 70:
@@ -179,39 +169,21 @@ def rsi_label(v):
 
 def generate_signal(change, r12, mh, price, fr=0, fr_ok=False):
     s = 0
-    if r12 < 30:
-        s += 3
-    elif r12 < 40:
-        s += 2
-    elif r12 < 50:
-        s += 1
-    elif r12 > 75:
-        s -= 3
-    elif r12 > 65:
-        s -= 2
-    elif r12 > 55:
-        s -= 1
-
-    if mh > 0:
-        s += 1
-    else:
-        s -= 1
-
-    if change > 5:
-        s += 2
-    elif change > 2:
-        s += 1
-    elif change < -5:
-        s -= 2
-    elif change < -2:
-        s -= 1
-
+    if r12 < 30:      s += 3
+    elif r12 < 40:    s += 2
+    elif r12 < 50:    s += 1
+    elif r12 > 75:    s -= 3
+    elif r12 > 65:    s -= 2
+    elif r12 > 55:    s -= 1
+    if mh > 0:        s += 1
+    else:             s -= 1
+    if change > 5:    s += 2
+    elif change > 2:  s += 1
+    elif change < -5: s -= 2
+    elif change < -2: s -= 1
     if fr_ok:
-        if fr > 0.1:
-            s -= 1
-        elif fr < -0.05:
-            s += 1
-
+        if fr > 0.1:      s -= 1
+        elif fr < -0.05:  s += 1
     if s >= 4:
         action = "ПОКУПАТЬ"
         conf   = "Высокая"
@@ -237,7 +209,6 @@ def generate_signal(change, r12, mh, price, fr=0, fr_ok=False):
         conf   = "Низкая"
         target = round(price * 1.02, 0)
         stop   = round(price * 0.98, 0)
-
     return {"action": action, "conf": conf, "target": target, "stop": stop, "score": s}
 
 async def collect_data():
@@ -263,18 +234,18 @@ async def collect_data():
             r6     = calc_rsi(closes, 6)
             r12    = calc_rsi(closes, 12)
             r24    = calc_rsi(closes, 24)
-            _, _, mh  = calc_macd(closes)
+            _, _, mh   = calc_macd(closes)
             bl, bm, bh = bollinger(closes)
             fr     = await fetch_funding(meta["bybit"])
-            sig    = generate_signal(change, r12, mh, price, fr=fr.get("rate", 0), fr_ok=fr.get("ok", False))
-            if bl and bh:
-                pct = int((price - bl) / (bh - bl) * 100)
+            sig    = generate_signal(change, r12, mh, price, fr=fr.get("rate",0), fr_ok=fr.get("ok",False))
+            if bl and bh and price:
+                pct = int((price-bl)/(bh-bl)*100)
                 if price <= bl:
-                    bp = "У нижней полосы (поддержка)"
+                    bp = "У нижней полосы"
                 elif price >= bh:
-                    bp = "У верхней полосы (сопротивление)"
+                    bp = "У верхней полосы"
                 else:
-                    bp = f"Середина ({pct}%)"
+                    bp = f"Середина {pct}%"
             else:
                 bp = "н/д"
             result["coins"].append({
@@ -289,8 +260,8 @@ async def collect_data():
                 "macd":           mh,
                 "bb_pos":         bp,
                 "funding_rate":   fr.get("rate") if fr.get("ok") else None,
-                "funding_src":    fr.get("source", ""),
-                "funding_interp": fr.get("interp", ""),
+                "funding_src":    fr.get("source",""),
+                "funding_interp": fr.get("interp",""),
                 "action":         sig["action"],
                 "conf":           sig["conf"],
                 "target":         sig["target"],
@@ -308,63 +279,40 @@ def build_text_report(data):
     L.append("*TY SMITH SIGNAL REPORT v3*")
     L.append(f"Время: {data['time']} МСК")
     L.append("")
-    L.append("*РЫНОЧНЫЙ КОНТЕКСТ*")
     if fg.get("ok"):
         v = fg["value"]
-        L.append(f"  Fear & Greed: *{v}/100* — {fg['label']} (delta {fg['delta']})")
-        if v <= 25:
-            L.append("  -> Экстремальный страх — покупай")
-        elif v <= 45:
-            L.append("  -> Страх — ищи точки входа")
-        elif v <= 55:
-            L.append("  -> Нейтрально")
-        elif v <= 75:
-            L.append("  -> Жадность — будь осторожен")
-        else:
-            L.append("  -> Экстремальная жадность — риск коррекции")
+        L.append(f"Fear & Greed: *{v}/100* — {fg['label']} (delta {fg['delta']})")
     if dom.get("ok"):
-        L.append(f"  BTC Dom: *{dom['dom']}%* — {dom['sig']}")
-        L.append(f"  Капитализация: ${dom['mcap']:,.0f}B  Объём: ${dom['vol']:,.0f}B")
+        L.append(f"BTC Dom: *{dom['dom']}%* — {dom['sig']}")
     L.append("")
     for c in data["coins"]:
         sign = "+" if c["change"] >= 0 else ""
         L.append(f"*{c['symbol']}*  ${c['price']:,.0f}  {sign}{c['change']:.2f}%")
-        L.append("")
-        L.append("  Технический анализ:")
-        L.append(f"  RSI-6:  {c['rsi6']} — {rsi_label(c['rsi6'])} [скальпинг]")
-        L.append(f"  RSI-12: {c['rsi12']} — {rsi_label(c['rsi12'])} [интрадей]")
-        L.append(f"  RSI-24: {c['rsi24']} — {rsi_label(c['rsi24'])} [свинг]")
-        L.append(f"  MACD: {c['macd']} — {'бычий' if c['macd'] > 0 else 'медвежий'}")
-        L.append(f"  Bollinger: {c['bb_pos']}")
-        L.append("")
-        L.append("  Деривативы:")
+        L.append(f"  RSI 6/12/24: {c['rsi6']} / {c['rsi12']} / {c['rsi24']}")
+        L.append(f"  MACD: {c['macd']}  |  {c['bb_pos']}")
         if c["funding_rate"] is not None:
             L.append(f"  Funding ({c['funding_src']}): {c['funding_rate']:+.4f}% — {c['funding_interp']}")
-        else:
-            L.append("  Funding Rate: недоступен")
+        L.append(f"  *{c['action']}* (score {c['score']:+d})")
+        L.append(f"  Цель: ${c['target']:,.0f}  Стоп: ${c['stop']:,.0f}")
         L.append("")
-        L.append(f"  СИГНАЛ: *{c['action']}* ({c['conf']})")
-        L.append(f"  Score: {c['score']:+d}  Цель: ${c['target']:,.0f}  Стоп: ${c['stop']:,.0f}")
-        L.append(f"  Объём: ${c['vol']/1e6:.0f}M  Кап: ${c['mcap']/1e9:.1f}B")
-        L.append("")
-        L.append("---")
-        L.append("")
-    L.append(f"Следующий отчёт: *{data['next_hour']} МСК*")
-    L.append("Не является финансовой рекомендацией. DYOR.")
+    next_hour = (datetime.now(MOSCOW_TZ).hour+1) % 24
+    L.append(f"Следующий отчёт: *{next_hour:02d}:00 МСК*")
+    L.append("Не является финансовой рекомендацией.")
     return "\n".join(L)
 
 async def send_signals():
     log.info("Генерируем отчёт...")
     try:
-        data      = await collect_data()
-        img_bytes = generate_dashboard(data)
-        text      = build_text_report(data)
-        bot       = Bot(token=BOT_TOKEN)
-        await bot.send_photo(
-            chat_id=CHAT_ID,
-            photo=io.BytesIO(img_bytes),
-            caption="Ty Smith Dashboard"
-        )
+        data  = await collect_data()
+        cards = generate_all_cards(data)
+        text  = build_text_report(data)
+        bot   = Bot(token=BOT_TOKEN)
+        for card_bytes in cards:
+            await bot.send_photo(
+                chat_id=CHAT_ID,
+                photo=io.BytesIO(card_bytes)
+            )
+            await asyncio.sleep(1)
         if len(text) > 4000:
             text = text[:3990] + "\n...обрезано"
         await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.MARKDOWN)
