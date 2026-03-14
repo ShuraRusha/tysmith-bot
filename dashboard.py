@@ -1,7 +1,6 @@
-from download_fonts import ensure_fonts
-ensure_fonts()
 from PIL import Image, ImageDraw, ImageFont
-import io, os
+import io, os, base64, tempfile
+from fonts_data import NUNITO_REGULAR, NUNITO_BOLD
 
 W, H = 1080, 810
 
@@ -18,23 +17,27 @@ RED    = (235, 70, 70)
 AMBER  = (245, 165, 30)
 BLUE   = (80, 150, 255)
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+_FONT_CACHE = {}
+
+def _write_font(name, b64data):
+    path = os.path.join(tempfile.gettempdir(), name)
+    if not os.path.exists(path):
+        with open(path, 'wb') as f:
+            f.write(base64.b64decode(b64data))
+    return path
+
+REG_PATH  = _write_font("Nunito-Regular.ttf", NUNITO_REGULAR)
+BOLD_PATH = _write_font("Nunito-Bold.ttf",    NUNITO_BOLD)
 
 def font(size, bold=False):
-    name = "Nunito-Bold.ttf" if bold else "Nunito-Regular.ttf"
-    local = os.path.join(BASE, name)
-    if os.path.exists(local):
-        return ImageFont.truetype(local, size)
-    for p in [
-        f"/usr/share/fonts/truetype/dejavu/DejaVuSans{'-Bold' if bold else ''}.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]:
-        if os.path.exists(p):
-            return ImageFont.truetype(p, size)
-    return ImageFont.load_default()
+    key = (size, bold)
+    if key not in _FONT_CACHE:
+        path = BOLD_PATH if bold else REG_PATH
+        _FONT_CACHE[key] = ImageFont.truetype(path, size)
+    return _FONT_CACHE[key]
 
 def tw(draw, text, f):
-    bb = draw.textbbox((0, 0), text, font=f)
+    bb = draw.textbbox((0,0), text, font=f)
     return bb[2] - bb[0]
 
 def rnd(draw, x1, y1, x2, y2, fill, r=14):
@@ -77,7 +80,7 @@ def generate_coin_card(coin, gdata):
         b = int(BG_TOP[2] + (BG_BOT[2]-BG_TOP[2])*t)
         drw.line([(0,y),(W,y)], fill=(r,g,b))
 
-    sc = sig_col(coin.get("action", "НЕЙТРАЛЬНО"))
+    sc = sig_col(coin.get("action","НЕЙТРАЛЬНО"))
     P  = 42
 
     f11 = font(22)
@@ -91,12 +94,10 @@ def generate_coin_card(coin, gdata):
 
     drw.rectangle([0, 0, W, 5], fill=sc)
 
-    # SYMBOL
     rnd(drw, P, P+4, P+110, P+46, CARD2, 8)
     drw.text((P+14, P+12), coin.get("symbol","?"), font=fb, fill=sc)
     drw.text((P+124, P+14), "TY SMITH SIGNALS", font=f11, fill=DGRAY)
 
-    # SIGNAL BADGE
     bw = 230
     rnd(drw, W-P-bw, P, W-P, P+90, CARD, 14)
     drw.rectangle([W-P-bw, P, W-P-bw+5, P+90], fill=sc)
@@ -104,7 +105,6 @@ def generate_coin_card(coin, gdata):
     drw.text((W-P-bw+18, P+34), coin.get("action","НЕЙТРАЛЬНО"), font=fb2, fill=sc)
     drw.text((W-P-bw+18, P+70), f"Score {coin.get('score',0):+d}   {coin.get('conf','')}", font=f11, fill=LGRAY)
 
-    # PRICE
     price = coin.get("price", 0)
     price_str = f"${price:,.0f}"
     drw.text((P, P+56), price_str, font=f40, fill=WHITE)
@@ -119,10 +119,8 @@ def generate_coin_card(coin, gdata):
     vol  = coin.get("vol", 0)
     mcap = coin.get("mcap", 0)
     drw.text((P, P+148), f"Vol 24h: ${vol/1e9:.2f}B     Cap: ${mcap/1e9:.1f}B", font=f13, fill=LGRAY)
-
     drw.line([(P, P+178), (W-P, P+178)], fill=LINE, width=1)
 
-    # TARGET / STOP
     target = coin.get("target", price)
     stop   = coin.get("stop", price)
     mid    = W//2 - 10
@@ -139,7 +137,6 @@ def generate_coin_card(coin, gdata):
     pct_s = (stop/price - 1)*100 if price > 0 else 0
     drw.text((mid+26, P+264), f"{pct_s:.1f}% от текущей цены", font=f11, fill=DGRAY)
 
-    # RSI
     y1  = P + 300
     bw2 = (W-P*2-32)//3
     drw.text((P, y1), "RSI АНАЛИЗ", font=f11, fill=LGRAY)
@@ -173,10 +170,8 @@ def generate_coin_card(coin, gdata):
 
     drw.rectangle([P, cy2+4, P+5, cy2+32], fill=mc)
     drw.text((P+14, cy2+4), msg, font=f13, fill=mc)
-
     drw.line([(P, cy2+44), (W-P, cy2+44)], fill=LINE, width=1)
 
-    # INDICATORS
     y2 = cy2 + 56
     iw = (W-P*2-32)//3
 
@@ -197,19 +192,18 @@ def generate_coin_card(coin, gdata):
     bp_c = GREEN if "нижней" in bp else RED if "верхней" in bp else AMBER
 
     for idx, (lbl, val, sub, col) in enumerate([
-        ("MACD",            macd_s,    "бычий" if macd_v>0 else "медвежий", macd_c),
-        (f"FUNDING {frs}",  fr_s,      fri[:18],                             fr_c),
-        ("BOLLINGER",       bp[:14],   "позиция",                            bp_c),
+        ("MACD",           macd_s, "бычий" if macd_v>0 else "медвежий", macd_c),
+        (f"FUNDING {frs}", fr_s,   fri[:18],                             fr_c),
+        ("BOLLINGER",      bp[:14],"позиция",                            bp_c),
     ]):
         ix = P + idx*(iw+16)
         rnd(drw, ix, y2, ix+iw, y2+86, CARD, 12)
-        drw.text((ix+16, y2+10), lbl,  font=f11, fill=LGRAY)
-        drw.text((ix+16, y2+32), val,  font=fb2, fill=col)
-        drw.text((ix+16, y2+68), sub,  font=f11, fill=DGRAY)
+        drw.text((ix+16, y2+10), lbl, font=f11, fill=LGRAY)
+        drw.text((ix+16, y2+32), val, font=fb2, fill=col)
+        drw.text((ix+16, y2+68), sub, font=f11, fill=DGRAY)
 
     drw.line([(P, y2+100), (W-P, y2+100)], fill=LINE, width=1)
 
-    # GLOBAL ROW
     y3  = y2 + 112
     fg  = gdata.get("fg", {})
     dom = gdata.get("dom", {})
@@ -224,27 +218,26 @@ def generate_coin_card(coin, gdata):
         gvals.append(("FEAR & GREED", "N/A", "", DGRAY))
 
     if dom.get("ok"):
-        gvals.append(("BTC DOM",    f"{dom['dom']}%",         dom["sig"][:14], BLUE))
-        gvals.append(("КАП. РЫНКА", f"${dom['mcap']:,.0f}B",  "капитализация", LGRAY))
-        gvals.append(("ОБЪЁМ 24H",  f"${dom['vol']:,.0f}B",   "торговый",      LGRAY))
+        gvals.append(("BTC DOM",    f"{dom['dom']}%",        dom["sig"][:14], BLUE))
+        gvals.append(("КАП. РЫНКА", f"${dom['mcap']:,.0f}B", "капитализация", LGRAY))
+        gvals.append(("ОБЪЁМ 24H",  f"${dom['vol']:,.0f}B",  "торговый",      LGRAY))
     else:
         gvals += [("BTC DOM","N/A","",DGRAY),("КАП.","N/A","",DGRAY),("ОБЪ.","N/A","",DGRAY)]
 
     for idx, (lbl, val, sub, col) in enumerate(gvals):
         gx = P + idx*(gw+16)
         rnd(drw, gx, y3, gx+gw, y3+76, CARD, 10)
-        drw.text((gx+14, y3+10), lbl,       font=f11, fill=LGRAY)
-        drw.text((gx+14, y3+32), val,       font=fb,  fill=col)
-        drw.text((gx+14, y3+62), sub[:16],  font=f11, fill=DGRAY)
+        drw.text((gx+14, y3+10), lbl,      font=f11, fill=LGRAY)
+        drw.text((gx+14, y3+32), val,      font=fb,  fill=col)
+        drw.text((gx+14, y3+62), sub[:16], font=f11, fill=DGRAY)
 
-    # FOOTER
     drw.line([(P, H-40), (W-P, H-40)], fill=LINE, width=1)
     drw.text((P, H-30), "TY SMITH SIGNALS  •  Не является финансовой рекомендацией", font=f11, fill=DGRAY)
     ts = f"{gdata.get('time','')} МСК  •  след. {gdata.get('next_hour','')}"
     drw.text((W-P-tw(drw,ts,f11), H-30), ts, font=f11, fill=DGRAY)
 
     buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=False)
+    img.save(buf, format="PNG")
     buf.seek(0)
     return buf.read()
 
