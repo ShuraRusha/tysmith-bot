@@ -1,3 +1,5 @@
+from download_fonts import ensure_fonts
+ensure_fonts()
 from PIL import Image, ImageDraw, ImageFont
 import io, os
 
