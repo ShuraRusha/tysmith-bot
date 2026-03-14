@@ -108,7 +108,7 @@ def bollinger(closes,p=20):
     return round(mid-2*std,0),round(mid,0),round(mid+2*std,0)
 
 def rsi_label(v):
-    return "🔴 перекуплен" if v>70 else "🟢 перепродан" if v<30 else "🟡 зона внимания" if v<40 or v>60 else "⚪️ норма"
+    return "🔴 перекуплен" if v>70 else "🟢 перепродан" if v<30 else "🟡 зона внимания" if v<40 or v>60 else "норма"
 
 def generate_signal(change,r12,mh,price,fr=0,fr_ok=False):
     s=0
@@ -120,7 +120,7 @@ def generate_signal(change,r12,mh,price,fr=0,fr_ok=False):
     elif s>=2: a,c,t,st="🔵 НАКАПЛИВАТЬ","Умеренная",round(price*1.04,0),round(price*0.97,0)
     elif s<=-4:a,c,t,st="🔴 ПРОДАВАТЬ","Высокая",round(price*0.93,0),round(price*1.04,0)
     elif s<=-2:a,c,t,st="🟠 ОСТОРОЖНО","Умеренная",round(price*0.97,0),round(price*1.02,0)
-else:      a,c,t,st="⚪️ НЕЙТРАЛЬНО","Низкая",round(price*1.02,0),round(price*0.98,0)
+else:      a,c,t,st="НЕЙТРАЛЬНО","Низкая",round(price*1.02,0),round(price*0.98,0)
     return {"action":a,"conf":c,"target":t,"stop":st,"score":s}
 
 async def collect_data():
@@ -147,7 +147,7 @@ async def collect_data():
             fr=await fetch_funding(meta["bybit"])
             sig=generate_signal(change,r12,mh,price,fr=fr.get("rate",0),fr_ok=fr.get("ok",False))
             if bl and bh:
-                bp="🟢 У нижней полосы" if price<=bl else "🔴 У верхней полосы" if price>=bh else f"⚪️ Середина ({int((price-bl)/(bh-bl)*100)}%)"
+                bp="🟢 У нижней полосы" if price<=bl else "🔴 У верхней полосы" if price>=bh else f"Середина ({int((price-bl)/(bh-bl)*100)}%)"
             else: bp="н/д"
             result["coins"].append({
                 "symbol": meta["symbol"],
