@@ -13,17 +13,22 @@ BOT_TOKEN = "8557968994:AAGzIC3Hd00UVAr-zliHcovtYAg_WOrSet0"
 CHAT_ID   = "7675712715"
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
-COINS = {
-    "bitcoin":   {"symbol": "BTC",  "emoji": "BTC", "bybit": "BTCUSDT"},
-    "ethereum":  {"symbol": "ETH",  "emoji": "ETH", "bybit": "ETHUSDT"},
-    "solana":    {"symbol": "SOL",  "emoji": "SOL", "bybit": "SOLUSDT"},
-    "chainlink": {"symbol": "LINK", "emoji": "LINK","bybit": "LINKUSDT"},
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
 }
 
-async def get(url):
-    async with aiohttp.ClientSession() as s:
+COINS = {
+    "bitcoin":   {"symbol": "BTC",  "bybit": "BTCUSDT"},
+    "ethereum":  {"symbol": "ETH",  "bybit": "ETHUSDT"},
+    "solana":    {"symbol": "SOL",  "bybit": "SOLUSDT"},
+    "chainlink": {"symbol": "LINK", "bybit": "LINKUSDT"},
+}
+
+async def get(url, headers=None):
+    async with aiohttp.ClientSession(headers=headers or HEADERS) as s:
         async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-            return await r.json()
+            return await r.json(content_type=None)
 
 async def fetch_prices():
     ids = ",".join(COINS.keys())
@@ -34,7 +39,7 @@ async def fetch_ohlc(coin_id):
 
 async def fetch_fear_greed():
     try:
-        data = await get("https://api.alternative.me/fng/?limit=2")
+        data = await get("https://api.alternative.me/fng/?limit=2", headers={"Accept": "application/json"})
         t, y = data["data"][0], data["data"][1]
         val = int(t["value"])
         delta = val - int(y["value"])
@@ -161,7 +166,7 @@ async def build_report():
             r6,r12,r24=rsi_vals["rsi6"],rsi_vals["rsi12"],rsi_vals["rsi24"]
             macd_tag="↗️ бычий" if mh>0 else "↘️ медвежий"
             rsi_comment="  _→ Все RSI <35 — сильный сигнал входа!_" if r6<35 and r12<35 and r24<35 else "  _→ RSI расходятся — рынок в переходе_" if abs(r6-r24)>20 else "  _→ RSI согласованы_"
-            L+=[f"*{meta['emoji']} {meta['symbol']}*  `${price:,.0f}`  `{sign}{change:.2f}%`","",
+            L+=[f"*{meta['symbol']}*  `${price:,.0f}`  `{sign}{change:.2f}%`","",
                 "  📐 *Технический анализ*",
                 f"  RSI-6:  `{r6}` — {rsi_label(r6)} _[скальпинг]_",
                 f"  RSI-12: `{r12}` — {rsi_label(r12)} _[интрадей]_",
@@ -171,7 +176,7 @@ async def build_report():
             if bl: L+=[f"  Bollinger: `${bl:,.0f}` / `${bm:,.0f}` / `${bh:,.0f}`", f"  Позиция: {bp}"]
             L+=["", "  💹 *Деривативы*"]
             if fr.get("ok"):
-                L+=[f"  Funding Rate ({fr['source']}): `{fr['rate']:+.4f}%` — {fr['interp']}", "  _норма: 0.01% каждые 8ч_"]
+                L+=[f"  Funding ({fr['source']}): `{fr['rate']:+.4f}%` — {fr['interp']}", "  _норма: 0.01% каждые 8ч_"]
             else:
                 L+=["  Funding Rate: недоступен"]
             L+=["", f"  🎯 *СИГНАЛ: {sig['action']}* ({sig['conf']})",
