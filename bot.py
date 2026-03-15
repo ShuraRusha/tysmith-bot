@@ -130,8 +130,8 @@ def calc_rsi(closes, p=14):
             g.append(abs(d))
         else:
             l.append(abs(d))
-    ag = sum(g[-p:]) / p
-    al = sum(l[-p:]) / p
+    ag = sum(g[-p:]) / p if g else 0.0
+    al = sum(l[-p:]) / p if l else 0.0
     if al == 0:
         return 100.0
     return round(100 - (100 / (1 + ag/al)), 1)
@@ -214,6 +214,9 @@ def generate_signal(change, r12, mh, price, fr=0, fr_ok=False):
 async def collect_data():
     now_msk = datetime.now(MOSCOW_TZ)
     prices, fg, dom = await asyncio.gather(fetch_prices(), fetch_fear_greed(), fetch_dominance())
+    log.info(f"Prices OK: {list(prices.keys()) if isinstance(prices, dict) else 'ERROR'}")
+    log.info(f"FG: {fg}")
+    log.info(f"DOM: {dom}")
     next_hour = (now_msk.hour + 1) % 24
     result = {
         "time":      now_msk.strftime("%d.%m.%Y %H:%M"),
@@ -229,6 +232,7 @@ async def collect_data():
             change = d.get("usd_24h_change", 0)
             vol    = d.get("usd_24h_vol", 0)
             mcap   = d.get("usd_market_cap", 0)
+            log.info(f"{meta['symbol']}: price={price} change={change}")
             ohlc   = await fetch_ohlc(coin_id)
             closes = [c[4] for c in ohlc] if ohlc else []
             r6     = calc_rsi(closes, 6)
@@ -238,7 +242,7 @@ async def collect_data():
             bl, bm, bh = bollinger(closes)
             fr     = await fetch_funding(meta["bybit"])
             sig    = generate_signal(change, r12, mh, price, fr=fr.get("rate",0), fr_ok=fr.get("ok",False))
-            if bl and bh and price:
+            if bl and bh and price and (bh - bl) > 0:
                 pct = int((price-bl)/(bh-bl)*100)
                 if price <= bl:
                     bp = "У нижней полосы"
@@ -248,7 +252,7 @@ async def collect_data():
                     bp = f"Середина {pct}%"
             else:
                 bp = "н/д"
-            result["coins"].append({
+            coin_data = {
                 "symbol":         meta["symbol"],
                 "price":          price,
                 "change":         change,
@@ -267,7 +271,9 @@ async def collect_data():
                 "target":         sig["target"],
                 "stop":           sig["stop"],
                 "score":          sig["score"],
-            })
+            }
+            result["coins"].append(coin_data)
+            log.info(f"{meta['symbol']} data collected OK")
         except Exception as e:
             log.error(f"Ошибка {meta['symbol']}: {e}")
     return result
@@ -303,22 +309,34 @@ def build_text_report(data):
 async def send_signals():
     log.info("Генерируем отчёт...")
     try:
-        data  = await collect_data()
+        data = await collect_data()
+        log.info(f"Coins collected: {len(data['coins'])}")
+
         cards = generate_all_cards(data)
-        text  = build_text_report(data)
-        bot   = Bot(token=BOT_TOKEN)
-        for card_bytes in cards:
-            await bot.send_photo(
-                chat_id=CHAT_ID,
-                photo=io.BytesIO(card_bytes)
-            )
-            await asyncio.sleep(1)
+        log.info(f"Cards generated: {len(cards)}")
+
+        bot = Bot(token=BOT_TOKEN)
+
+        if cards:
+            for i, card_bytes in enumerate(cards):
+                log.info(f"Sending card {i+1}, size={len(card_bytes)} bytes")
+                await bot.send_photo(
+                    chat_id=CHAT_ID,
+                    photo=io.BytesIO(card_bytes)
+                )
+                await asyncio.sleep(1)
+            log.info("All cards sent")
+        else:
+            log.error("No cards generated!")
+
+        text = build_text_report(data)
         if len(text) > 4000:
             text = text[:3990] + "\n...обрезано"
         await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.MARKDOWN)
-        log.info("Отчёт отправлен.")
+        log.info("Text report sent")
+
     except Exception as e:
-        log.error(f"Ошибка: {e}")
+        log.error(f"Ошибка send_signals: {e}", exc_info=True)
 
 async def main():
     log.info("Ty Smith Bot v3 запущен.")
