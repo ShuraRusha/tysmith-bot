@@ -26,10 +26,28 @@ COINS = {
     "chainlink": {"symbol": "LINK", "bybit": "LINKUSDT"},
 }
 
-async def get(url):
-    async with aiohttp.ClientSession(headers=HEADERS) as s:
-        async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-            return await r.json(content_type=None)
+async def get(url, retries=3):
+    """Fetch JSON with automatic retry on 429 / transient errors."""
+    for attempt in range(retries):
+        try:
+            async with aiohttp.ClientSession(headers=HEADERS) as s:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    if r.status == 429:
+                        wait = 10 * (attempt + 1)
+                        log.warning(f"Rate limit (429) for {url} — waiting {wait}s")
+                        await asyncio.sleep(wait)
+                        continue
+                    r.raise_for_status()
+                    return await r.json(content_type=None)
+        except asyncio.TimeoutError:
+            log.warning(f"Timeout on {url}, attempt {attempt+1}/{retries}")
+            if attempt < retries - 1:
+                await asyncio.sleep(5)
+        except Exception as e:
+            log.warning(f"Request error {url}: {e}, attempt {attempt+1}/{retries}")
+            if attempt < retries - 1:
+                await asyncio.sleep(5)
+    raise RuntimeError(f"Failed to fetch {url} after {retries} attempts")
 
 async def fetch_prices():
     ids = ",".join(COINS.keys())
@@ -233,6 +251,7 @@ async def collect_data():
             vol    = d.get("usd_24h_vol", 0)
             mcap   = d.get("usd_market_cap", 0)
             log.info(f"{meta['symbol']}: price={price} change={change}")
+            await asyncio.sleep(2)  # avoid CoinGecko rate limit between coins
             ohlc   = await fetch_ohlc(coin_id)
             closes = [c[4] for c in ohlc] if ohlc else []
             r6     = calc_rsi(closes, 6)
@@ -258,6 +277,7 @@ async def collect_data():
                 "change":         change,
                 "vol":            vol,
                 "mcap":           mcap,
+                "closes":         closes,
                 "rsi6":           r6,
                 "rsi12":          r12,
                 "rsi24":          r24,
