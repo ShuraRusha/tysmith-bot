@@ -26,14 +26,14 @@ COINS = {
     "chainlink": {"symbol": "LINK", "bybit": "LINKUSDT"},
 }
 
-async def get(url, retries=3):
+async def get(url, retries=5):
     """Fetch JSON with automatic retry on 429 / transient errors."""
     for attempt in range(retries):
         try:
             async with aiohttp.ClientSession(headers=HEADERS) as s:
-                async with s.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=30)) as r:
                     if r.status == 429:
-                        wait = 10 * (attempt + 1)
+                        wait = 15 * (attempt + 1)
                         log.warning(f"Rate limit (429) for {url} — waiting {wait}s")
                         await asyncio.sleep(wait)
                         continue
@@ -42,11 +42,11 @@ async def get(url, retries=3):
         except asyncio.TimeoutError:
             log.warning(f"Timeout on {url}, attempt {attempt+1}/{retries}")
             if attempt < retries - 1:
-                await asyncio.sleep(5)
+                await asyncio.sleep(8)
         except Exception as e:
             log.warning(f"Request error {url}: {e}, attempt {attempt+1}/{retries}")
             if attempt < retries - 1:
-                await asyncio.sleep(5)
+                await asyncio.sleep(8)
     raise RuntimeError(f"Failed to fetch {url} after {retries} attempts")
 
 async def fetch_prices():
@@ -251,8 +251,12 @@ async def collect_data():
             vol    = d.get("usd_24h_vol", 0)
             mcap   = d.get("usd_market_cap", 0)
             log.info(f"{meta['symbol']}: price={price} change={change}")
-            await asyncio.sleep(2)  # avoid CoinGecko rate limit between coins
-            ohlc   = await fetch_ohlc(coin_id)
+            await asyncio.sleep(5)  # avoid CoinGecko rate limit between coins
+            try:
+                ohlc = await fetch_ohlc(coin_id)
+            except Exception as ohlc_err:
+                log.warning(f"OHLC failed for {coin_id}, using defaults: {ohlc_err}")
+                ohlc = []
             closes = [c[4] for c in ohlc] if ohlc else []
             r6     = calc_rsi(closes, 6)
             r12    = calc_rsi(closes, 12)
