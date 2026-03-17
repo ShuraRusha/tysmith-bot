@@ -1,50 +1,43 @@
 from PIL import Image, ImageDraw, ImageFont
-import io, os, base64, tempfile
+import io, os, base64, tempfile, re
 from fonts_data import NUNITO_REGULAR, NUNITO_BOLD
 
-W, H = 1080, 810
+# Portrait format to match design mockup
+W, H = 900, 1120
 
 # ── Palette ──────────────────────────────────────────────────
-BG      = (8,  10, 20)
-PANEL   = (16, 18, 32)
-PANEL2  = (22, 25, 42)
-LINE    = (38, 40, 62)
+BG_OUT  = (13,  15,  24)   # outer background
+BG_CARD = (20,  23,  36)   # main card
+BG_BLOK = (28,  32,  48)   # inner block
+BG_BLK2 = (34,  38,  56)   # slightly lighter inner block
+LINE    = (44,  48,  70)
 WHITE   = (255, 255, 255)
-LGRAY   = (120, 125, 155)
-DGRAY   = (52,  55,  78)
-GREEN   = (34,  210, 130)
-RED     = (235, 70,  70)
-AMBER   = (248, 168, 28)
-BLUE    = (88,  152, 255)
+LGRAY   = (108, 114, 145)
+DGRAY   = (58,  62,  88)
+GREEN   = (42,  196, 140)
+RED     = (228, 72,  72)
+AMBER   = (244, 164, 28)
+BLUE    = (82,  146, 250)
 
 COIN_ACCENT = {
-    "BTC":  (247, 147, 26),
+    "BTC":  (42,  185, 145),
     "ETH":  (98,  126, 234),
     "SOL":  (153, 69,  255),
-    "LINK": (42,  90,  218),
+    "LINK": (58,  110, 230),
 }
 
-# ── Layout constants (all Y-positions pre-calculated) ────────
-# Each section sits below the previous with explicit gaps.
-# This prevents any math errors causing overflow past H=810.
-_STRIPE_H   = 5
-_HEADER_Y   = 14   ; _HEADER_H  = 68   # 14-82
-_PRICE_Y    = 90                        # price text
-_VOLC_Y     = 174                       # vol/cap text
-_DIV1       = 204                       # after vol/cap (174 + ~26px font + 4px gap)
-_SPARK_Y    = 212  ; _SPARK_H   = 78   # 212-290
-_DIV2       = 298
-_RSI_LBL_Y  = 306                       # "RSI АНАЛИЗ"
-_RSI_Y      = 338  ; _RSI_H    = 130   # 338-468
-_INTERP_Y   = 472                       # RSI interpretation
-_DIV3       = 504
-_IND_Y      = 512  ; _IND_H    = 88   # 512-600
-_DIV4       = 608
-_TS_Y       = 616  ; _TS_H     = 70   # 616-686
-_DIV5       = 694
-_GM_Y       = 702  ; _GM_H     = 56   # 702-758
-_FOOT_DIV   = 766
-_FOOT_TXT_Y = 774                       # footer text, font 20 → ends ~796 < 810
+COIN_NAMES = {
+    "BTC":  "Bitcoin",
+    "ETH":  "Ethereum",
+    "SOL":  "Solana",
+    "LINK": "Chainlink",
+}
+
+RSI_TIMEFRAMES = {
+    "RSI-6":  "скальпинг",
+    "RSI-12": "интрадей",
+    "RSI-24": "свинг",
+}
 
 # ── Font cache ────────────────────────────────────────────────
 _FONT_CACHE = {}
@@ -69,9 +62,12 @@ def tw(draw, text, f):
     bb = draw.textbbox((0, 0), text, font=f)
     return bb[2] - bb[0]
 
+def th(draw, text, f):
+    bb = draw.textbbox((0, 0), text, font=f)
+    return bb[3] - bb[1]
+
 # ── Drawing helpers ───────────────────────────────────────────
 def rnd(draw, x1, y1, x2, y2, fill, r=12):
-    """Filled rounded rectangle."""
     if x2 <= x1 or y2 <= y1:
         return
     r = min(r, (x2 - x1) // 2, (y2 - y1) // 2)
@@ -80,11 +76,19 @@ def rnd(draw, x1, y1, x2, y2, fill, r=12):
     for cx, cy in [(x1, y1), (x2 - 2*r, y1), (x1, y2 - 2*r), (x2 - 2*r, y2 - 2*r)]:
         draw.ellipse([cx, cy, cx + 2*r, cy + 2*r], fill=fill)
 
-def bar(draw, x, y, w, h, pct, color):
-    """Colored progress bar with rounded ends."""
-    rnd(draw, x, y, x + w, y + h, DGRAY, h // 2)
-    fw = max(int(w * min(max(pct, 0.0), 1.0)), h)
-    rnd(draw, x, y, x + fw, y + h, color, h // 2)
+def rnd_outline(draw, x1, y1, x2, y2, color, r=12, lw=1):
+    """Draw only the outline of a rounded rectangle."""
+    if x2 <= x1 or y2 <= y1:
+        return
+    r = min(r, (x2 - x1) // 2, (y2 - y1) // 2)
+    draw.arc([x1, y1, x1 + 2*r, y1 + 2*r], 180, 270, fill=color, width=lw)
+    draw.arc([x2 - 2*r, y1, x2, y1 + 2*r], 270, 360, fill=color, width=lw)
+    draw.arc([x1, y2 - 2*r, x1 + 2*r, y2], 90, 180, fill=color, width=lw)
+    draw.arc([x2 - 2*r, y2 - 2*r, x2, y2], 0, 90, fill=color, width=lw)
+    draw.line([(x1 + r, y1), (x2 - r, y1)], fill=color, width=lw)
+    draw.line([(x1 + r, y2), (x2 - r, y2)], fill=color, width=lw)
+    draw.line([(x1, y1 + r), (x1, y2 - r)], fill=color, width=lw)
+    draw.line([(x2, y1 + r), (x2, y2 - r)], fill=color, width=lw)
 
 def sig_col(action):
     a = action.upper()
@@ -106,97 +110,99 @@ def rsi_label(v):
     if v <= 42 or v >= 58: return "внимание"
     return "норма"
 
-def _gradient_bg(drw):
-    for row in range(H):
-        t = row / H
-        r = int(BG[0] + (14 - BG[0]) * t)
-        g = int(BG[1] + (16 - BG[1]) * t)
-        b = int(BG[2] + (30 - BG[2]) * t)
-        drw.line([(0, row), (W, row)], fill=(r, g, b))
+def bb_pct_from_pos(bb_pos):
+    """Extract numeric % from bb_pos string."""
+    m = re.search(r'(\d+)%', bb_pos)
+    if m:
+        return int(m.group(1))
+    if "нижней" in bb_pos:
+        return 2
+    if "верхней" in bb_pos:
+        return 98
+    return 50
 
-def _draw_sparkline(img, closes, x, y, w, h, accent):
-    if not closes or len(closes) < 2:
-        return
-    mn, mx = min(closes), max(closes)
-    rng = mx - mn if mx > mn else 1
-
-    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    ld = ImageDraw.Draw(layer)
-
-    pad = 8
-    sw, sh = w - pad * 2, h - pad * 2
-    pts = []
-    for i, c in enumerate(closes):
-        px = pad + int(i / (len(closes) - 1) * sw)
-        py = pad + sh - int((c - mn) / rng * sh)
-        pts.append((px, py))
-
-    ar, ag, ab = accent
-    poly = [(pts[0][0], pad + sh)] + pts + [(pts[-1][0], pad + sh)]
-    ld.polygon(poly, fill=(ar, ag, ab, 32))
-    for i in range(len(pts) - 1):
-        ld.line([pts[i], pts[i + 1]], fill=(ar, ag, ab, 210), width=3)
-    lx, ly = pts[-1]
-    ld.ellipse([lx - 5, ly - 5, lx + 5, ly + 5], fill=(ar, ag, ab, 255))
-
-    img.paste(layer, (x, y), layer)
+def bb_label(pct):
+    if pct <= 20: return "нижняя"
+    if pct >= 80: return "верхняя"
+    return "середина"
 
 
-# ── Main card generator ───────────────────────────────────────
+# ── Card generator ────────────────────────────────────────────
 def generate_coin_card(coin, gdata):
-    P = 40  # horizontal padding
+    OP  = 26   # outer padding (image edge → card)
+    IP  = 24   # inner padding (card edge → content)
+    CX  = OP + IP           # content X start = 50
+    CW  = W - 2 * (OP + IP) # content width  = 800
 
-    # Fonts
+    symbol  = coin.get("symbol", "?")
+    accent  = COIN_ACCENT.get(symbol, BLUE)
+    action  = coin.get("action", "НЕЙТРАЛЬНО")
+    sc      = sig_col(action)
+    price   = coin.get("price", 0)
+    chg     = coin.get("change", 0)
+    score   = coin.get("score", 0)
+    conf    = coin.get("conf", "")
+    r6, r12, r24 = coin.get("rsi6",50), coin.get("rsi12",50), coin.get("rsi24",50)
+    macd_v  = coin.get("macd", 0)
+    fr      = coin.get("funding_rate")
+    frs     = coin.get("funding_src", "")
+    bb_pos  = coin.get("bb_pos", "н/д")
+    bb_pct  = bb_pct_from_pos(bb_pos)
+    target  = coin.get("target", price)
+    stop    = coin.get("stop",   price)
+    pct_t   = (target / price - 1) * 100 if price > 0 else 0
+    pct_s   = (stop   / price - 1) * 100 if price > 0 else 0
+    vol     = coin.get("vol",  0)
+    fg      = gdata.get("fg",  {})
+    dom     = gdata.get("dom", {})
+
+    # ── Fonts ────────────────────────────────────────────────
+    f9   = font(18)
     f10  = font(20)
+    f11  = font(22)
     f12  = font(24)
-    f13  = font(26)
-    fb13 = font(26, bold=True)
+    fb12 = font(24, bold=True)
     fb14 = font(28, bold=True)
-    fb16 = font(32, bold=True)
-    fb22 = font(44, bold=True)
-    fb32 = font(64, bold=True)
+    fb18 = font(36, bold=True)
+    fb26 = font(52, bold=True)
+    fb36 = font(72, bold=True)
 
-    symbol = coin.get("symbol", "?")
-    accent = COIN_ACCENT.get(symbol, BLUE)
-    action = coin.get("action", "НЕЙТРАЛЬНО")
-    sc     = sig_col(action)
-    price  = coin.get("price", 0)
-    chg    = coin.get("change", 0)
-    closes = coin.get("closes", [])
-    ar, ag, ab = accent
-
-    # ── Canvas + gradient ────────────────────────────────────
-    img = Image.new("RGBA", (W, H), (*BG, 255))
+    # ── Canvas ───────────────────────────────────────────────
+    img = Image.new("RGB", (W, H), BG_OUT)
     drw = ImageDraw.Draw(img)
-    _gradient_bg(drw)
 
-    # ── Top accent stripe ────────────────────────────────────
-    for i in range(_STRIPE_H):
-        drw.rectangle([0, i, W, i + 1], fill=accent)
+    # Main card
+    rnd(drw, OP, OP, W - OP, H - OP, BG_CARD, 24)
 
-    # ── HEADER ──────────────────────────────────────────────
-    # Symbol badge (left)
-    rnd(drw, P, _HEADER_Y, P + 130, _HEADER_Y + _HEADER_H, PANEL2, 10)
-    drw.rectangle([P, _HEADER_Y, P + 5, _HEADER_Y + _HEADER_H], fill=accent)
-    drw.text((P + 18, _HEADER_Y + 10), symbol, font=fb22, fill=accent)
+    # Thin accent stripe at top of card
+    ar, ag, ab = accent
+    for i in range(4):
+        drw.rectangle([OP + 24, OP + i, W - OP - 24, OP + i + 1], fill=accent)
 
-    drw.text((P + 148, _HEADER_Y + 10), "TY SMITH SIGNALS", font=f10, fill=DGRAY)
-    drw.text((P + 148, _HEADER_Y + 34), gdata.get("time", "") + " МСК",
-             font=f10, fill=DGRAY)
+    # ── Y layout ─────────────────────────────────────────────
+    # These are Y positions relative to image top.
+    Y = OP + IP + 10  # start of content
 
-    # Signal badge (right) — width 260 so "НАКАПЛИВАТЬ" fits at 32pt bold
-    BADGE_W = 260
-    bx = W - P - BADGE_W
-    gc = (max(0, ar // 8), max(0, ag // 8), max(0, ab // 8))
-    for i in range(3, 0, -1):
-        rnd(drw, bx - i*2, _HEADER_Y - i, W - P + i*2, _HEADER_Y + _HEADER_H + i, gc, 16)
-    rnd(drw, bx, _HEADER_Y, W - P, _HEADER_Y + _HEADER_H, PANEL2, 14)
-    drw.rectangle([bx, _HEADER_Y, bx + 5, _HEADER_Y + _HEADER_H], fill=sc)
-    drw.text((bx + 18, _HEADER_Y + 6),  "СИГНАЛ", font=f10,  fill=LGRAY)
-    drw.text((bx + 18, _HEADER_Y + 24), action,   font=fb16, fill=sc)
-    drw.text((bx + 18, _HEADER_Y + 54),
-             f"Score {coin.get('score', 0):+d}  •  {coin.get('conf', '')}",
-             font=f10, fill=LGRAY)
+    # ── HEADER ───────────────────────────────────────────────
+    # Coin badge (left)
+    badge_txt = symbol
+    bw = tw(drw, badge_txt, fb14) + 32
+    rnd(drw, CX, Y, CX + bw, Y + 44, accent, 10)
+    drw.text((CX + 16, Y + 8), badge_txt, font=fb14, fill=BG_CARD)
+
+    coin_name = COIN_NAMES.get(symbol, symbol)
+    drw.text((CX + bw + 16, Y + 12), coin_name, font=f12, fill=LGRAY)
+
+    # Signal box (right)
+    SB_W, SB_H = 210, 90
+    sbx = CX + CW - SB_W
+    rnd(drw, sbx, Y - 4, sbx + SB_W, Y - 4 + SB_H, BG_BLOK, 16)
+    rnd_outline(drw, sbx, Y - 4, sbx + SB_W, Y - 4 + SB_H, accent, 16, lw=1)
+    drw.text((sbx + 18, Y + 2),  "СИГНАЛ",  font=f9,  fill=LGRAY)
+    drw.text((sbx + 18, Y + 20), action,    font=fb14, fill=sc)
+    drw.text((sbx + 18, Y + 60), f"Score {score:+d}", font=f10, fill=LGRAY)
+
+    Y += SB_H + 10
 
     # ── PRICE ────────────────────────────────────────────────
     if price >= 1000:
@@ -206,112 +212,95 @@ def generate_coin_card(coin, gdata):
     else:
         price_str = f"${price:.4f}"
 
-    drw.text((P, _PRICE_Y), price_str, font=fb32, fill=WHITE)
-    pw = tw(drw, price_str, fb32)
+    drw.text((CX, Y), price_str, font=fb36, fill=WHITE)
 
-    chg_str = f"+{chg:.2f}%" if chg >= 0 else f"{chg:.2f}%"
+    Y += 78  # price text height
+
+    # Change badge + vol
+    chg_str = f"+{chg:.2f}% 24h" if chg >= 0 else f"{chg:.2f}% 24h"
     chg_col = GREEN if chg >= 0 else RED
-    cbx = P + pw + 18
-    cbw = tw(drw, chg_str, fb14) + 22
-    cbh = 36
-    cby = _PRICE_Y + 30  # vertically centered relative to price text
-    rnd(drw, cbx, cby, cbx + cbw, cby + cbh,
-        (int(chg_col[0]*0.16), int(chg_col[1]*0.16), int(chg_col[2]*0.16)), 8)
-    drw.text((cbx + 11, cby + 6), chg_str, font=fb14, fill=chg_col)
+    cbg = (int(chg_col[0]*0.18), int(chg_col[1]*0.18), int(chg_col[2]*0.18))
+    cbw = tw(drw, chg_str, fb12) + 22
+    rnd(drw, CX, Y, CX + cbw, Y + 36, cbg, 8)
+    drw.text((CX + 11, Y + 6), chg_str, font=fb12, fill=chg_col)
 
-    vol  = coin.get("vol",  0)
-    mcap = coin.get("mcap", 0)
-    drw.text((P, _VOLC_Y),
-             f"Vol 24h: ${vol/1e9:.2f}B    Cap: ${mcap/1e9:.1f}B",
-             font=f12, fill=LGRAY)
+    vol_s = f"Vol: ${vol/1e9:.1f}B" if vol > 0 else ""
+    if vol_s:
+        drw.text((CX + cbw + 20, Y + 8), vol_s, font=f12, fill=LGRAY)
 
-    # ── DIVIDER 1 ────────────────────────────────────────────
-    drw.line([(P, _DIV1), (W - P, _DIV1)], fill=LINE, width=1)
+    Y += 52
 
-    # ── SPARKLINE ────────────────────────────────────────────
-    rnd(drw, P, _SPARK_Y, W - P, _SPARK_Y + _SPARK_H, PANEL, 8)
-    if closes and len(closes) >= 2:
-        _draw_sparkline(img, closes,
-                        P + 6, _SPARK_Y + 4,
-                        W - P * 2 - 12, _SPARK_H - 8, accent)
-        drw = ImageDraw.Draw(img)
-        mn_c, mx_c = min(closes), max(closes)
-        mn_s = f"${mn_c:,.0f}" if mn_c >= 1 else f"${mn_c:.4f}"
-        mx_s = f"${mx_c:,.0f}" if mx_c >= 1 else f"${mx_c:.4f}"
-        drw.text((P + 10, _SPARK_Y + _SPARK_H - 22), mn_s, font=f10, fill=LGRAY)
-        drw.text((W - P - 10 - tw(drw, mx_s, f10), _SPARK_Y + 6),
-                 mx_s, font=f10, fill=LGRAY)
-    else:
-        drw.text((W // 2 - 80, _SPARK_Y + 30), "нет данных графика",
-                 font=f12, fill=DGRAY)
+    # ── TARGET / STOP ────────────────────────────────────────
+    TS_H = 130
+    rnd(drw, CX, Y, CX + CW, Y + TS_H, BG_BLOK, 16)
+    mid = CX + CW // 2
 
-    # ── DIVIDER 2 ────────────────────────────────────────────
-    drw.line([(P, _DIV2), (W - P, _DIV2)], fill=LINE, width=1)
+    # Vertical divider
+    drw.line([(mid, Y + 24), (mid, Y + TS_H - 24)], fill=LINE, width=1)
+
+    # Target (left)
+    drw.text((CX + 22, Y + 18), "ЦЕЛЬ", font=f9, fill=LGRAY)
+    drw.text((CX + 22, Y + 40), f"${target:,.0f}", font=fb26, fill=GREEN)
+    drw.text((CX + 22, Y + 98), f"{pct_t:+.1f}% от цены", font=f10, fill=DGRAY)
+
+    # Stop (right)
+    drw.text((mid + 22, Y + 18), "СТОП-ЛОСС", font=f9, fill=LGRAY)
+    drw.text((mid + 22, Y + 40), f"${stop:,.0f}", font=fb26, fill=RED)
+    drw.text((mid + 22, Y + 98), f"{pct_s:+.1f}% от цены", font=f10, fill=DGRAY)
+
+    Y += TS_H + 20
 
     # ── RSI SECTION ──────────────────────────────────────────
-    drw.text((P, _RSI_LBL_Y), "RSI  АНАЛИЗ", font=fb14, fill=WHITE)
+    drw.text((CX, Y), "RSI АНАЛИЗ", font=f10, fill=LGRAY)
+    Y += 26
 
-    RSI_BW = (W - P * 2 - 40) // 3  # width of each RSI block
+    LBL_W  = 76    # label column width
+    VAL_W  = 64    # value column width
+    TF_W   = 90    # timeframe column width
+    BAR_X  = CX + LBL_W + 12
+    BAR_W  = CW - LBL_W - 12 - 12 - VAL_W - 12 - TF_W
+    ROW_H  = 50
 
-    for idx, (lbl, val, sub) in enumerate([
-        ("RSI-6",  coin.get("rsi6",  50), "краткосрочный"),
-        ("RSI-12", coin.get("rsi12", 50), "среднесрочный"),
-        ("RSI-24", coin.get("rsi24", 50), "долгосрочный"),
-    ]):
-        bx  = P + idx * (RSI_BW + 20)
+    for lbl, val, tf in [
+        ("RSI-6",  r6,  "скальпинг"),
+        ("RSI-12", r12, "интрадей"),
+        ("RSI-24", r24, "свинг"),
+    ]:
         rc  = rsi_col(val)
-        rl  = rsi_label(val)
 
-        rnd(drw, bx, _RSI_Y, bx + RSI_BW, _RSI_Y + _RSI_H, PANEL, 12)
+        # Label (left)
+        drw.text((CX, Y + 14), lbl, font=f11, fill=LGRAY)
 
-        # Top row: label (left) + timeframe (right)
-        drw.text((bx + 16, _RSI_Y + 10), lbl, font=fb13, fill=WHITE)
-        sw = tw(drw, sub, f10)
-        drw.text((bx + RSI_BW - 16 - sw, _RSI_Y + 14), sub, font=f10, fill=LGRAY)
+        # Bar (center)
+        bh = 10
+        by = Y + (ROW_H - bh) // 2
+        rnd(drw, BAR_X, by, BAR_X + BAR_W, by + bh, BG_BLK2, bh // 2)
 
-        # Large value — left-aligned, with status label to the right
-        val_s = str(val)
-        drw.text((bx + 16, _RSI_Y + 40), val_s, font=fb22, fill=rc)
-        vw = tw(drw, val_s, fb22)
-        drw.text((bx + 16 + vw + 12, _RSI_Y + 60), rl, font=f10, fill=rc)
-
-        # Progress bar with zone markers
-        BAR_X = bx + 16
-        BAR_Y = _RSI_Y + 92
-        BAR_W = RSI_BW - 32
-        BAR_H = 8
-
-        # Background bar
-        rnd(drw, BAR_X, BAR_Y, BAR_X + BAR_W, BAR_Y + BAR_H, DGRAY, BAR_H // 2)
-
-        # Zone fill: 0-30 green tint, 30-70 neutral, 70-100 red tint
+        # Zone tints
         z30 = BAR_X + int(0.30 * BAR_W)
         z70 = BAR_X + int(0.70 * BAR_W)
-        rnd(drw, BAR_X, BAR_Y, z30, BAR_Y + BAR_H,
-            (int(GREEN[0]*0.35), int(GREEN[1]*0.35), int(GREEN[2]*0.35)), BAR_H // 2)
-        rnd(drw, z70, BAR_Y, BAR_X + BAR_W, BAR_Y + BAR_H,
-            (int(RED[0]*0.35), int(RED[1]*0.35), int(RED[2]*0.35)), BAR_H // 2)
+        rnd(drw, BAR_X, by, z30, by + bh,
+            (int(GREEN[0]*0.25), int(GREEN[1]*0.25), int(GREEN[2]*0.25)), bh//2)
+        rnd(drw, z70, by, BAR_X + BAR_W, by + bh,
+            (int(RED[0]*0.25), int(RED[1]*0.25), int(RED[2]*0.25)), bh//2)
 
-        # Colored fill up to current value
-        dot_x = BAR_X + int(min(max(val, 0), 100) / 100 * BAR_W)
-        fill_w = max(dot_x - BAR_X, BAR_H)
-        rnd(drw, BAR_X, BAR_Y, BAR_X + fill_w, BAR_Y + BAR_H, rc, BAR_H // 2)
+        # Colored fill
+        fill_end = BAR_X + int(min(max(val, 0), 100) / 100 * BAR_W)
+        fill_w   = max(fill_end - BAR_X, bh)
+        rnd(drw, BAR_X, by, BAR_X + fill_w, by + bh, rc, bh // 2)
 
-        # Zone marker lines
-        drw.line([(z30, BAR_Y - 4), (z30, BAR_Y + BAR_H + 4)],
-                 fill=(60, 64, 90), width=1)
-        drw.line([(z70, BAR_Y - 4), (z70, BAR_Y + BAR_H + 4)],
-                 fill=(60, 64, 90), width=1)
+        # Value (right of bar)
+        val_s = str(val)
+        vx = BAR_X + BAR_W + 14
+        drw.text((vx, Y + 10), val_s, font=fb14, fill=rc)
+        vw = tw(drw, val_s, fb14)
 
-        # Current value dot
-        drw.ellipse([dot_x - 6, BAR_Y - 3, dot_x + 6, BAR_Y + BAR_H + 3], fill=rc)
+        # Timeframe (far right)
+        drw.text((vx + vw + 12, Y + 14), tf, font=f9, fill=DGRAY)
 
-        # Scale labels
-        drw.text((BAR_X, BAR_Y + 14),       "30",  font=f10, fill=DGRAY)
-        drw.text((z70 - 8, BAR_Y + 14),     "70",  font=f10, fill=DGRAY)
+        Y += ROW_H
 
     # RSI interpretation
-    r6, r12, r24 = coin.get("rsi6",50), coin.get("rsi12",50), coin.get("rsi24",50)
     if r6 < 35 and r12 < 35 and r24 < 35:
         imsg, ic = "Все RSI ниже 35 — сильный сигнал входа", GREEN
     elif r6 > 65 and r12 > 65 and r24 > 65:
@@ -321,115 +310,83 @@ def generate_coin_card(coin, gdata):
     else:
         imsg, ic = "RSI согласованы — тренд стабилен", LGRAY
 
-    drw.rectangle([P, _INTERP_Y + 4, P + 5, _INTERP_Y + 26], fill=ic)
-    drw.text((P + 14, _INTERP_Y + 4), imsg, font=f13, fill=ic)
+    Y += 6
+    rnd(drw, CX, Y, CX + CW, Y + 56, BG_BLOK, 12)
+    drw.rectangle([CX, Y + 12, CX + 4, Y + 44], fill=ic)
+    drw.text((CX + 18, Y + 16), imsg, font=f11, fill=ic)
 
-    # ── DIVIDER 3 ────────────────────────────────────────────
-    drw.line([(P, _DIV3), (W - P, _DIV3)], fill=LINE, width=1)
+    Y += 72
 
     # ── INDICATORS ───────────────────────────────────────────
-    IND_W = (W - P * 2 - 40) // 3
+    IND_W = (CW - 28) // 3
+    IND_H = 112
 
-    macd_v = coin.get("macd", 0)
     macd_c = GREEN if macd_v > 0 else RED
     macd_s = f"+{macd_v}" if macd_v >= 0 else str(macd_v)
     macd_l = "бычий" if macd_v > 0 else "медвежий"
 
-    fr  = coin.get("funding_rate")
-    frs = coin.get("funding_src", "")
-    fri = coin.get("funding_interp", "нет данных")
     if fr is not None:
         fr_s = f"{fr:+.4f}%"
         fr_c = RED if fr > 0.1 else AMBER if fr > 0.05 else LGRAY if fr > -0.02 else GREEN
+        fr_l = coin.get("funding_interp", "")[:16].lower()
     else:
-        fr_s, fr_c, fri, frs = "N/A", DGRAY, "нет данных", ""
+        fr_s, fr_c, fr_l = "N/A", DGRAY, "нет данных"
 
-    bp   = coin.get("bb_pos", "н/д")
-    bp_c = GREEN if "нижней" in bp else RED if "верхней" in bp else AMBER if "%" in bp else LGRAY
+    bb_c = GREEN if bb_pct <= 25 else RED if bb_pct >= 75 else AMBER
+    bb_s = f"{bb_pct}%"
+    bb_l = bb_label(bb_pct)
 
     for idx, (lbl, val_s, sub, col) in enumerate([
-        ("MACD",           macd_s,    macd_l,    macd_c),
-        (f"FUNDING {frs}", fr_s,      fri[:22],  fr_c),
-        ("BOLLINGER",      bp[:18],   "позиция", bp_c),
+        ("MACD",    macd_s, macd_l, macd_c),
+        ("FUNDING", fr_s,   fr_l,   fr_c),
+        ("BOLLINGER", bb_s, bb_l,   bb_c),
     ]):
-        ix = P + idx * (IND_W + 20)
-        rnd(drw, ix, _IND_Y, ix + IND_W, _IND_Y + _IND_H, PANEL, 10)
-        drw.rectangle([ix, _IND_Y, ix + 5, _IND_Y + _IND_H], fill=col)
-        drw.text((ix + 18, _IND_Y + 10), lbl,   font=f10,  fill=LGRAY)
-        drw.text((ix + 18, _IND_Y + 32), val_s, font=fb16, fill=col)
-        drw.text((ix + 18, _IND_Y + 70), sub,   font=f10,  fill=DGRAY)
+        ix = CX + idx * (IND_W + 14)
+        rnd(drw, ix, Y, ix + IND_W, Y + IND_H, BG_BLOK, 14)
+        drw.text((ix + 16, Y + 14), lbl,   font=f9,   fill=LGRAY)
+        drw.text((ix + 16, Y + 36), val_s, font=fb18, fill=col)
+        drw.text((ix + 16, Y + 80), sub,   font=f10,  fill=DGRAY)
 
-    # ── DIVIDER 4 ────────────────────────────────────────────
-    drw.line([(P, _DIV4), (W - P, _DIV4)], fill=LINE, width=1)
-
-    # ── TARGET / STOP ────────────────────────────────────────
-    TS_W = (W - P * 2 - 24) // 2
-    target = coin.get("target", price)
-    stop   = coin.get("stop",   price)
-    pct_t  = (target / price - 1) * 100 if price > 0 else 0
-    pct_s  = (stop   / price - 1) * 100 if price > 0 else 0
-
-    # Target
-    rnd(drw, P, _TS_Y, P + TS_W, _TS_Y + _TS_H, PANEL, 10)
-    drw.rectangle([P, _TS_Y, P + 5, _TS_Y + _TS_H], fill=GREEN)
-    lbl_t = f"ЦЕЛЬ  {pct_t:+.1f}% от цены"
-    drw.text((P + 18, _TS_Y + 8), lbl_t, font=f10, fill=LGRAY)
-    drw.text((P + 18, _TS_Y + 26), f"${target:,.2f}" if target < 10 else f"${target:,.0f}",
-             font=fb22, fill=GREEN)
-
-    # Stop
-    sx = P + TS_W + 24
-    rnd(drw, sx, _TS_Y, sx + TS_W, _TS_Y + _TS_H, PANEL, 10)
-    drw.rectangle([sx, _TS_Y, sx + 5, _TS_Y + _TS_H], fill=RED)
-    lbl_s = f"СТОП-ЛОСС  {pct_s:+.1f}% от цены"
-    drw.text((sx + 18, _TS_Y + 8), lbl_s, font=f10, fill=LGRAY)
-    drw.text((sx + 18, _TS_Y + 26), f"${stop:,.2f}" if stop < 10 else f"${stop:,.0f}",
-             font=fb22, fill=RED)
-
-    # ── DIVIDER 5 ────────────────────────────────────────────
-    drw.line([(P, _DIV5), (W - P, _DIV5)], fill=LINE, width=1)
+    Y += IND_H + 20
 
     # ── GLOBAL MARKET ────────────────────────────────────────
-    GM_W = (W - P * 2 - 60) // 4
+    GM_H = 118
+    rnd(drw, CX, Y, CX + CW, Y + GM_H, BG_BLOK, 14)
 
-    fg  = gdata.get("fg",  {})
-    dom = gdata.get("dom", {})
-    gm  = []
-
+    gm_cols = []
     if fg.get("ok"):
         fv = fg["value"]
         fc = RED if fv <= 25 else AMBER if fv <= 45 else LGRAY if fv <= 55 else GREEN
-        gm.append(("FEAR & GREED", f"{fv}/100", fg.get("label","")[:14], fc))
+        gm_cols.append(("FEAR & GREED", f"{fv}", fg.get("label","")[:12], fc))
     else:
-        gm.append(("FEAR & GREED", "N/A", "недоступно", DGRAY))
+        gm_cols.append(("FEAR & GREED", "N/A", "", DGRAY))
 
     if dom.get("ok"):
-        gm.append(("BTC DOM",    f"{dom['dom']}%",       dom["sig"][:15], BLUE))
-        gm.append(("MARKET CAP", f"${dom['mcap']:.0f}B", "глобальный",    LGRAY))
-        gm.append(("ОБЪ. 24H",   f"${dom['vol']:.0f}B",  "торговый",      LGRAY))
+        gm_cols.append(("BTC DOM",    f"{dom['dom']}%",       dom["sig"][:18], BLUE))
+        gm_cols.append(("КАП. РЫНКА", f"${dom['mcap']:.0f}B", "",             LGRAY))
     else:
-        for lbl in ("BTC DOM", "MARKET CAP", "ОБЪ. 24H"):
-            gm.append((lbl, "N/A", "", DGRAY))
+        gm_cols += [("BTC DOM","N/A","",DGRAY), ("КАП. РЫНКА","N/A","",DGRAY)]
 
-    for idx, (lbl, val_s, sub, col) in enumerate(gm):
-        gx = P + idx * (GM_W + 20)
-        rnd(drw, gx, _GM_Y, gx + GM_W, _GM_Y + _GM_H, PANEL, 10)
-        drw.text((gx + 14, _GM_Y + 5),  lbl,      font=f10,  fill=LGRAY)
-        drw.text((gx + 14, _GM_Y + 22), val_s,    font=fb14, fill=col)
-        drw.text((gx + 14, _GM_Y + 46), sub[:17], font=f10,  fill=DGRAY)
+    col_w = CW // len(gm_cols)
+    for idx, (lbl, val_s, sub, col) in enumerate(gm_cols):
+        gx = CX + idx * col_w
+        if idx > 0:
+            drw.line([(gx, Y + 24), (gx, Y + GM_H - 24)], fill=LINE, width=1)
+        drw.text((gx + 22, Y + 14), lbl,   font=f9,   fill=LGRAY)
+        drw.text((gx + 22, Y + 38), val_s, font=fb18, fill=col)
+        if sub:
+            drw.text((gx + 22, Y + 82), sub, font=f10, fill=DGRAY)
+
+    Y += GM_H + 18
 
     # ── FOOTER ───────────────────────────────────────────────
-    drw.line([(P, _FOOT_DIV), (W - P, _FOOT_DIV)], fill=LINE, width=1)
-    drw.text((P, _FOOT_TXT_Y),
-             "Не является финансовой рекомендацией  •  DYOR",
-             font=f10, fill=DGRAY)
-    next_s = f"Следующий отчёт: {gdata.get('next_hour', '')} МСК"
-    drw.text((W - P - tw(drw, next_s, f10), _FOOT_TXT_Y),
-             next_s, font=f10, fill=DGRAY)
+    drw.text((CX, Y + 4), "TY SMITH SIGNALS", font=f9, fill=DGRAY)
+    ts = f"{gdata.get('time', '')} МСК"
+    drw.text((CX + CW - tw(drw, ts, f9), Y + 4), ts, font=f9, fill=DGRAY)
 
     # ── Export ───────────────────────────────────────────────
     buf = io.BytesIO()
-    img.convert("RGB").save(buf, format="PNG", optimize=True)
+    img.save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf.read()
 
