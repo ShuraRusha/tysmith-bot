@@ -162,10 +162,11 @@ def calc_macd(closes):
             e.append(p * k + e[-1] * (1 - k))
         return e
     if len(closes) < 26:
-        return 0, 0, 0
+        return 0, 0, 0, []
     m = [a - b for a, b in zip(ema(closes,12), ema(closes,26))]
     s = ema(m, 9)
-    return round(m[-1],2), round(s[-1],2), round(m[-1]-s[-1],2)
+    hist = [round(mv - sv, 4) for mv, sv in zip(m, s)]
+    return round(m[-1],2), round(s[-1],2), round(m[-1]-s[-1],2), hist[-8:]
 
 def bollinger(closes, p=20):
     if len(closes) < p:
@@ -296,7 +297,7 @@ async def collect_data():
             r6     = calc_rsi(closes, 6)
             r12    = calc_rsi(closes, 12)
             r24    = calc_rsi(closes, 24)
-            _, _, mh   = calc_macd(closes)
+            _, _, mh, macd_hist = calc_macd(closes)
             bl, bm, bh = bollinger(closes)
             fr     = funding_map.get(coin_id, {"ok": False})
             sig    = generate_signal(change, r12, mh, price, fr=fr.get("rate",0), fr_ok=fr.get("ok",False))
@@ -321,6 +322,7 @@ async def collect_data():
                 "rsi12":          r12,
                 "rsi24":          r24,
                 "macd":           mh,
+                "macd_hist":      macd_hist,
                 "bb_pos":         bp,
                 "funding_rate":   fr.get("rate") if fr.get("ok") else None,
                 "funding_src":    fr.get("source",""),

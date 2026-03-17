@@ -145,8 +145,9 @@ def generate_coin_card(coin, gdata):
     chg    = coin.get("change", 0)
     score  = coin.get("score", 0)
     r6, r12, r24 = coin.get("rsi6", 50), coin.get("rsi12", 50), coin.get("rsi24", 50)
-    macd_v = coin.get("macd", 0)
-    fr     = coin.get("funding_rate")
+    macd_v    = coin.get("macd", 0)
+    macd_hist = coin.get("macd_hist", [])
+    fr        = coin.get("funding_rate")
     bb_pos = coin.get("bb_pos", "н/д")
     bb_pct = bb_pct_from_pos(bb_pos)
     target = coin.get("target", price)
@@ -335,11 +336,20 @@ def generate_coin_card(coin, gdata):
 
     # ── INDICATORS ───────────────────────────────────────────
     IND_W = (CW - 28) // 3
-    IND_H = 116
+    IND_H = 130
 
+    # MACD: direction label + momentum + mini histogram bars
     macd_c = GREEN if macd_v > 0 else RED
-    macd_s = f"+{macd_v}" if macd_v >= 0 else str(macd_v)
-    macd_l = "бычий" if macd_v > 0 else "медвежий"
+    if len(macd_hist) >= 2:
+        growing = macd_hist[-1] > macd_hist[-2]
+    else:
+        growing = macd_v > 0
+    if macd_v > 0:
+        macd_dir = "Бычий"
+        macd_mom = "усиливается" if growing else "ослабевает"
+    else:
+        macd_dir = "Медвежий"
+        macd_mom = "усиливается" if not growing else "ослабевает"
 
     if fr is not None:
         fr_s = f"{fr:+.4f}%"
@@ -352,18 +362,45 @@ def generate_coin_card(coin, gdata):
     bb_s = f"{bb_pct}%"
     bb_l = bb_label(bb_pct)
 
+    # Draw FUNDING and BOLLINGER cards (standard layout)
     for idx, (lbl, val_s, sub, col) in enumerate([
-        ("MACD",      macd_s, macd_l, macd_c),
-        ("FUNDING",   fr_s,   fr_l,   fr_c),
-        ("BOLLINGER", bb_s,   bb_l,   bb_c),
+        ("FUNDING",   fr_s, fr_l, fr_c),
+        ("BOLLINGER", bb_s, bb_l, bb_c),
     ]):
-        ix = CX + idx * (IND_W + 14)
+        ix = CX + (idx + 1) * (IND_W + 14)
         rnd(drw, ix, Y, ix + IND_W, Y + IND_H, BG_BLOK, 14)
-        # Top accent border on each indicator card
         rnd(drw, ix, Y, ix + IND_W, Y + 3, col, 2)
         text(drw, ix + 16, Y + 14, lbl,   f9,   LGRAY)
         text(drw, ix + 16, Y + 36, val_s, fb18, col)
-        text(drw, ix + 16, Y + 84, sub,   f10,  DGRAY)
+        text(drw, ix + 16, Y + 96, sub,   f10,  DGRAY)
+
+    # Draw MACD card with mini histogram
+    mx = CX
+    rnd(drw, mx, Y, mx + IND_W, Y + IND_H, BG_BLOK, 14)
+    rnd(drw, mx, Y, mx + IND_W, Y + 3, macd_c, 2)
+    text(drw, mx + 16, Y + 14, "MACD",    f9,   LGRAY)
+    text(drw, mx + 16, Y + 36, macd_dir,  fb14, macd_c)
+    text(drw, mx + 16, Y + 68, macd_mom,  f10,  macd_c)
+
+    # Mini histogram bars (last 8 candles)
+    if macd_hist:
+        bars_n  = len(macd_hist)
+        bar_w   = 7   # logical px per bar
+        bar_gap = 3
+        bars_total_w = bars_n * (bar_w + bar_gap) - bar_gap
+        bx_start = mx + IND_W - 16 - bars_total_w
+        max_abs  = max(abs(v) for v in macd_hist) or 1
+        bar_max_h = 20   # max bar height in logical px
+        base_y    = Y + 88
+
+        for bi, hv in enumerate(macd_hist):
+            bx  = bx_start + bi * (bar_w + bar_gap)
+            bh  = max(int(abs(hv) / max_abs * bar_max_h), 2)
+            col = GREEN if hv >= 0 else RED
+            # bars grow upward from baseline
+            rnd(drw, bx, base_y - bh, bx + bar_w, base_y, col, 2)
+        # baseline
+        line(drw, bx_start - 2, base_y, bx_start + bars_total_w + 2, base_y, DGRAY, 1)
 
     Y += IND_H + 18
 
