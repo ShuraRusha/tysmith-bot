@@ -374,32 +374,32 @@ def generate_coin_card(coin, gdata):
         text(drw, ix + 16, Y + 36, val_s, fb18, col)
         text(drw, ix + 16, Y + 96, sub,   f10,  DGRAY)
 
-    # Draw MACD card with mini histogram
-    mx = CX
+    # Draw MACD card: number + direction + momentum + mini histogram
+    mx      = CX
+    macd_num = f"+{macd_v}" if macd_v >= 0 else str(macd_v)
+    macd_sub = f"{macd_dir}  {macd_mom}"
     rnd(drw, mx, Y, mx + IND_W, Y + IND_H, BG_BLOK, 14)
     rnd(drw, mx, Y, mx + IND_W, Y + 3, macd_c, 2)
-    text(drw, mx + 16, Y + 14, "MACD",    f9,   LGRAY)
-    text(drw, mx + 16, Y + 36, macd_dir,  fb14, macd_c)
-    text(drw, mx + 16, Y + 68, macd_mom,  f10,  macd_c)
+    text(drw, mx + 16, Y + 12, "MACD",    f9,   LGRAY)   # label
+    text(drw, mx + 16, Y + 30, macd_num,  fb14, macd_c)  # number (+420.5)
+    text(drw, mx + 16, Y + 60, macd_sub,  f9,   macd_c)  # Бычий  усиливается
 
-    # Mini histogram bars (last 8 candles)
+    # Mini histogram bars aligned to bottom of card
     if macd_hist:
-        bars_n  = len(macd_hist)
-        bar_w   = 7   # logical px per bar
-        bar_gap = 3
+        bars_n       = len(macd_hist)
+        bar_w        = 7
+        bar_gap      = 3
         bars_total_w = bars_n * (bar_w + bar_gap) - bar_gap
-        bx_start = mx + IND_W - 16 - bars_total_w
-        max_abs  = max(abs(v) for v in macd_hist) or 1
-        bar_max_h = 20   # max bar height in logical px
-        base_y    = Y + 88
+        bx_start     = mx + 16
+        max_abs      = max(abs(v) for v in macd_hist) or 1
+        bar_max_h    = 22
+        base_y       = Y + IND_H - 12
 
         for bi, hv in enumerate(macd_hist):
             bx  = bx_start + bi * (bar_w + bar_gap)
             bh  = max(int(abs(hv) / max_abs * bar_max_h), 2)
             col = GREEN if hv >= 0 else RED
-            # bars grow upward from baseline
             rnd(drw, bx, base_y - bh, bx + bar_w, base_y, col, 2)
-        # baseline
         line(drw, bx_start - 2, base_y, bx_start + bars_total_w + 2, base_y, DGRAY, 1)
 
     Y += IND_H + 18
