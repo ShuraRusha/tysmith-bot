@@ -229,12 +229,52 @@ def generate_signal(change, r12, mh, price, fr=0, fr_ok=False):
         stop   = round(price * 0.98, 0)
     return {"action": action, "conf": conf, "target": target, "stop": stop, "score": s}
 
+# ── OHLC cache (TTL = 4 hours) ────────────────────────────────
+_ohlc_cache: dict = {}   # coin_id -> list of candles
+_ohlc_ts:    dict = {}   # coin_id -> datetime of last fetch
+OHLC_TTL = 4 * 3600      # seconds
+
+async def fetch_ohlc_cached(coin_id: str) -> list:
+    """Return cached OHLC if fresh enough, otherwise fetch and update cache."""
+    now = datetime.now(MOSCOW_TZ).timestamp()
+    if coin_id in _ohlc_cache and now - _ohlc_ts.get(coin_id, 0) < OHLC_TTL:
+        log.info(f"OHLC cache hit for {coin_id}")
+        return _ohlc_cache[coin_id]
+    try:
+        data = await fetch_ohlc(coin_id)
+        _ohlc_cache[coin_id] = data
+        _ohlc_ts[coin_id] = now
+        log.info(f"OHLC fetched for {coin_id}: {len(data)} candles")
+        return data
+    except Exception as e:
+        log.warning(f"OHLC fetch failed for {coin_id}: {e}")
+        return _ohlc_cache.get(coin_id, [])   # return stale cache on error
+
+
 async def collect_data():
     now_msk = datetime.now(MOSCOW_TZ)
+    # Fetch prices, FG, DOM all in parallel
     prices, fg, dom = await asyncio.gather(fetch_prices(), fetch_fear_greed(), fetch_dominance())
     log.info(f"Prices OK: {list(prices.keys()) if isinstance(prices, dict) else 'ERROR'}")
     log.info(f"FG: {fg}")
     log.info(f"DOM: {dom}")
+
+    # Fetch OHLC for coins that need a refresh (sequentially to avoid 429)
+    coin_ids = list(COINS.keys())
+    for i, coin_id in enumerate(coin_ids):
+        now_ts = datetime.now(MOSCOW_TZ).timestamp()
+        age = now_ts - _ohlc_ts.get(coin_id, 0)
+        if age >= OHLC_TTL:
+            if i > 0:
+                await asyncio.sleep(5)  # avoid CoinGecko rate limit between fetches
+            await fetch_ohlc_cached(coin_id)
+
+    # Fetch all funding rates in parallel (Bybit handles concurrent requests fine)
+    funding_results = await asyncio.gather(
+        *[fetch_funding(meta["bybit"]) for meta in COINS.values()]
+    )
+    funding_map = {coin_id: fr for coin_id, fr in zip(COINS.keys(), funding_results)}
+
     next_hour = (now_msk.hour + 1) % 24
     result = {
         "time":      now_msk.strftime("%d.%m.%Y %H:%M"),
@@ -251,19 +291,14 @@ async def collect_data():
             vol    = d.get("usd_24h_vol", 0)
             mcap   = d.get("usd_market_cap", 0)
             log.info(f"{meta['symbol']}: price={price} change={change}")
-            await asyncio.sleep(5)  # avoid CoinGecko rate limit between coins
-            try:
-                ohlc = await fetch_ohlc(coin_id)
-            except Exception as ohlc_err:
-                log.warning(f"OHLC failed for {coin_id}, using defaults: {ohlc_err}")
-                ohlc = []
+            ohlc   = _ohlc_cache.get(coin_id, [])
             closes = [c[4] for c in ohlc] if ohlc else []
             r6     = calc_rsi(closes, 6)
             r12    = calc_rsi(closes, 12)
             r24    = calc_rsi(closes, 24)
             _, _, mh   = calc_macd(closes)
             bl, bm, bh = bollinger(closes)
-            fr     = await fetch_funding(meta["bybit"])
+            fr     = funding_map.get(coin_id, {"ok": False})
             sig    = generate_signal(change, r12, mh, price, fr=fr.get("rate",0), fr_ok=fr.get("ok",False))
             if bl and bh and price and (bh - bl) > 0:
                 pct = int((price-bl)/(bh-bl)*100)
