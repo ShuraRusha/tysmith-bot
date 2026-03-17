@@ -336,7 +336,7 @@ def generate_coin_card(coin, gdata):
 
     # ── INDICATORS ───────────────────────────────────────────
     IND_W = (CW - 28) // 3
-    IND_H = 130
+    IND_H = 144
 
     # MACD: direction label + momentum + mini histogram bars
     macd_c = GREEN if macd_v > 0 else RED
@@ -372,19 +372,24 @@ def generate_coin_card(coin, gdata):
         rnd(drw, ix, Y, ix + IND_W, Y + 3, col, 2)
         text(drw, ix + 16, Y + 14, lbl,   f9,   LGRAY)
         text(drw, ix + 16, Y + 36, val_s, fb18, col)
-        text(drw, ix + 16, Y + 96, sub,   f10,  DGRAY)
+        text(drw, ix + 16, Y + 108, sub,  f10,  DGRAY)
 
-    # Draw MACD card: number + direction + momentum + mini histogram
-    mx      = CX
+    # Draw MACD card: number | direction + momentum | histogram
+    # Layout (logical px from card top):
+    #  +13 : "MACD" label
+    #  +32 : number  (+420.5)          fb14 ~30px tall → ends at ~+62
+    #  +70 : "Бычий  усиливается"      f9   ~18px tall → ends at ~+88
+    #  +94…+130 : mini histogram bars
+    mx       = CX
     macd_num = f"+{macd_v}" if macd_v >= 0 else str(macd_v)
     macd_sub = f"{macd_dir}  {macd_mom}"
     rnd(drw, mx, Y, mx + IND_W, Y + IND_H, BG_BLOK, 14)
     rnd(drw, mx, Y, mx + IND_W, Y + 3, macd_c, 2)
-    text(drw, mx + 16, Y + 12, "MACD",    f9,   LGRAY)   # label
-    text(drw, mx + 16, Y + 30, macd_num,  fb14, macd_c)  # number (+420.5)
-    text(drw, mx + 16, Y + 60, macd_sub,  f9,   macd_c)  # Бычий  усиливается
+    text(drw, mx + 16, Y + 13, "MACD",    f9,   LGRAY)
+    text(drw, mx + 16, Y + 32, macd_num,  fb14, macd_c)
+    text(drw, mx + 16, Y + 70, macd_sub,  f9,   macd_c)
 
-    # Mini histogram bars aligned to bottom of card
+    # Mini histogram bars
     if macd_hist:
         bars_n       = len(macd_hist)
         bar_w        = 7
@@ -392,8 +397,8 @@ def generate_coin_card(coin, gdata):
         bars_total_w = bars_n * (bar_w + bar_gap) - bar_gap
         bx_start     = mx + 16
         max_abs      = max(abs(v) for v in macd_hist) or 1
-        bar_max_h    = 22
-        base_y       = Y + IND_H - 12
+        bar_max_h    = 24
+        base_y       = Y + IND_H - 10
 
         for bi, hv in enumerate(macd_hist):
             bx  = bx_start + bi * (bar_w + bar_gap)
