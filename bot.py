@@ -186,39 +186,71 @@ def rsi_label(v):
     else:
         return "норма"
 
-def generate_signal(change, r12, mh, price, fr=0, fr_ok=False):
+def generate_signal(change, r6, r12, r24, mh, macd_hist, bb_pct, price, fr=0, fr_ok=False):
+    """
+    Multi-factor signal scoring.
+
+    RSI: average of all three timeframes + cross-timeframe trend direction
+    MACD: histogram value AND direction (growing / shrinking)
+    Bollinger: price position within the band
+    Funding: extreme positioning warning
+    Change: 24h momentum confirmation
+    """
     s = 0
-    if r12 < 30:      s += 3
-    elif r12 < 40:    s += 2
-    elif r12 < 50:    s += 1
-    elif r12 > 75:    s -= 3
-    elif r12 > 65:    s -= 2
-    elif r12 > 55:    s -= 1
-    if mh > 0:        s += 1
-    else:             s -= 1
-    if change > 5:    s += 2
-    elif change > 2:  s += 1
-    elif change < -5: s -= 2
-    elif change < -2: s -= 1
+
+    # ── RSI composite (average of 3 timeframes) ──────────────
+    rsi_avg = (r6 + r12 + r24) / 3
+    if   rsi_avg < 30: s += 3
+    elif rsi_avg < 40: s += 2
+    elif rsi_avg < 50: s += 1
+    elif rsi_avg > 70: s -= 3
+    elif rsi_avg > 60: s -= 2
+    elif rsi_avg > 55: s -= 1
+
+    # ── RSI trend direction (short-term vs long-term) ─────────
+    if   r6 > r24: s += 1   # short-term rising above long-term → bullish
+    elif r6 < r24: s -= 1   # short-term falling below long-term → bearish
+
+    # ── MACD histogram: value + momentum direction ────────────
+    macd_growing = len(macd_hist) >= 2 and macd_hist[-1] > macd_hist[-2]
+    if mh > 0:
+        s += 2 if macd_growing else 1   # positive and growing = strong bull
+    else:
+        s -= 2 if not macd_growing else 1  # negative and falling = strong bear
+
+    # ── Bollinger Bands position ──────────────────────────────
+    if   bb_pct < 15: s += 2
+    elif bb_pct < 30: s += 1
+    elif bb_pct > 85: s -= 2
+    elif bb_pct > 70: s -= 1
+
+    # ── Funding rate ──────────────────────────────────────────
     if fr_ok:
-        if fr > 0.1:      s -= 1
-        elif fr < -0.05:  s += 1
-    if s >= 4:
+        if   fr >  0.10: s -= 2   # longs heavily overloaded
+        elif fr >  0.05: s -= 1
+        elif fr < -0.05: s += 1   # shorts overloaded → squeeze potential
+
+    # ── 24h price change (momentum confirmation) ──────────────
+    if   change >  3: s += 1
+    elif change < -3: s -= 1
+
+    # ── Map score to action ───────────────────────────────────
+    if s >= 5:
         action = "ПОКУПАТЬ"
         conf   = "Высокая"
         target = round(price * 1.07, 0)
         stop   = round(price * 0.95, 0)
-    elif s >= 2:
+    elif s >= 3:
         action = "НАКАПЛИВАТЬ"
         conf   = "Умеренная"
         target = round(price * 1.04, 0)
         stop   = round(price * 0.97, 0)
-    elif s <= -4:
+    elif s <= -5:
         action = "ПРОДАВАТЬ"
         conf   = "Высокая"
         target = round(price * 0.93, 0)
-        stop   = round(price * 1.04, 0)
-    elif s <= -2:
+        stop   = round(price * 1.05, 0)
+    elif s <= -3:
         action = "ОСТОРОЖНО"
         conf   = "Умеренная"
         target = round(price * 0.97, 0)
@@ -228,6 +260,7 @@ def generate_signal(change, r12, mh, price, fr=0, fr_ok=False):
         conf   = "Низкая"
         target = round(price * 1.02, 0)
         stop   = round(price * 0.98, 0)
+
     return {"action": action, "conf": conf, "target": target, "stop": stop, "score": s}
 
 # ── OHLC cache (TTL = 4 hours) ────────────────────────────────
@@ -300,17 +333,24 @@ async def collect_data():
             _, _, mh, macd_hist = calc_macd(closes)
             bl, bm, bh = bollinger(closes)
             fr     = funding_map.get(coin_id, {"ok": False})
-            sig    = generate_signal(change, r12, mh, price, fr=fr.get("rate",0), fr_ok=fr.get("ok",False))
             if bl and bh and price and (bh - bl) > 0:
-                pct = int((price-bl)/(bh-bl)*100)
+                pct = int((price - bl) / (bh - bl) * 100)
                 if price <= bl:
-                    bp = "У нижней полосы"
+                    bp     = "У нижней полосы"
+                    bb_pct = 0
                 elif price >= bh:
-                    bp = "У верхней полосы"
+                    bp     = "У верхней полосы"
+                    bb_pct = 100
                 else:
-                    bp = f"Середина {pct}%"
+                    bp     = f"Середина {pct}%"
+                    bb_pct = pct
             else:
-                bp = "н/д"
+                bp     = "н/д"
+                bb_pct = 50
+            sig = generate_signal(
+                change, r6, r12, r24, mh, macd_hist, bb_pct, price,
+                fr=fr.get("rate", 0), fr_ok=fr.get("ok", False)
+            )
             coin_data = {
                 "symbol":         meta["symbol"],
                 "price":          price,
