@@ -20,10 +20,10 @@ HEADERS = {
 }
 
 COINS = {
-    "bitcoin":   {"symbol": "BTC",  "bybit": "BTCUSDT"},
-    "ethereum":  {"symbol": "ETH",  "bybit": "ETHUSDT"},
-    "solana":    {"symbol": "SOL",  "bybit": "SOLUSDT"},
-    "chainlink": {"symbol": "LINK", "bybit": "LINKUSDT"},
+    "bitcoin":   {"symbol": "BTC",  "bybit": "BTCUSDT",  "okx": "BTC-USDT"},
+    "ethereum":  {"symbol": "ETH",  "bybit": "ETHUSDT",  "okx": "ETH-USDT"},
+    "solana":    {"symbol": "SOL",  "bybit": "SOLUSDT",  "okx": "SOL-USDT"},
+    "chainlink": {"symbol": "LINK", "bybit": "LINKUSDT", "okx": "LINK-USDT"},
 }
 
 async def get(url, retries=5):
@@ -55,8 +55,31 @@ async def fetch_prices():
     url += f"?ids={ids}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_market_cap=true"
     return await get(url)
 
-async def fetch_ohlc(coin_id):
-    return await get(f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days=7")
+async def fetch_candles_bybit(symbol, limit=200):
+    """Fetch hourly OHLC candles from Bybit spot market (newest-first → reversed to oldest-first)."""
+    url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}&interval=60&limit={limit}"
+    data = await get(url)
+    candles = data["result"]["list"]  # newest first: [ts, open, high, low, close, volume, turnover]
+    return list(reversed(candles))    # return oldest first
+
+async def fetch_candles_okx(symbol, limit=200):
+    """Fetch hourly OHLC candles from OKX spot market (fallback)."""
+    url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=1H&limit={limit}"
+    data = await get(url)
+    candles = data["data"]  # newest first: [ts, open, high, low, close, vol, ...]
+    return list(reversed(candles))   # return oldest first
+
+async def fetch_candles(bybit_sym, okx_sym, limit=200):
+    """Fetch candles from Bybit spot; fallback to OKX spot on error."""
+    try:
+        return await fetch_candles_bybit(bybit_sym, limit)
+    except Exception as e:
+        log.warning(f"Bybit candles failed for {bybit_sym}: {e}, trying OKX")
+    try:
+        return await fetch_candles_okx(okx_sym, limit)
+    except Exception as e:
+        log.error(f"OKX candles also failed for {okx_sym}: {e}")
+        return []
 
 async def fetch_fear_greed():
     try:
@@ -138,21 +161,22 @@ async def fetch_funding(sym):
     return {"ok": False}
 
 def calc_rsi(closes, p=14):
+    """RSI using Wilder's EMA smoothing — matches TradingView / OKX / Bybit charts."""
     if len(closes) < p + 1:
         return 50.0
-    g = []
-    l = []
-    for i in range(1, len(closes)):
-        d = closes[i] - closes[i-1]
-        if d > 0:
-            g.append(abs(d))
-        else:
-            l.append(abs(d))
-    ag = sum(g[-p:]) / p if g else 0.0
-    al = sum(l[-p:]) / p if l else 0.0
-    if al == 0:
+    changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains   = [max(c, 0.0) for c in changes]
+    losses  = [abs(min(c, 0.0)) for c in changes]
+    # Seed: simple average of first `p` bars
+    avg_gain = sum(gains[:p]) / p
+    avg_loss = sum(losses[:p]) / p
+    # Wilder's smoothing for remaining bars
+    for i in range(p, len(changes)):
+        avg_gain = (avg_gain * (p - 1) + gains[i]) / p
+        avg_loss = (avg_loss * (p - 1) + losses[i]) / p
+    if avg_loss == 0:
         return 100.0
-    return round(100 - (100 / (1 + ag/al)), 1)
+    return round(100 - (100 / (1 + avg_gain / avg_loss)), 1)
 
 def calc_macd(closes):
     def ema(d, n):
@@ -263,25 +287,26 @@ def generate_signal(change, r6, r12, r24, mh, macd_hist, bb_pct, price, fr=0, fr
 
     return {"action": action, "conf": conf, "target": target, "stop": stop, "score": s}
 
-# ── OHLC cache (TTL = 4 hours) ────────────────────────────────
+# ── Candle cache (TTL = 55 min — refreshes every hourly report) ──────────────
 _ohlc_cache: dict = {}   # coin_id -> list of candles
-_ohlc_ts:    dict = {}   # coin_id -> datetime of last fetch
-OHLC_TTL = 4 * 3600      # seconds
+_ohlc_ts:    dict = {}   # coin_id -> timestamp of last fetch
+OHLC_TTL = 55 * 60       # seconds
 
 async def fetch_ohlc_cached(coin_id: str) -> list:
-    """Return cached OHLC if fresh enough, otherwise fetch and update cache."""
+    """Return cached candles if fresh, otherwise fetch from Bybit/OKX and update cache."""
     now = datetime.now(MOSCOW_TZ).timestamp()
     if coin_id in _ohlc_cache and now - _ohlc_ts.get(coin_id, 0) < OHLC_TTL:
-        log.info(f"OHLC cache hit for {coin_id}")
+        log.info(f"Candle cache hit for {coin_id}")
         return _ohlc_cache[coin_id]
+    meta = COINS[coin_id]
     try:
-        data = await fetch_ohlc(coin_id)
+        data = await fetch_candles(meta["bybit"], meta["okx"])
         _ohlc_cache[coin_id] = data
         _ohlc_ts[coin_id] = now
-        log.info(f"OHLC fetched for {coin_id}: {len(data)} candles")
+        log.info(f"Candles fetched for {coin_id} from exchange: {len(data)} candles")
         return data
     except Exception as e:
-        log.warning(f"OHLC fetch failed for {coin_id}: {e}")
+        log.warning(f"Candle fetch failed for {coin_id}: {e}")
         return _ohlc_cache.get(coin_id, [])   # return stale cache on error
 
 
@@ -293,15 +318,8 @@ async def collect_data():
     log.info(f"FG: {fg}")
     log.info(f"DOM: {dom}")
 
-    # Fetch OHLC for coins that need a refresh (sequentially to avoid 429)
-    coin_ids = list(COINS.keys())
-    for i, coin_id in enumerate(coin_ids):
-        now_ts = datetime.now(MOSCOW_TZ).timestamp()
-        age = now_ts - _ohlc_ts.get(coin_id, 0)
-        if age >= OHLC_TTL:
-            if i > 0:
-                await asyncio.sleep(5)  # avoid CoinGecko rate limit between fetches
-            await fetch_ohlc_cached(coin_id)
+    # Fetch candles for all coins in parallel (exchange APIs handle concurrent requests fine)
+    await asyncio.gather(*[fetch_ohlc_cached(coin_id) for coin_id in COINS.keys()])
 
     # Fetch all funding rates in parallel (Bybit handles concurrent requests fine)
     funding_results = await asyncio.gather(
@@ -326,7 +344,7 @@ async def collect_data():
             mcap   = d.get("usd_market_cap", 0)
             log.info(f"{meta['symbol']}: price={price} change={change}")
             ohlc   = _ohlc_cache.get(coin_id, [])
-            closes = [c[4] for c in ohlc] if ohlc else []
+            closes = [float(c[4]) for c in ohlc] if ohlc else []
             r6     = calc_rsi(closes, 6)
             r12    = calc_rsi(closes, 12)
             r24    = calc_rsi(closes, 24)
