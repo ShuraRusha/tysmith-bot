@@ -5,7 +5,7 @@ import aiohttp
 from telegram import Bot
 from telegram.constants import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from dashboard import generate_all_cards
+from dashboard import generate_collage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -518,28 +518,22 @@ async def send_signals():
         data = await collect_data()
         log.info(f"Coins collected: {len(data['coins'])}")
 
-        cards = generate_all_cards(data)
-        log.info(f"Cards generated: {len(cards)}")
+        log.info("Генерируем PDF-коллаж...")
+        pdf_bytes = generate_collage(data)
+        log.info(f"PDF сгенерирован: {len(pdf_bytes):,} байт")
 
-        bot = Bot(token=BOT_TOKEN)
+        bot_client = Bot(token=BOT_TOKEN)
+        now_str  = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y_%H-%M")
+        filename = f"TySmith_{now_str}.pdf"
 
-        if cards:
-            for i, card_bytes in enumerate(cards):
-                log.info(f"Sending card {i+1}, size={len(card_bytes)} bytes")
-                await bot.send_photo(
-                    chat_id=CHAT_ID,
-                    photo=io.BytesIO(card_bytes)
-                )
-                await asyncio.sleep(1)
-            log.info("All cards sent")
-        else:
-            log.error("No cards generated!")
-
-        text = build_text_report(data)
-        if len(text) > 4000:
-            text = text[:3990] + "\n...обрезано"
-        await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.MARKDOWN)
-        log.info("Text report sent")
+        await bot_client.send_document(
+            chat_id=CHAT_ID,
+            document=io.BytesIO(pdf_bytes),
+            filename=filename,
+            caption=f"*TY SMITH SIGNAL REPORT*  |  {data['time']} МСК",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        log.info("PDF-коллаж отправлен")
 
     except Exception as e:
         log.error(f"Ошибка send_signals: {e}", exc_info=True)

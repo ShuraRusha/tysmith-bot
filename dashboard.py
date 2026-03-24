@@ -491,6 +491,151 @@ def generate_coin_card(coin, gdata):
     return buf.read()
 
 
+def generate_collage(data) -> bytes:
+    """
+    Premium 2×2 collage of all 4 coin cards exported as a high-resolution PDF.
+
+    Layout
+    ──────
+    ┌──────────────────── header (logo + global metrics) ─────────────────────┐
+    │  BTC                    │  ETH                                           │
+    │  SOL                    │  LINK                                          │
+    └─────────────────────────────────────────────────────────────────────────┘
+
+    Each coin card is rendered at the existing 900 × 1260 resolution (with 2×
+    internal supersampling), so the collage is ~1876 × 2796 px @ 200 DPI.
+    """
+    OUTER = 28   # outer canvas padding
+    GAP   = 20   # gap between cards
+    HDR_H = 190  # header height
+
+    cw, ch  = W, H
+    total_w = OUTER + cw + GAP + cw + OUTER
+    total_h = OUTER + HDR_H + GAP + ch + GAP + ch + OUTER
+
+    # ── Canvas ────────────────────────────────────────────────────────────────
+    canvas = Image.new("RGB", (total_w, total_h), BG_OUT)
+    cdraw  = ImageDraw.Draw(canvas)
+
+    # Vertical gradient across the whole canvas
+    for yi in range(total_h):
+        t = yi / total_h
+        c = tuple(int(BG_OUT[i] + (BG_CARD[i] - BG_OUT[i]) * t * 0.22) for i in range(3))
+        cdraw.line([(0, yi), (total_w, yi)], fill=c)
+
+    # ── Header background ─────────────────────────────────────────────────────
+    hy = OUTER
+    for yi in range(HDR_H):
+        t = yi / HDR_H
+        c = tuple(int(BG_CARD[i] + (BG_BLOK[i] - BG_CARD[i]) * t * 0.55) for i in range(3))
+        cdraw.line([(0, hy + yi), (total_w, hy + yi)], fill=c)
+
+    # White accent stripe at the very top
+    cdraw.rectangle([0, hy, total_w, hy + 4], fill=WHITE)
+
+    # Thin separator at header bottom
+    cdraw.line([(0, hy + HDR_H - 1), (total_w, hy + HDR_H - 1)], fill=LINE, width=1)
+
+    # ── Header fonts (direct sizes — canvas is 1×, not 2×) ───────────────────
+    _hf = {
+        "title": ImageFont.truetype(BOLD_PATH, 54),
+        "sub":   ImageFont.truetype(BOLD_PATH, 25),
+        "time":  ImageFont.truetype(REG_PATH,  15),
+        "rep":   ImageFont.truetype(BOLD_PATH, 15),
+        "mlbl":  ImageFont.truetype(REG_PATH,  13),
+        "mval":  ImageFont.truetype(BOLD_PATH, 30),
+        "msub":  ImageFont.truetype(REG_PATH,  13),
+    }
+
+    PAD = 46
+
+    # Logo block
+    cdraw.text((PAD, hy + 22),  "TY SMITH",  font=_hf["title"], fill=WHITE)
+    cdraw.text((PAD, hy + 88),  "SIGNALS",   font=_hf["sub"],   fill=LGRAY)
+    cdraw.text((PAD, hy + 128), data.get("time", "") + " МСК",
+               font=_hf["time"], fill=DGRAY)
+
+    # Vertical divider after logo
+    cdraw.line([(340, hy + 24), (340, hy + HDR_H - 24)], fill=LINE, width=1)
+
+    # Report label (centered between divider and pills)
+    cdraw.text((362, hy + 70), "SIGNAL REPORT", font=_hf["rep"], fill=LGRAY)
+
+    # ── Global metric pills ───────────────────────────────────────────────────
+    fg    = data.get("fg",    {})
+    dom   = data.get("dom",   {})
+    nupl  = data.get("nupl",  {})
+    puell = data.get("puell", {})
+
+    pills = []
+    if fg.get("ok"):
+        fv = fg["value"]
+        fc = RED if fv <= 25 else AMBER if fv <= 45 else LGRAY if fv <= 55 else GREEN
+        pills.append(("FEAR & GREED", str(fv), fg.get("label", "")[:14], fc))
+    if dom.get("ok"):
+        pills.append(("BTC DOM", f"{dom['dom']}%", dom["sig"][:16], BLUE))
+    if nupl.get("ok"):
+        nv = nupl["value"]
+        nc = RED if nv > 0.75 else AMBER if nv > 0.5 else LGRAY if nv > 0.25 else GREEN
+        pills.append(("NUPL", f"{nv:.3f}", nupl.get("zone", "")[:16], nc))
+    if puell.get("ok"):
+        pv = puell["value"]
+        pc = RED if pv > 2.5 else AMBER if pv > 1.5 else LGRAY if pv > 0.8 else GREEN
+        pills.append(("PUELL", f"{pv:.2f}x", puell.get("zone", "")[:16], pc))
+
+    if pills:
+        PILL_W   = 270
+        PILL_H   = 122
+        PILL_GAP = 14
+        PILL_Y   = hy + (HDR_H - PILL_H) // 2
+        n        = len(pills)
+        total_pw = n * PILL_W + (n - 1) * PILL_GAP
+        pill_x0  = total_w - PAD - total_pw
+        r        = 10
+
+        for mi, (lbl, val_s, sub_s, col) in enumerate(pills):
+            px, py = pill_x0 + mi * (PILL_W + PILL_GAP), PILL_Y
+
+            # Rounded-rect background
+            cdraw.rectangle([px + r, py,          px + PILL_W - r, py + PILL_H],     fill=BG_BLOK)
+            cdraw.rectangle([px,     py + r,       px + PILL_W,     py + PILL_H - r], fill=BG_BLOK)
+            for cx2, cy2 in [(px, py), (px + PILL_W - 2*r, py),
+                             (px, py + PILL_H - 2*r), (px + PILL_W - 2*r, py + PILL_H - 2*r)]:
+                cdraw.ellipse([cx2, cy2, cx2 + 2*r, cy2 + 2*r], fill=BG_BLOK)
+
+            # Accent colour bar at pill top
+            cdraw.rectangle([px + r, py, px + PILL_W - r, py + 4], fill=col)
+
+            # Text
+            ix = px + 16
+            cdraw.text((ix, py + 12), lbl,   font=_hf["mlbl"], fill=LGRAY)
+            cdraw.text((ix, py + 34), val_s, font=_hf["mval"], fill=col)
+            cdraw.text((ix, py + 88), sub_s, font=_hf["msub"], fill=DGRAY)
+
+    # ── Paste 4 coin cards ────────────────────────────────────────────────────
+    y1 = OUTER + HDR_H + GAP
+    y2 = y1 + ch + GAP
+    x1 = OUTER
+    x2 = OUTER + cw + GAP
+
+    positions = [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]
+
+    for i, coin in enumerate(data.get("coins", [])[:4]):
+        try:
+            card_img = Image.open(io.BytesIO(generate_coin_card(coin, data)))
+            canvas.paste(card_img, positions[i])
+        except Exception as e:
+            import traceback
+            print(f"Collage card error {coin.get('symbol','?')}: {e}", flush=True)
+            traceback.print_exc()
+
+    # ── Export as high-resolution PDF ─────────────────────────────────────────
+    buf = io.BytesIO()
+    canvas.save(buf, format="PDF", resolution=200)
+    buf.seek(0)
+    return buf.read()
+
+
 def generate_all_cards(data):
     cards = []
     for coin in data.get("coins", []):
