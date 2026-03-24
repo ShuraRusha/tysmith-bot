@@ -493,73 +493,82 @@ def generate_coin_card(coin, gdata):
 
 def generate_collage(data) -> bytes:
     """
-    Premium 2×2 collage of all 4 coin cards exported as a high-resolution PDF.
+    Premium full-bleed 2×2 collage.
 
-    Layout
-    ──────
-    ┌──────────────────── header (logo + global metrics) ─────────────────────┐
-    │  BTC                    │  ETH                                           │
-    │  SOL                    │  LINK                                          │
-    └─────────────────────────────────────────────────────────────────────────┘
-
-    Each coin card is rendered at the existing 900 × 1260 resolution (with 2×
-    internal supersampling), so the collage is ~1876 × 2796 px @ 200 DPI.
+    Design principles:
+    • Canvas background = BG_OUT (exact match to card outer padding colour)
+      → cards appear seamlessly integrated, zero visible border/frame effect
+    • 8 px side margins, 2 px internal separators → tight & modern grid
+    • 190 px header with bold 68-px logo, gradient accent stripe, metric pills
+    • Pills tinted with their accent colour for expressiveness
+    • 1818 × 2726 px @ 200 DPI ≈ A3 portrait, crisp on any screen
     """
-    OUTER = 28   # outer canvas padding
-    GAP   = 20   # gap between cards
-    HDR_H = 190  # header height
+    H_PAD   = 8    # horizontal outer margin (tiny — near full-bleed)
+    TOP     = 5    # top accent stripe height (blue→green gradient)
+    HDR_H   = 190  # header panel height
+    SEP     = 2    # thin separator between cards
+    BOT     = 9    # bottom margin
 
-    cw, ch  = W, H
-    total_w = OUTER + cw + GAP + cw + OUTER
-    total_h = OUTER + HDR_H + GAP + ch + GAP + ch + OUTER
+    total_w = H_PAD + W + SEP + W + H_PAD          # 1818
+    total_h = TOP + HDR_H + SEP + H + SEP + H + BOT  # 2726
 
-    # ── Canvas ────────────────────────────────────────────────────────────────
+    SEP_COL = (22, 26, 42)
+
+    # ── Canvas: same colour as card outer padding → seamless blending ─────────
     canvas = Image.new("RGB", (total_w, total_h), BG_OUT)
     cdraw  = ImageDraw.Draw(canvas)
 
-    # Vertical gradient across the whole canvas
+    # Replicate card's own outer gradient so the whole canvas is one unified field
     for yi in range(total_h):
         t = yi / total_h
-        c = tuple(int(BG_OUT[i] + (BG_CARD[i] - BG_OUT[i]) * t * 0.22) for i in range(3))
+        c = tuple(int(BG_OUT[i] + (BG_CARD[i] - BG_OUT[i]) * t * 0.4) for i in range(3))
         cdraw.line([(0, yi), (total_w, yi)], fill=c)
 
-    # ── Header background ─────────────────────────────────────────────────────
-    hy = OUTER
+    # ── Top accent stripe: blue → green horizontal gradient ───────────────────
+    for xi in range(total_w):
+        t   = xi / total_w
+        col = tuple(int(BLUE[i] + (GREEN[i] - BLUE[i]) * t) for i in range(3))
+        cdraw.line([(xi, 0), (xi, TOP)], fill=col)
+
+    # ── Header: subtle inner-glow background (darker at edges, lighter mid) ───
+    hy = TOP
     for yi in range(HDR_H):
-        t = yi / HDR_H
-        c = tuple(int(BG_CARD[i] + (BG_BLOK[i] - BG_CARD[i]) * t * 0.55) for i in range(3))
+        t    = yi / HDR_H
+        glow = 4 * t * (1 - t)        # bell curve, peaks at 0.5
+        c    = tuple(int(BG_OUT[i] + (BG_BLOK[i] - BG_OUT[i]) * glow * 0.60) for i in range(3))
         cdraw.line([(0, hy + yi), (total_w, hy + yi)], fill=c)
 
-    # White accent stripe at the very top
-    cdraw.rectangle([0, hy, total_w, hy + 4], fill=WHITE)
+    # Thin separator at base of header
+    cdraw.rectangle([H_PAD + 16, hy + HDR_H - 1,
+                     total_w - H_PAD - 16, hy + HDR_H], fill=LINE)
 
-    # Thin separator at header bottom
-    cdraw.line([(0, hy + HDR_H - 1), (total_w, hy + HDR_H - 1)], fill=LINE, width=1)
-
-    # ── Header fonts (direct sizes — canvas is 1×, not 2×) ───────────────────
-    _hf = {
-        "title": ImageFont.truetype(BOLD_PATH, 54),
-        "sub":   ImageFont.truetype(BOLD_PATH, 25),
-        "time":  ImageFont.truetype(REG_PATH,  15),
-        "rep":   ImageFont.truetype(BOLD_PATH, 15),
-        "mlbl":  ImageFont.truetype(REG_PATH,  13),
-        "mval":  ImageFont.truetype(BOLD_PATH, 30),
-        "msub":  ImageFont.truetype(REG_PATH,  13),
+    # ── Header fonts (1× sizing — canvas is NOT supersampled) ────────────────
+    _F = {
+        "logo": ImageFont.truetype(BOLD_PATH, 68),   # "TY SMITH"
+        "sub":  ImageFont.truetype(BOLD_PATH, 26),   # "SIGNALS"
+        "time": ImageFont.truetype(REG_PATH,  14),
+        "rep":  ImageFont.truetype(BOLD_PATH, 14),
+        "mlbl": ImageFont.truetype(REG_PATH,  12),
+        "mval": ImageFont.truetype(BOLD_PATH, 34),   # big metric number
+        "msub": ImageFont.truetype(REG_PATH,  12),
     }
 
-    PAD = 46
+    lx = H_PAD + 32   # left content x
 
-    # Logo block
-    cdraw.text((PAD, hy + 22),  "TY SMITH",  font=_hf["title"], fill=WHITE)
-    cdraw.text((PAD, hy + 88),  "SIGNALS",   font=_hf["sub"],   fill=LGRAY)
-    cdraw.text((PAD, hy + 128), data.get("time", "") + " МСК",
-               font=_hf["time"], fill=DGRAY)
+    # Logo text
+    cdraw.text((lx, hy + 16),  "TY SMITH", font=_F["logo"], fill=WHITE)
+    cdraw.text((lx, hy + 100), "SIGNALS",  font=_F["sub"],  fill=LGRAY)
+    cdraw.text((lx, hy + 143), data.get("time", "") + " МСК",
+               font=_F["time"], fill=DGRAY)
 
-    # Vertical divider after logo
-    cdraw.line([(340, hy + 24), (340, hy + HDR_H - 24)], fill=LINE, width=1)
+    # Two decorative accent bars under "TY SMITH" (blue + green)
+    cdraw.rectangle([lx,      hy + 97, lx + 32, hy + 100], fill=BLUE)
+    cdraw.rectangle([lx + 38, hy + 97, lx + 70, hy + 100], fill=GREEN)
 
-    # Report label (centered between divider and pills)
-    cdraw.text((362, hy + 70), "SIGNAL REPORT", font=_hf["rep"], fill=LGRAY)
+    # Divider + label
+    div_x = lx + 340
+    cdraw.line([(div_x, hy + 22), (div_x, hy + HDR_H - 22)], fill=LINE, width=1)
+    cdraw.text((div_x + 22, hy + 80), "SIGNAL REPORT", font=_F["rep"], fill=LGRAY)
 
     # ── Global metric pills ───────────────────────────────────────────────────
     fg    = data.get("fg",    {})
@@ -584,52 +593,67 @@ def generate_collage(data) -> bytes:
         pills.append(("PUELL", f"{pv:.2f}x", puell.get("zone", "")[:16], pc))
 
     if pills:
-        PILL_W   = 270
-        PILL_H   = 122
+        PILL_W   = 258
+        PILL_H   = 140
         PILL_GAP = 14
         PILL_Y   = hy + (HDR_H - PILL_H) // 2
         n        = len(pills)
         total_pw = n * PILL_W + (n - 1) * PILL_GAP
-        pill_x0  = total_w - PAD - total_pw
+        pill_x0  = total_w - H_PAD - 32 - total_pw
         r        = 10
 
         for mi, (lbl, val_s, sub_s, col) in enumerate(pills):
             px, py = pill_x0 + mi * (PILL_W + PILL_GAP), PILL_Y
 
-            # Rounded-rect background
-            cdraw.rectangle([px + r, py,          px + PILL_W - r, py + PILL_H],     fill=BG_BLOK)
-            cdraw.rectangle([px,     py + r,       px + PILL_W,     py + PILL_H - r], fill=BG_BLOK)
+            # Pill bg: BG_BLK2 tinted with accent colour
+            pill_bg = tuple(
+                max(0, min(255, int(BG_BLK2[i] * 0.86 + col[i] * 0.12)))
+                for i in range(3)
+            )
+            # Rounded rect
+            cdraw.rectangle([px + r, py,         px + PILL_W - r, py + PILL_H],     fill=pill_bg)
+            cdraw.rectangle([px,     py + r,      px + PILL_W,     py + PILL_H - r], fill=pill_bg)
             for cx2, cy2 in [(px, py), (px + PILL_W - 2*r, py),
                              (px, py + PILL_H - 2*r), (px + PILL_W - 2*r, py + PILL_H - 2*r)]:
-                cdraw.ellipse([cx2, cy2, cx2 + 2*r, cy2 + 2*r], fill=BG_BLOK)
+                cdraw.ellipse([cx2, cy2, cx2 + 2*r, cy2 + 2*r], fill=pill_bg)
 
-            # Accent colour bar at pill top
-            cdraw.rectangle([px + r, py, px + PILL_W - r, py + 4], fill=col)
+            # 5-px accent bar + 5-px glow
+            cdraw.rectangle([px + r, py, px + PILL_W - r, py + 5], fill=col)
+            glow = tuple(int(col[i] * 0.30 + pill_bg[i] * 0.70) for i in range(3))
+            cdraw.rectangle([px + r, py + 5, px + PILL_W - r, py + 10], fill=glow)
 
             # Text
-            ix = px + 16
-            cdraw.text((ix, py + 12), lbl,   font=_hf["mlbl"], fill=LGRAY)
-            cdraw.text((ix, py + 34), val_s, font=_hf["mval"], fill=col)
-            cdraw.text((ix, py + 88), sub_s, font=_hf["msub"], fill=DGRAY)
+            ix = px + 18
+            cdraw.text((ix, py + 16),  lbl,   font=_F["mlbl"], fill=LGRAY)
+            cdraw.text((ix, py + 38),  val_s, font=_F["mval"], fill=col)
+            cdraw.text((ix, py + 104), sub_s, font=_F["msub"], fill=DGRAY)
 
-    # ── Paste 4 coin cards ────────────────────────────────────────────────────
-    y1 = OUTER + HDR_H + GAP
-    y2 = y1 + ch + GAP
-    x1 = OUTER
-    x2 = OUTER + cw + GAP
+    # ── Card grid ─────────────────────────────────────────────────────────────
+    card_y1 = TOP + HDR_H + SEP
+    card_y2 = card_y1 + H + SEP
+    card_x1 = H_PAD
+    card_x2 = H_PAD + W + SEP
 
-    positions = [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]
+    # Hair-line cross separators
+    cdraw.rectangle([card_x1 + W, card_y1,
+                     card_x1 + W + SEP, card_y2 + H], fill=SEP_COL)
+    cdraw.rectangle([card_x1, card_y1 + H,
+                     card_x2 + W, card_y1 + H + SEP], fill=SEP_COL)
 
+    positions = [
+        (card_x1, card_y1), (card_x2, card_y1),
+        (card_x1, card_y2), (card_x2, card_y2),
+    ]
     for i, coin in enumerate(data.get("coins", [])[:4]):
         try:
             card_img = Image.open(io.BytesIO(generate_coin_card(coin, data)))
             canvas.paste(card_img, positions[i])
         except Exception as e:
             import traceback
-            print(f"Collage card error {coin.get('symbol','?')}: {e}", flush=True)
+            print(f"Collage card {coin.get('symbol','?')}: {e}", flush=True)
             traceback.print_exc()
 
-    # ── Export as high-resolution PDF ─────────────────────────────────────────
+    # ── Export PDF @ 200 DPI ──────────────────────────────────────────────────
     buf = io.BytesIO()
     canvas.save(buf, format="PDF", resolution=200)
     buf.seek(0)
