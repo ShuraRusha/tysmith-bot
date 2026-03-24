@@ -3,7 +3,7 @@ import io, os, base64, tempfile, re
 from fonts_data import NUNITO_REGULAR, NUNITO_BOLD
 
 # Output size
-W, H = 900, 1120
+W, H = 900, 1260
 # Supersampling scale — draw at 2× then downscale for crisp anti-aliasing
 S = 2
 WS, HS = W * S, H * S
@@ -438,6 +438,41 @@ def generate_coin_card(coin, gdata):
             text(drw, gx + 22, Y + 88, sub, f10, DGRAY)
 
     Y += GM_H + 16
+
+    # ── ON-CHAIN METRICS ─────────────────────────────────────
+    OC_H  = 130
+    nupl  = gdata.get("nupl",  {})
+    puell = gdata.get("puell", {})
+
+    rnd(drw, CX, Y, CX + CW, Y + OC_H, BG_BLOK, 14)
+    text(drw, CX + 22, Y + 12, "ON-CHAIN МЕТРИКИ", f9, LGRAY)
+
+    oc_items = []
+    if nupl.get("ok"):
+        nv  = nupl["value"]
+        nc  = RED if nv > 0.75 else AMBER if nv > 0.5 else LGRAY if nv > 0.25 else GREEN
+        oc_items.append(("NUPL", f"{nv:.3f}", nupl.get("zone", "")[:22], nc))
+    else:
+        oc_items.append(("NUPL", "N/A", "нет данных", DGRAY))
+
+    if puell.get("ok"):
+        pv  = puell["value"]
+        pc  = RED if pv > 2.5 else AMBER if pv > 1.5 else LGRAY if pv > 0.8 else GREEN
+        oc_items.append(("PUELL MULTIPLE", f"{pv:.2f}x", puell.get("zone", "")[:22], pc))
+    else:
+        oc_items.append(("PUELL MULTIPLE", "N/A", "нет данных", DGRAY))
+
+    oc_col_w = CW // len(oc_items)
+    for idx, (lbl, val_s, sub, col) in enumerate(oc_items):
+        ox = CX + idx * oc_col_w
+        if idx > 0:
+            line(drw, ox, Y + 28, ox, Y + OC_H - 18, LINE, 1)
+        text(drw, ox + 22, Y + 30, lbl,   f9,   LGRAY)
+        text(drw, ox + 22, Y + 52, val_s, fb18, col)
+        if sub:
+            text(drw, ox + 22, Y + 102, sub, f10, DGRAY)
+
+    Y += OC_H + 16
 
     # ── FOOTER ───────────────────────────────────────────────
     line(drw, CX, Y, CX + CW, Y, LINE, 1)

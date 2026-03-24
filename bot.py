@@ -90,6 +90,78 @@ async def fetch_dominance():
         log.error(f"DOM error: {e}")
         return {"ok": False}
 
+async def fetch_nupl():
+    """NUPL (Net Unrealized Profit/Loss) — эмоциональное состояние рынка BTC.
+    Источник: CoinMetrics community API (NUPLAdj).
+    Диапазон: < 0 капитуляция … > 0.75 эйфория."""
+    try:
+        url = (
+            "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
+            "?assets=btc&metrics=NUPLAdj&frequency=1d&page_size=3"
+        )
+        data = await get(url)
+        rows = data.get("data", [])
+        if not rows:
+            return {"ok": False}
+        val = float(rows[-1]["NUPLAdj"])
+        if val < 0:
+            zone   = "Капитуляция"
+            interp = "Экстремальная перепроданность — сильный вход"
+        elif val < 0.25:
+            zone   = "Надежда/Накопление"
+            interp = "Рынок восстанавливается — хорошая зона"
+        elif val < 0.5:
+            zone   = "Оптимизм"
+            interp = "Здоровый тренд — продолжение вероятно"
+        elif val < 0.75:
+            zone   = "Вера/Отрицание"
+            interp = "Рынок горячий — сокращай позиции"
+        else:
+            zone   = "Эйфория"
+            interp = "Экстремальная перекупленность — высокий риск"
+        log.info(f"NUPL: {val:.3f} ({zone})")
+        return {"ok": True, "value": round(val, 3), "zone": zone, "interp": interp}
+    except Exception as e:
+        log.error(f"NUPL error: {e}")
+        return {"ok": False}
+
+async def fetch_puell():
+    """Puell Multiple — давление со стороны майнеров BTC.
+    = дневная выручка майнеров / 365-дневная скользящая средняя выручки.
+    Источник: blockchain.info charts API."""
+    try:
+        url = "https://api.blockchain.info/charts/miners-revenue?timespan=2years&format=json&cors=true"
+        data = await get(url)
+        values = data.get("values", [])
+        if len(values) < 365:
+            return {"ok": False}
+        revenues = [v["y"] for v in values]
+        today_rev = revenues[-1]
+        ma365     = sum(revenues[-365:]) / 365
+        if ma365 == 0:
+            return {"ok": False}
+        puell = today_rev / ma365
+        if puell < 0.5:
+            zone   = "Зона покупки"
+            interp = "Майнеры в стрессе — дно близко"
+        elif puell < 0.8:
+            zone   = "Недооценка"
+            interp = "Хорошая зона накопления"
+        elif puell < 1.5:
+            zone   = "Справедливая цена"
+            interp = "Нейтральная зона"
+        elif puell < 2.5:
+            zone   = "Переоценка"
+            interp = "Майнеры в прибыли — осторожно"
+        else:
+            zone   = "Зона продажи"
+            interp = "Сильная перекупленность — высокий риск"
+        log.info(f"Puell Multiple: {puell:.2f} ({zone})")
+        return {"ok": True, "value": round(puell, 2), "zone": zone, "interp": interp}
+    except Exception as e:
+        log.error(f"Puell error: {e}")
+        return {"ok": False}
+
 async def fetch_funding_bybit(symbol):
     try:
         url  = f"https://api.bybit.com/v5/market/funding/history?category=linear&symbol={symbol}&limit=1"
@@ -186,15 +258,18 @@ def rsi_label(v):
     else:
         return "норма"
 
-def generate_signal(change, r6, r12, r24, mh, macd_hist, bb_pct, price, fr=0, fr_ok=False):
+def generate_signal(change, r6, r12, r24, mh, macd_hist, bb_pct, price,
+                    fr=0, fr_ok=False, nupl=None, puell=None):
     """
     Multi-factor signal scoring.
 
-    RSI: average of all three timeframes + cross-timeframe trend direction
-    MACD: histogram value AND direction (growing / shrinking)
-    Bollinger: price position within the band
-    Funding: extreme positioning warning
-    Change: 24h momentum confirmation
+    RSI:          average of 3 timeframes + cross-timeframe trend  (-4 … +4)
+    MACD:         histogram value + momentum direction              (-2 … +2)
+    Bollinger:    price position within the band                    (-2 … +2)
+    Funding:      extreme positioning warning                       (-2 … +1)
+    Change:       24h momentum confirmation                         (-1 … +1)
+    NUPL:         emotional state of the BTC market                 (-3 … +3)
+    Puell:        miner revenue pressure                            (-2 … +2)
     """
     s = 0
 
@@ -208,15 +283,15 @@ def generate_signal(change, r6, r12, r24, mh, macd_hist, bb_pct, price, fr=0, fr
     elif rsi_avg > 55: s -= 1
 
     # ── RSI trend direction (short-term vs long-term) ─────────
-    if   r6 > r24: s += 1   # short-term rising above long-term → bullish
-    elif r6 < r24: s -= 1   # short-term falling below long-term → bearish
+    if   r6 > r24: s += 1
+    elif r6 < r24: s -= 1
 
     # ── MACD histogram: value + momentum direction ────────────
     macd_growing = len(macd_hist) >= 2 and macd_hist[-1] > macd_hist[-2]
     if mh > 0:
-        s += 2 if macd_growing else 1   # positive and growing = strong bull
+        s += 2 if macd_growing else 1
     else:
-        s -= 2 if not macd_growing else 1  # negative and falling = strong bear
+        s -= 2 if not macd_growing else 1
 
     # ── Bollinger Bands position ──────────────────────────────
     if   bb_pct < 15: s += 2
@@ -226,31 +301,47 @@ def generate_signal(change, r6, r12, r24, mh, macd_hist, bb_pct, price, fr=0, fr
 
     # ── Funding rate ──────────────────────────────────────────
     if fr_ok:
-        if   fr >  0.10: s -= 2   # longs heavily overloaded
+        if   fr >  0.10: s -= 2
         elif fr >  0.05: s -= 1
-        elif fr < -0.05: s += 1   # shorts overloaded → squeeze potential
+        elif fr < -0.05: s += 1
 
     # ── 24h price change (momentum confirmation) ──────────────
     if   change >  3: s += 1
     elif change < -3: s -= 1
 
-    # ── Map score to action ───────────────────────────────────
-    if s >= 5:
+    # ── NUPL: эмоциональное состояние рынка ──────────────────
+    if nupl is not None:
+        if   nupl < 0.00: s += 3   # Капитуляция — сильный вход
+        elif nupl < 0.25: s += 2   # Надежда/Накопление
+        elif nupl < 0.50: s += 1   # Оптимизм
+        elif nupl < 0.75: s -= 1   # Вера/Отрицание
+        else:             s -= 3   # Эйфория — высокий риск
+
+    # ── Puell Multiple: давление майнеров ────────────────────
+    if puell is not None:
+        if   puell < 0.50: s += 2   # Майнеры в стрессе — дно близко
+        elif puell < 0.80: s += 1   # Недооценка
+        elif puell < 1.50: s += 0   # Справедливая цена
+        elif puell < 2.50: s -= 1   # Переоценка
+        else:              s -= 2   # Зона продажи
+
+    # ── Map score to action (пороги скорректированы под новый диапазон) ──
+    if s >= 6:
         action = "ПОКУПАТЬ"
         conf   = "Высокая"
         target = round(price * 1.07, 0)
         stop   = round(price * 0.95, 0)
-    elif s >= 3:
+    elif s >= 4:
         action = "НАКАПЛИВАТЬ"
         conf   = "Умеренная"
         target = round(price * 1.04, 0)
         stop   = round(price * 0.97, 0)
-    elif s <= -5:
+    elif s <= -6:
         action = "ПРОДАВАТЬ"
         conf   = "Высокая"
         target = round(price * 0.93, 0)
         stop   = round(price * 1.05, 0)
-    elif s <= -3:
+    elif s <= -4:
         action = "ОСТОРОЖНО"
         conf   = "Умеренная"
         target = round(price * 0.97, 0)
@@ -287,11 +378,15 @@ async def fetch_ohlc_cached(coin_id: str) -> list:
 
 async def collect_data():
     now_msk = datetime.now(MOSCOW_TZ)
-    # Fetch prices, FG, DOM all in parallel
-    prices, fg, dom = await asyncio.gather(fetch_prices(), fetch_fear_greed(), fetch_dominance())
+    # Fetch prices, FG, DOM, NUPL, Puell all in parallel
+    prices, fg, dom, nupl, puell = await asyncio.gather(
+        fetch_prices(), fetch_fear_greed(), fetch_dominance(), fetch_nupl(), fetch_puell()
+    )
     log.info(f"Prices OK: {list(prices.keys()) if isinstance(prices, dict) else 'ERROR'}")
     log.info(f"FG: {fg}")
     log.info(f"DOM: {dom}")
+    log.info(f"NUPL: {nupl}")
+    log.info(f"Puell: {puell}")
 
     # Fetch OHLC for coins that need a refresh (sequentially to avoid 429)
     coin_ids = list(COINS.keys())
@@ -315,6 +410,8 @@ async def collect_data():
         "next_hour": f"{next_hour:02d}:00",
         "fg":        fg,
         "dom":       dom,
+        "nupl":      nupl,
+        "puell":     puell,
         "coins":     [],
     }
     for coin_id, meta in COINS.items():
@@ -349,7 +446,9 @@ async def collect_data():
                 bb_pct = 50
             sig = generate_signal(
                 change, r6, r12, r24, mh, macd_hist, bb_pct, price,
-                fr=fr.get("rate", 0), fr_ok=fr.get("ok", False)
+                fr=fr.get("rate", 0), fr_ok=fr.get("ok", False),
+                nupl=nupl.get("value")  if nupl.get("ok")  else None,
+                puell=puell.get("value") if puell.get("ok") else None,
             )
             coin_data = {
                 "symbol":         meta["symbol"],
@@ -380,9 +479,11 @@ async def collect_data():
     return result
 
 def build_text_report(data):
-    L   = []
-    fg  = data["fg"]
-    dom = data["dom"]
+    L     = []
+    fg    = data["fg"]
+    dom   = data["dom"]
+    nupl  = data.get("nupl",  {})
+    puell = data.get("puell", {})
     L.append("*TY SMITH SIGNAL REPORT v3*")
     L.append(f"Время: {data['time']} МСК")
     L.append("")
@@ -391,6 +492,10 @@ def build_text_report(data):
         L.append(f"Fear & Greed: *{v}/100* — {fg['label']} (delta {fg['delta']})")
     if dom.get("ok"):
         L.append(f"BTC Dom: *{dom['dom']}%* — {dom['sig']}")
+    if nupl.get("ok"):
+        L.append(f"NUPL: *{nupl['value']:.3f}* — {nupl['zone']}")
+    if puell.get("ok"):
+        L.append(f"Puell Multiple: *{puell['value']:.2f}x* — {puell['zone']}")
     L.append("")
     for c in data["coins"]:
         sign = "+" if c["change"] >= 0 else ""
