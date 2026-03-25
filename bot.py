@@ -1,4 +1,4 @@
-import os, asyncio, logging, io
+import os, asyncio, logging, io, sys
 from datetime import datetime
 import pytz
 import aiohttp
@@ -538,9 +538,30 @@ async def send_signals():
     except Exception as e:
         log.error(f"Ошибка send_signals: {e}", exc_info=True)
 
+PID_FILE = "/tmp/tysmith-bot.pid"
+
+def _acquire_pid_lock():
+    """Exit if another instance is already running."""
+    if os.path.exists(PID_FILE):
+        try:
+            old_pid = int(open(PID_FILE).read().strip())
+            os.kill(old_pid, 0)   # signal 0 = check if process exists
+            log.error(f"Бот уже запущен (PID {old_pid}). Выход.")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            pass   # stale PID file — overwrite it
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+def _release_pid_lock():
+    try:
+        os.remove(PID_FILE)
+    except FileNotFoundError:
+        pass
+
 async def main():
+    _acquire_pid_lock()
     log.info("Ty Smith Bot v3 запущен.")
-    await send_signals()
     scheduler = AsyncIOScheduler()
     scheduler.add_job(send_signals, "cron", hour="*", minute=0, timezone=MOSCOW_TZ)
     scheduler.start()
@@ -549,6 +570,8 @@ async def main():
             await asyncio.sleep(60)
     except (KeyboardInterrupt, SystemExit):
         log.info("Бот остановлен.")
+    finally:
+        _release_pid_lock()
 
 if __name__ == "__main__":
     asyncio.run(main())
