@@ -441,7 +441,6 @@ async def send_signals():
 
 async def main():
     log.info("Ty Smith Bot v3 запущен.")
-    await send_signals()
     scheduler = AsyncIOScheduler()
     scheduler.add_job(send_signals, "cron", hour="*", minute=0, timezone=MOSCOW_TZ)
     scheduler.start()
