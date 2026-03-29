@@ -1,454 +1,319 @@
-import os, asyncio, logging, io
+import asyncio
+import logging
 from datetime import datetime
-import pytz
-import aiohttp
-from telegram import Bot
-from telegram.constants import ParseMode
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from dashboard import generate_all_cards
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+import pytz
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
+from web3 import Web3
+from web3.middleware import geth_poa_middleware
+
+import config
+from analyzer import check_token, get_bnb_price
+from position import Position, PositionManager
+from trader import Trader
+from watcher import watch_pairs
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 log = logging.getLogger(__name__)
 
-BOT_TOKEN = "8557968994:AAGzIC3Hd00UVAr-zliHcovtYAg_WOrSet0"
-CHAT_ID   = "7675712715"
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-    "Accept": "application/json",
-}
 
-COINS = {
-    "bitcoin":   {"symbol": "BTC",  "bybit": "BTCUSDT"},
-    "ethereum":  {"symbol": "ETH",  "bybit": "ETHUSDT"},
-    "solana":    {"symbol": "SOL",  "bybit": "SOLUSDT"},
-    "chainlink": {"symbol": "LINK", "bybit": "LINKUSDT"},
-}
+# ── Web3 setup ────────────────────────────────────────────────────────────────
 
-async def get(url, retries=5):
-    """Fetch JSON with automatic retry on 429 / transient errors."""
-    for attempt in range(retries):
-        try:
-            async with aiohttp.ClientSession(headers=HEADERS) as s:
-                async with s.get(url, timeout=aiohttp.ClientTimeout(total=30)) as r:
-                    if r.status == 429:
-                        wait = 15 * (attempt + 1)
-                        log.warning(f"Rate limit (429) for {url} — waiting {wait}s")
-                        await asyncio.sleep(wait)
-                        continue
-                    r.raise_for_status()
-                    return await r.json(content_type=None)
-        except asyncio.TimeoutError:
-            log.warning(f"Timeout on {url}, attempt {attempt+1}/{retries}")
-            if attempt < retries - 1:
-                await asyncio.sleep(8)
-        except Exception as e:
-            log.warning(f"Request error {url}: {e}, attempt {attempt+1}/{retries}")
-            if attempt < retries - 1:
-                await asyncio.sleep(8)
-    raise RuntimeError(f"Failed to fetch {url} after {retries} attempts")
+def _make_w3(url: str) -> Web3:
+    w3 = Web3(Web3.HTTPProvider(url))
+    w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+    return w3
 
-async def fetch_prices():
-    ids = ",".join(COINS.keys())
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    url += f"?ids={ids}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_market_cap=true"
-    return await get(url)
+w3 = _make_w3(config.BSC_HTTP_RPC)
+if not w3.is_connected():
+    log.warning("Primary RPC unavailable — switching to backup")
+    w3 = _make_w3(config.BSC_HTTP_RPC_BACKUP)
 
-async def fetch_ohlc(coin_id):
-    return await get(f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days=7")
+trader = Trader(w3, config.PRIVATE_KEY, config.SLIPPAGE, config.GAS_MULTIPLIER)
 
-async def fetch_fear_greed():
-    try:
-        data = await get("https://api.alternative.me/fng/?limit=2")
-        t = data["data"][0]
-        y = data["data"][1]
-        val = int(t["value"])
-        delta = val - int(y["value"])
-        sign = "+" if delta >= 0 else ""
-        return {"value": val, "label": t["value_classification"], "delta": f"{sign}{delta}", "ok": True}
-    except Exception as e:
-        log.error(f"FG error: {e}")
-        return {"ok": False}
-
-async def fetch_dominance():
-    try:
-        data = await get("https://api.coingecko.com/api/v3/global")
-        dom  = data["data"]["market_cap_percentage"]["btc"]
-        mcap = data["data"]["total_market_cap"]["usd"]
-        vol  = data["data"]["total_volume"]["usd"]
-        if dom > 58:
-            sig = "Альты под давлением"
-        elif dom > 52:
-            sig = "Выбирай осторожно"
-        elif dom > 46:
-            sig = "Альты могут расти"
-        else:
-            sig = "Альт-сезон!"
-        return {"dom": round(dom,1), "sig": sig, "mcap": round(mcap/1e9,0), "vol": round(vol/1e9,0), "ok": True}
-    except Exception as e:
-        log.error(f"DOM error: {e}")
-        return {"ok": False}
-
-async def fetch_funding_bybit(symbol):
-    try:
-        url  = f"https://api.bybit.com/v5/market/funding/history?category=linear&symbol={symbol}&limit=1"
-        data = await get(url)
-        rate = float(data["result"]["list"][0]["fundingRate"]) * 100
-        if rate > 0.15:
-            interp = "Перегрев лонгов"
-        elif rate > 0.05:
-            interp = "Лонги доминируют"
-        elif rate > -0.02:
-            interp = "Нейтрально"
-        elif rate > -0.08:
-            interp = "Шорты доминируют"
-        else:
-            interp = "Перегрев шортов"
-        return {"rate": round(rate,4), "interp": interp, "ok": True, "source": "Bybit"}
-    except:
-        return {"ok": False}
-
-async def fetch_funding_okx(symbol):
-    try:
-        okx_sym = symbol.replace("USDT", "-USDT-SWAP")
-        data    = await get(f"https://www.okx.com/api/v5/public/funding-rate?instId={okx_sym}")
-        rate    = float(data["data"][0]["fundingRate"]) * 100
-        if rate > 0.15:
-            interp = "Перегрев лонгов"
-        elif rate > 0.05:
-            interp = "Лонги доминируют"
-        elif rate > -0.02:
-            interp = "Нейтрально"
-        elif rate > -0.08:
-            interp = "Шорты доминируют"
-        else:
-            interp = "Перегрев шортов"
-        return {"rate": round(rate,4), "interp": interp, "ok": True, "source": "OKX"}
-    except:
-        return {"ok": False}
-
-async def fetch_funding(sym):
-    r = await fetch_funding_bybit(sym)
-    if r.get("ok"):
-        return r
-    r = await fetch_funding_okx(sym)
-    if r.get("ok"):
-        return r
-    return {"ok": False}
-
-def calc_rsi(closes, p=14):
-    if len(closes) < p + 1:
-        return 50.0
-    g = []
-    l = []
-    for i in range(1, len(closes)):
-        d = closes[i] - closes[i-1]
-        if d > 0:
-            g.append(abs(d))
-        else:
-            l.append(abs(d))
-    ag = sum(g[-p:]) / p if g else 0.0
-    al = sum(l[-p:]) / p if l else 0.0
-    if al == 0:
-        return 100.0
-    return round(100 - (100 / (1 + ag/al)), 1)
-
-def calc_macd(closes):
-    def ema(d, n):
-        k = 2 / (n + 1)
-        e = [d[0]]
-        for p in d[1:]:
-            e.append(p * k + e[-1] * (1 - k))
-        return e
-    if len(closes) < 26:
-        return 0, 0, 0, []
-    m = [a - b for a, b in zip(ema(closes,12), ema(closes,26))]
-    s = ema(m, 9)
-    hist = [round(mv - sv, 4) for mv, sv in zip(m, s)]
-    return round(m[-1],2), round(s[-1],2), round(m[-1]-s[-1],2), hist[-8:]
-
-def bollinger(closes, p=20):
-    if len(closes) < p:
-        return None, None, None
-    w   = closes[-p:]
-    mid = sum(w) / p
-    std = (sum((x-mid)**2 for x in w) / p) ** 0.5
-    return round(mid-2*std,0), round(mid,0), round(mid+2*std,0)
-
-def rsi_label(v):
-    if v > 70:
-        return "перекуплен"
-    elif v < 30:
-        return "перепродан"
-    elif v < 40 or v > 60:
-        return "зона внимания"
-    else:
-        return "норма"
-
-def generate_signal(change, r6, r12, r24, mh, macd_hist, bb_pct, price, fr=0, fr_ok=False):
-    """
-    Multi-factor signal scoring.
-
-    RSI: average of all three timeframes + cross-timeframe trend direction
-    MACD: histogram value AND direction (growing / shrinking)
-    Bollinger: price position within the band
-    Funding: extreme positioning warning
-    Change: 24h momentum confirmation
-    """
-    s = 0
-
-    # ── RSI composite (average of 3 timeframes) ──────────────
-    rsi_avg = (r6 + r12 + r24) / 3
-    if   rsi_avg < 30: s += 3
-    elif rsi_avg < 40: s += 2
-    elif rsi_avg < 50: s += 1
-    elif rsi_avg > 70: s -= 3
-    elif rsi_avg > 60: s -= 2
-    elif rsi_avg > 55: s -= 1
-
-    # ── RSI trend direction (short-term vs long-term) ─────────
-    if   r6 > r24: s += 1   # short-term rising above long-term → bullish
-    elif r6 < r24: s -= 1   # short-term falling below long-term → bearish
-
-    # ── MACD histogram: value + momentum direction ────────────
-    macd_growing = len(macd_hist) >= 2 and macd_hist[-1] > macd_hist[-2]
-    if mh > 0:
-        s += 2 if macd_growing else 1   # positive and growing = strong bull
-    else:
-        s -= 2 if not macd_growing else 1  # negative and falling = strong bear
-
-    # ── Bollinger Bands position ──────────────────────────────
-    if   bb_pct < 15: s += 2
-    elif bb_pct < 30: s += 1
-    elif bb_pct > 85: s -= 2
-    elif bb_pct > 70: s -= 1
-
-    # ── Funding rate ──────────────────────────────────────────
-    if fr_ok:
-        if   fr >  0.10: s -= 2   # longs heavily overloaded
-        elif fr >  0.05: s -= 1
-        elif fr < -0.05: s += 1   # shorts overloaded → squeeze potential
-
-    # ── 24h price change (momentum confirmation) ──────────────
-    if   change >  3: s += 1
-    elif change < -3: s -= 1
-
-    # ── Map score to action ───────────────────────────────────
-    if s >= 5:
-        action = "ПОКУПАТЬ"
-        conf   = "Высокая"
-        target = round(price * 1.07, 0)
-        stop   = round(price * 0.95, 0)
-    elif s >= 3:
-        action = "НАКАПЛИВАТЬ"
-        conf   = "Умеренная"
-        target = round(price * 1.04, 0)
-        stop   = round(price * 0.97, 0)
-    elif s <= -5:
-        action = "ПРОДАВАТЬ"
-        conf   = "Высокая"
-        target = round(price * 0.93, 0)
-        stop   = round(price * 1.05, 0)
-    elif s <= -3:
-        action = "ОСТОРОЖНО"
-        conf   = "Умеренная"
-        target = round(price * 0.97, 0)
-        stop   = round(price * 1.02, 0)
-    else:
-        action = "НЕЙТРАЛЬНО"
-        conf   = "Низкая"
-        target = round(price * 1.02, 0)
-        stop   = round(price * 0.98, 0)
-
-    return {"action": action, "conf": conf, "target": target, "stop": stop, "score": s}
-
-# ── OHLC cache (TTL = 4 hours) ────────────────────────────────
-_ohlc_cache: dict = {}   # coin_id -> list of candles
-_ohlc_ts:    dict = {}   # coin_id -> datetime of last fetch
-OHLC_TTL = 4 * 3600      # seconds
-
-async def fetch_ohlc_cached(coin_id: str) -> list:
-    """Return cached OHLC if fresh enough, otherwise fetch and update cache."""
-    now = datetime.now(MOSCOW_TZ).timestamp()
-    if coin_id in _ohlc_cache and now - _ohlc_ts.get(coin_id, 0) < OHLC_TTL:
-        log.info(f"OHLC cache hit for {coin_id}")
-        return _ohlc_cache[coin_id]
-    try:
-        data = await fetch_ohlc(coin_id)
-        _ohlc_cache[coin_id] = data
-        _ohlc_ts[coin_id] = now
-        log.info(f"OHLC fetched for {coin_id}: {len(data)} candles")
-        return data
-    except Exception as e:
-        log.warning(f"OHLC fetch failed for {coin_id}: {e}")
-        return _ohlc_cache.get(coin_id, [])   # return stale cache on error
+# callback_id (first 10 chars of token address) → token info
+# cleaned up after user action (buy or skip)
+pending: dict[str, dict] = {}
 
 
-async def collect_data():
-    now_msk = datetime.now(MOSCOW_TZ)
-    # Fetch prices, FG, DOM all in parallel
-    prices, fg, dom = await asyncio.gather(fetch_prices(), fetch_fear_greed(), fetch_dominance())
-    log.info(f"Prices OK: {list(prices.keys()) if isinstance(prices, dict) else 'ERROR'}")
-    log.info(f"FG: {fg}")
-    log.info(f"DOM: {dom}")
+# ── Telegram helper ───────────────────────────────────────────────────────────
 
-    # Fetch OHLC for coins that need a refresh (sequentially to avoid 429)
-    coin_ids = list(COINS.keys())
-    for i, coin_id in enumerate(coin_ids):
-        now_ts = datetime.now(MOSCOW_TZ).timestamp()
-        age = now_ts - _ohlc_ts.get(coin_id, 0)
-        if age >= OHLC_TTL:
-            if i > 0:
-                await asyncio.sleep(5)  # avoid CoinGecko rate limit between fetches
-            await fetch_ohlc_cached(coin_id)
-
-    # Fetch all funding rates in parallel (Bybit handles concurrent requests fine)
-    funding_results = await asyncio.gather(
-        *[fetch_funding(meta["bybit"]) for meta in COINS.values()]
+async def tg_send(text: str, reply_markup=None):
+    bot = Bot(token=config.BOT_TOKEN)
+    await bot.send_message(
+        chat_id=config.CHAT_ID,
+        text=text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
     )
-    funding_map = {coin_id: fr for coin_id, fr in zip(COINS.keys(), funding_results)}
 
-    next_hour = (now_msk.hour + 1) % 24
-    result = {
-        "time":      now_msk.strftime("%d.%m.%Y %H:%M"),
-        "next_hour": f"{next_hour:02d}:00",
-        "fg":        fg,
-        "dom":       dom,
-        "coins":     [],
+pos_manager = PositionManager(trader, tg_send)
+
+
+# ── New pair handler ──────────────────────────────────────────────────────────
+
+async def on_pair_found(token_address: str, base_token: str, pair_address: str):
+    log.info(f"Analyzing: {token_address}")
+
+    result = await check_token(
+        token_address, pair_address, base_token, w3,
+        config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
+    )
+
+    if not result["ok"]:
+        log.info(f"Rejected {token_address}: {result['reason']}")
+        return
+
+    info      = result["info"]
+    bnb_price = info["bnb_price"]
+
+    # Build warning lines for non-critical flags
+    warnings = []
+    if info["is_mintable"]:   warnings.append("⚠️ Mintable — могут допечатать токены")
+    if info["hidden_owner"]:  warnings.append("⚠️ Hidden owner")
+    if info["is_proxy"]:      warnings.append("⚠️ Proxy контракт")
+    if info["external_call"]: warnings.append("⚠️ External call в коде")
+    warn_block = "\n".join(warnings) if warnings else "✅ Дополнительных угроз нет"
+
+    text = (
+        f"🎯 *Новый токен прошёл все проверки*\n\n"
+        f"🪙 *{info['name']}* (`{info['symbol']}`)\n"
+        f"📄 `{token_address}`\n\n"
+        f"💧 Ликвидность: *${info['liquidity_usd']:,.0f}*\n"
+        f"💸 Buy tax: *{info['buy_tax']:.1f}%*  |  Sell tax: *{info['sell_tax']:.1f}%*\n"
+        f"👥 Холдеры: {info['holder_count']}\n\n"
+        f"{warn_block}\n\n"
+        f"📊 TP: +{config.TAKE_PROFIT}%  |  SL: -{config.STOP_LOSS}%\n"
+        f"💰 Покупка: *{config.BUY_AMOUNT_BNB} BNB* "
+        f"(~${config.BUY_AMOUNT_BNB * bnb_price:.0f})\n"
+        f"⏰ {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')} МСК"
+    )
+
+    cb_id = token_address[:10]
+    pending[cb_id] = {
+        "token_address": token_address,
+        "base_token":    base_token,
+        "pair_address":  pair_address,
+        "info":          info,
     }
-    for coin_id, meta in COINS.items():
-        try:
-            d      = prices.get(coin_id, {})
-            price  = d.get("usd", 0)
-            change = d.get("usd_24h_change", 0)
-            vol    = d.get("usd_24h_vol", 0)
-            mcap   = d.get("usd_market_cap", 0)
-            log.info(f"{meta['symbol']}: price={price} change={change}")
-            ohlc   = _ohlc_cache.get(coin_id, [])
-            closes = [c[4] for c in ohlc] if ohlc else []
-            r6     = calc_rsi(closes, 6)
-            r12    = calc_rsi(closes, 12)
-            r24    = calc_rsi(closes, 24)
-            _, _, mh, macd_hist = calc_macd(closes)
-            bl, bm, bh = bollinger(closes)
-            fr     = funding_map.get(coin_id, {"ok": False})
-            if bl and bh and price and (bh - bl) > 0:
-                pct = int((price - bl) / (bh - bl) * 100)
-                if price <= bl:
-                    bp     = "У нижней полосы"
-                    bb_pct = 0
-                elif price >= bh:
-                    bp     = "У верхней полосы"
-                    bb_pct = 100
-                else:
-                    bp     = f"Середина {pct}%"
-                    bb_pct = pct
-            else:
-                bp     = "н/д"
-                bb_pct = 50
-            sig = generate_signal(
-                change, r6, r12, r24, mh, macd_hist, bb_pct, price,
-                fr=fr.get("rate", 0), fr_ok=fr.get("ok", False)
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ КУПИТЬ",     callback_data=f"buy_{cb_id}"),
+        InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_{cb_id}"),
+    ]])
+    await tg_send(text, reply_markup=keyboard)
+
+
+# ── Callback handler ──────────────────────────────────────────────────────────
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data  = query.data
+
+    # ── BUY ──────────────────────────────────────────────────────────────────
+    if data.startswith("buy_"):
+        cb_id      = data[4:]
+        token_info = pending.pop(cb_id, None)
+        if not token_info:
+            await query.edit_message_text("⚠️ Время ожидания истекло — пара уже устарела.")
+            return
+
+        sym = token_info["info"]["symbol"]
+        await query.edit_message_text(
+            f"⏳ Покупаю *{sym}*...", parse_mode=ParseMode.MARKDOWN
+        )
+
+        result = await asyncio.to_thread(
+            trader.buy, token_info["token_address"], config.BUY_AMOUNT_BNB
+        )
+
+        if result["ok"]:
+            price = await asyncio.to_thread(
+                trader.get_price,
+                token_info["token_address"],
+                token_info["base_token"],
             )
-            coin_data = {
-                "symbol":         meta["symbol"],
-                "price":          price,
-                "change":         change,
-                "vol":            vol,
-                "mcap":           mcap,
-                "closes":         closes,
-                "rsi6":           r6,
-                "rsi12":          r12,
-                "rsi24":          r24,
-                "macd":           mh,
-                "macd_hist":      macd_hist,
-                "bb_pos":         bp,
-                "funding_rate":   fr.get("rate") if fr.get("ok") else None,
-                "funding_src":    fr.get("source",""),
-                "funding_interp": fr.get("interp",""),
-                "action":         sig["action"],
-                "conf":           sig["conf"],
-                "target":         sig["target"],
-                "stop":           sig["stop"],
-                "score":          sig["score"],
-            }
-            result["coins"].append(coin_data)
-            log.info(f"{meta['symbol']} data collected OK")
-        except Exception as e:
-            log.error(f"Ошибка {meta['symbol']}: {e}")
-    return result
-
-def build_text_report(data):
-    L   = []
-    fg  = data["fg"]
-    dom = data["dom"]
-    L.append("*TY SMITH SIGNAL REPORT v3*")
-    L.append(f"Время: {data['time']} МСК")
-    L.append("")
-    if fg.get("ok"):
-        v = fg["value"]
-        L.append(f"Fear & Greed: *{v}/100* — {fg['label']} (delta {fg['delta']})")
-    if dom.get("ok"):
-        L.append(f"BTC Dom: *{dom['dom']}%* — {dom['sig']}")
-    L.append("")
-    for c in data["coins"]:
-        sign = "+" if c["change"] >= 0 else ""
-        L.append(f"*{c['symbol']}*  ${c['price']:,.0f}  {sign}{c['change']:.2f}%")
-        L.append(f"  RSI 6/12/24: {c['rsi6']} / {c['rsi12']} / {c['rsi24']}")
-        L.append(f"  MACD: {c['macd']}  |  {c['bb_pos']}")
-        if c["funding_rate"] is not None:
-            L.append(f"  Funding ({c['funding_src']}): {c['funding_rate']:+.4f}% — {c['funding_interp']}")
-        L.append(f"  *{c['action']}* (score {c['score']:+d})")
-        L.append(f"  Цель: ${c['target']:,.0f}  Стоп: ${c['stop']:,.0f}")
-        L.append("")
-    next_hour = (datetime.now(MOSCOW_TZ).hour+1) % 24
-    L.append(f"Следующий отчёт: *{next_hour:02d}:00 МСК*")
-    L.append("Не является финансовой рекомендацией.")
-    return "\n".join(L)
-
-async def send_signals():
-    log.info("Генерируем отчёт...")
-    try:
-        data = await collect_data()
-        log.info(f"Coins collected: {len(data['coins'])}")
-
-        cards = generate_all_cards(data)
-        log.info(f"Cards generated: {len(cards)}")
-
-        bot = Bot(token=BOT_TOKEN)
-
-        if cards:
-            for i, card_bytes in enumerate(cards):
-                log.info(f"Sending card {i+1}, size={len(card_bytes)} bytes")
-                await bot.send_photo(
-                    chat_id=CHAT_ID,
-                    photo=io.BytesIO(card_bytes)
-                )
-                await asyncio.sleep(1)
-            log.info("All cards sent")
+            pos = Position(
+                token_address = token_info["token_address"],
+                symbol        = sym,
+                name          = token_info["info"]["name"],
+                pair_address  = token_info["pair_address"],
+                buy_price_bnb = price,
+                tokens_amount = result["tokens_received"],
+                decimals      = result["decimals"],
+                buy_bnb       = config.BUY_AMOUNT_BNB,
+                take_profit   = config.TAKE_PROFIT,
+                stop_loss     = config.STOP_LOSS,
+            )
+            pos_manager.add(pos)
+            amount_fmt = result["tokens_received"] / 10 ** result["decimals"]
+            await query.edit_message_text(
+                f"✅ *Куплено!* — {sym}\n\n"
+                f"Получено: {amount_fmt:.4f} {sym}\n"
+                f"Цена входа: {price:.8f} BNB\n"
+                f"Tx: `{result['tx_hash']}`\n\n"
+                f"TP: +{config.TAKE_PROFIT}%  |  SL: -{config.STOP_LOSS}%",
+                parse_mode=ParseMode.MARKDOWN,
+            )
         else:
-            log.error("No cards generated!")
+            await query.edit_message_text(
+                f"❌ *Ошибка покупки* — {sym}\n{result['reason']}",
+                parse_mode=ParseMode.MARKDOWN,
+            )
 
-        text = build_text_report(data)
-        if len(text) > 4000:
-            text = text[:3990] + "\n...обрезано"
-        await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.MARKDOWN)
-        log.info("Text report sent")
+    # ── SKIP ─────────────────────────────────────────────────────────────────
+    elif data.startswith("skip_"):
+        cb_id = data[5:]
+        info  = pending.pop(cb_id, {}).get("info", {})
+        sym   = info.get("symbol", "токен")
+        await query.edit_message_text(f"❌ Пропущено — {sym}")
 
-    except Exception as e:
-        log.error(f"Ошибка send_signals: {e}", exc_info=True)
+    # ── SELL (manual from /positions) ─────────────────────────────────────────
+    elif data.startswith("sell_"):
+        token_address = data[5:]
+        pos = pos_manager.positions.get(token_address)
+        if not pos:
+            await query.edit_message_text("⚠️ Позиция не найдена или уже закрыта.")
+            return
+
+        await query.edit_message_text(
+            f"⏳ Продаю *{pos.symbol}*...", parse_mode=ParseMode.MARKDOWN
+        )
+        result = await asyncio.to_thread(
+            trader.sell, token_address, pos.tokens_amount
+        )
+
+        if result["ok"]:
+            price   = await asyncio.to_thread(trader.get_price, token_address)
+            pnl_pct = (
+                (price - pos.buy_price_bnb) / pos.buy_price_bnb * 100
+                if pos.buy_price_bnb and price else 0
+            )
+            pos_manager.remove(token_address)
+            await query.edit_message_text(
+                f"✅ *Продано вручную* — {pos.symbol}\n"
+                f"P&L: {pnl_pct:+.1f}%\n"
+                f"Tx: `{result['tx_hash']}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ Ошибка продажи — {pos.symbol}: {result['reason']}",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+
+# ── Command handlers ──────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 *Sniper Bot активен*\n\n"
+        "Слежу за новыми парами на PancakeSwap V2 (BSC).\n"
+        "Каждый токен проходит автоматическую проверку:\n"
+        "honeypot · налог · ликвидность · опасные функции\n\n"
+        "При появлении чистого токена — пришлю уведомление с кнопками.\n\n"
+        "*/positions* — открытые позиции\n"
+        "*/status* — состояние бота и баланс кошелька",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    positions = pos_manager.get_all()
+    if not positions:
+        await update.message.reply_text("Нет открытых позиций.")
+        return
+
+    for pos in positions:
+        price   = await asyncio.to_thread(trader.get_price, pos.token_address)
+        pnl_pct = (
+            (price - pos.buy_price_bnb) / pos.buy_price_bnb * 100
+            if pos.buy_price_bnb and price else 0
+        )
+        text = (
+            f"*{pos.name}* ({pos.symbol})\n"
+            f"Вход: {pos.buy_price_bnb:.8f} BNB\n"
+            f"Сейчас: {price:.8f} BNB\n"
+            f"P&L: {pnl_pct:+.1f}%\n"
+            f"TP: +{pos.take_profit}%  |  SL: -{pos.stop_loss}%"
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"🔴 Продать {pos.symbol}",
+                callback_data=f"sell_{pos.token_address}",
+            )
+        ]])
+        await update.message.reply_text(
+            text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+        )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    connected = w3.is_connected()
+    balance   = w3.eth.get_balance(trader.wallet) / 1e18
+    bnb_price = await get_bnb_price(w3)
+    await update.message.reply_text(
+        f"*Статус Sniper Bot*\n\n"
+        f"RPC: {'✅ подключён' if connected else '❌ нет соединения'}\n"
+        f"Кошелёк: `{trader.wallet}`\n"
+        f"Баланс: *{balance:.4f} BNB* (~${balance * bnb_price:.0f})\n"
+        f"Позиций открыто: {len(pos_manager.positions)}\n\n"
+        f"*Настройки:*\n"
+        f"Buy: {config.BUY_AMOUNT_BNB} BNB  |  Slippage: {config.SLIPPAGE}%\n"
+        f"TP: +{config.TAKE_PROFIT}%  |  SL: -{config.STOP_LOSS}%\n"
+        f"Min ликвидность: ${config.MIN_LIQUIDITY_USD:,.0f}\n"
+        f"Max tax: {config.MAX_BUY_TAX}% buy / {config.MAX_SELL_TAX}% sell",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main():
-    log.info("Ty Smith Bot v3 запущен.")
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(send_signals, "cron", hour="*", minute=0, timezone=MOSCOW_TZ)
-    scheduler.start()
+    log.info("Sniper Bot starting...")
+
+    app = Application.builder().token(config.BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start",     cmd_start))
+    app.add_handler(CommandHandler("positions", cmd_positions))
+    app.add_handler(CommandHandler("status",    cmd_status))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+
+    asyncio.create_task(pos_manager.monitor())
+    asyncio.create_task(watch_pairs(config.BSC_WS_RPC, on_pair_found))
+
+    log.info(f"Ready. Wallet: {trader.wallet}")
+    await tg_send(
+        "🚀 *Sniper Bot запущен*\n"
+        "Слежу за новыми парами на PancakeSwap V2 (BSC)...\n\n"
+        "/status — баланс и настройки"
+    )
+
     try:
         while True:
             await asyncio.sleep(60)
     except (KeyboardInterrupt, SystemExit):
-        log.info("Бот остановлен.")
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
