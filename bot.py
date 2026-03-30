@@ -283,6 +283,27 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+PID_FILE = "/tmp/tysmith-bot.pid"
+
+def _acquire_pid_lock():
+    """Exit if another instance is already running."""
+    if os.path.exists(PID_FILE):
+        try:
+            old_pid = int(open(PID_FILE).read().strip())
+            os.kill(old_pid, 0)   # signal 0 = check if process exists
+            log.error(f"Бот уже запущен (PID {old_pid}). Выход.")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            pass   # stale PID file — overwrite it
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+def _release_pid_lock():
+    try:
+        os.remove(PID_FILE)
+    except FileNotFoundError:
+        pass
+
 async def main():
     log.info("Sniper Bot starting...")
 

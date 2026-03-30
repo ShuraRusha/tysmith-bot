@@ -3,7 +3,7 @@ import io, os, base64, tempfile, re
 from fonts_data import NUNITO_REGULAR, NUNITO_BOLD
 
 # Output size
-W, H = 900, 1120
+W, H = 900, 1260
 # Supersampling scale — draw at 2× then downscale for crisp anti-aliasing
 S = 2
 WS, HS = W * S, H * S
@@ -439,6 +439,41 @@ def generate_coin_card(coin, gdata):
 
     Y += GM_H + 16
 
+    # ── ON-CHAIN METRICS ─────────────────────────────────────
+    OC_H  = 130
+    nupl  = gdata.get("nupl",  {})
+    puell = gdata.get("puell", {})
+
+    rnd(drw, CX, Y, CX + CW, Y + OC_H, BG_BLOK, 14)
+    text(drw, CX + 22, Y + 12, "ON-CHAIN МЕТРИКИ", f9, LGRAY)
+
+    oc_items = []
+    if nupl.get("ok"):
+        nv  = nupl["value"]
+        nc  = RED if nv > 0.75 else AMBER if nv > 0.5 else LGRAY if nv > 0.25 else GREEN
+        oc_items.append(("NUPL", f"{nv:.3f}", nupl.get("zone", "")[:22], nc))
+    else:
+        oc_items.append(("NUPL", "N/A", "нет данных", DGRAY))
+
+    if puell.get("ok"):
+        pv  = puell["value"]
+        pc  = RED if pv > 2.5 else AMBER if pv > 1.5 else LGRAY if pv > 0.8 else GREEN
+        oc_items.append(("PUELL MULTIPLE", f"{pv:.2f}x", puell.get("zone", "")[:22], pc))
+    else:
+        oc_items.append(("PUELL MULTIPLE", "N/A", "нет данных", DGRAY))
+
+    oc_col_w = CW // len(oc_items)
+    for idx, (lbl, val_s, sub, col) in enumerate(oc_items):
+        ox = CX + idx * oc_col_w
+        if idx > 0:
+            line(drw, ox, Y + 28, ox, Y + OC_H - 18, LINE, 1)
+        text(drw, ox + 22, Y + 30, lbl,   f9,   LGRAY)
+        text(drw, ox + 22, Y + 52, val_s, fb18, col)
+        if sub:
+            text(drw, ox + 22, Y + 102, sub, f10, DGRAY)
+
+    Y += OC_H + 16
+
     # ── FOOTER ───────────────────────────────────────────────
     line(drw, CX, Y, CX + CW, Y, LINE, 1)
     Y += 8
@@ -452,6 +487,175 @@ def generate_coin_card(coin, gdata):
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf.read()
+
+
+def generate_collage(data) -> bytes:
+    """
+    Premium full-bleed 2×2 collage.
+
+    Design principles:
+    • Canvas background = BG_OUT (exact match to card outer padding colour)
+      → cards appear seamlessly integrated, zero visible border/frame effect
+    • 8 px side margins, 2 px internal separators → tight & modern grid
+    • 190 px header with bold 68-px logo, gradient accent stripe, metric pills
+    • Pills tinted with their accent colour for expressiveness
+    • 1818 × 2726 px @ 200 DPI ≈ A3 portrait, crisp on any screen
+    """
+    H_PAD   = 8    # horizontal outer margin (tiny — near full-bleed)
+    TOP     = 5    # top accent stripe height (blue→green gradient)
+    HDR_H   = 190  # header panel height
+    SEP     = 2    # thin separator between cards
+    BOT     = 9    # bottom margin
+
+    total_w = H_PAD + W + SEP + W + H_PAD          # 1818
+    total_h = TOP + HDR_H + SEP + H + SEP + H + BOT  # 2726
+
+    SEP_COL = (22, 26, 42)
+
+    # ── Canvas: same colour as card outer padding → seamless blending ─────────
+    canvas = Image.new("RGB", (total_w, total_h), BG_OUT)
+    cdraw  = ImageDraw.Draw(canvas)
+
+    # Replicate card's own outer gradient so the whole canvas is one unified field
+    for yi in range(total_h):
+        t = yi / total_h
+        c = tuple(int(BG_OUT[i] + (BG_CARD[i] - BG_OUT[i]) * t * 0.4) for i in range(3))
+        cdraw.line([(0, yi), (total_w, yi)], fill=c)
+
+    # ── Top accent stripe: blue → green horizontal gradient ───────────────────
+    for xi in range(total_w):
+        t   = xi / total_w
+        col = tuple(int(BLUE[i] + (GREEN[i] - BLUE[i]) * t) for i in range(3))
+        cdraw.line([(xi, 0), (xi, TOP)], fill=col)
+
+    # ── Header: subtle inner-glow background (darker at edges, lighter mid) ───
+    hy = TOP
+    for yi in range(HDR_H):
+        t    = yi / HDR_H
+        glow = 4 * t * (1 - t)        # bell curve, peaks at 0.5
+        c    = tuple(int(BG_OUT[i] + (BG_BLOK[i] - BG_OUT[i]) * glow * 0.60) for i in range(3))
+        cdraw.line([(0, hy + yi), (total_w, hy + yi)], fill=c)
+
+    # Thin separator at base of header
+    cdraw.rectangle([H_PAD + 16, hy + HDR_H - 1,
+                     total_w - H_PAD - 16, hy + HDR_H], fill=LINE)
+
+    # ── Header fonts (1× sizing — canvas is NOT supersampled) ────────────────
+    _F = {
+        "logo": ImageFont.truetype(BOLD_PATH, 68),   # "TY SMITH"
+        "sub":  ImageFont.truetype(BOLD_PATH, 26),   # "SIGNALS"
+        "time": ImageFont.truetype(REG_PATH,  14),
+        "rep":  ImageFont.truetype(BOLD_PATH, 14),
+        "mlbl": ImageFont.truetype(REG_PATH,  12),
+        "mval": ImageFont.truetype(BOLD_PATH, 34),   # big metric number
+        "msub": ImageFont.truetype(REG_PATH,  12),
+    }
+
+    lx = H_PAD + 32   # left content x
+
+    # Logo text
+    cdraw.text((lx, hy + 16),  "TY SMITH", font=_F["logo"], fill=WHITE)
+    cdraw.text((lx, hy + 100), "SIGNALS",  font=_F["sub"],  fill=LGRAY)
+    cdraw.text((lx, hy + 143), data.get("time", "") + " МСК",
+               font=_F["time"], fill=DGRAY)
+
+    # Two decorative accent bars under "TY SMITH" (blue + green)
+    cdraw.rectangle([lx,      hy + 97, lx + 32, hy + 100], fill=BLUE)
+    cdraw.rectangle([lx + 38, hy + 97, lx + 70, hy + 100], fill=GREEN)
+
+    # Divider + label
+    div_x = lx + 340
+    cdraw.line([(div_x, hy + 22), (div_x, hy + HDR_H - 22)], fill=LINE, width=1)
+    cdraw.text((div_x + 22, hy + 80), "SIGNAL REPORT", font=_F["rep"], fill=LGRAY)
+
+    # ── Global metric pills ───────────────────────────────────────────────────
+    fg    = data.get("fg",    {})
+    dom   = data.get("dom",   {})
+    nupl  = data.get("nupl",  {})
+    puell = data.get("puell", {})
+
+    pills = []
+    if fg.get("ok"):
+        fv = fg["value"]
+        fc = RED if fv <= 25 else AMBER if fv <= 45 else LGRAY if fv <= 55 else GREEN
+        pills.append(("FEAR & GREED", str(fv), fg.get("label", "")[:14], fc))
+    if dom.get("ok"):
+        pills.append(("BTC DOM", f"{dom['dom']}%", dom["sig"][:16], BLUE))
+    if nupl.get("ok"):
+        nv = nupl["value"]
+        nc = RED if nv > 0.75 else AMBER if nv > 0.5 else LGRAY if nv > 0.25 else GREEN
+        pills.append(("NUPL", f"{nv:.3f}", nupl.get("zone", "")[:16], nc))
+    if puell.get("ok"):
+        pv = puell["value"]
+        pc = RED if pv > 2.5 else AMBER if pv > 1.5 else LGRAY if pv > 0.8 else GREEN
+        pills.append(("PUELL", f"{pv:.2f}x", puell.get("zone", "")[:16], pc))
+
+    if pills:
+        PILL_W   = 258
+        PILL_H   = 140
+        PILL_GAP = 14
+        PILL_Y   = hy + (HDR_H - PILL_H) // 2
+        n        = len(pills)
+        total_pw = n * PILL_W + (n - 1) * PILL_GAP
+        pill_x0  = total_w - H_PAD - 32 - total_pw
+        r        = 10
+
+        for mi, (lbl, val_s, sub_s, col) in enumerate(pills):
+            px, py = pill_x0 + mi * (PILL_W + PILL_GAP), PILL_Y
+
+            # Pill bg: BG_BLK2 tinted with accent colour
+            pill_bg = tuple(
+                max(0, min(255, int(BG_BLK2[i] * 0.86 + col[i] * 0.12)))
+                for i in range(3)
+            )
+            # Rounded rect
+            cdraw.rectangle([px + r, py,         px + PILL_W - r, py + PILL_H],     fill=pill_bg)
+            cdraw.rectangle([px,     py + r,      px + PILL_W,     py + PILL_H - r], fill=pill_bg)
+            for cx2, cy2 in [(px, py), (px + PILL_W - 2*r, py),
+                             (px, py + PILL_H - 2*r), (px + PILL_W - 2*r, py + PILL_H - 2*r)]:
+                cdraw.ellipse([cx2, cy2, cx2 + 2*r, cy2 + 2*r], fill=pill_bg)
+
+            # 5-px accent bar + 5-px glow
+            cdraw.rectangle([px + r, py, px + PILL_W - r, py + 5], fill=col)
+            glow = tuple(int(col[i] * 0.30 + pill_bg[i] * 0.70) for i in range(3))
+            cdraw.rectangle([px + r, py + 5, px + PILL_W - r, py + 10], fill=glow)
+
+            # Text
+            ix = px + 18
+            cdraw.text((ix, py + 16),  lbl,   font=_F["mlbl"], fill=LGRAY)
+            cdraw.text((ix, py + 38),  val_s, font=_F["mval"], fill=col)
+            cdraw.text((ix, py + 104), sub_s, font=_F["msub"], fill=DGRAY)
+
+    # ── Card grid ─────────────────────────────────────────────────────────────
+    card_y1 = TOP + HDR_H + SEP
+    card_y2 = card_y1 + H + SEP
+    card_x1 = H_PAD
+    card_x2 = H_PAD + W + SEP
+
+    # Hair-line cross separators
+    cdraw.rectangle([card_x1 + W, card_y1,
+                     card_x1 + W + SEP, card_y2 + H], fill=SEP_COL)
+    cdraw.rectangle([card_x1, card_y1 + H,
+                     card_x2 + W, card_y1 + H + SEP], fill=SEP_COL)
+
+    positions = [
+        (card_x1, card_y1), (card_x2, card_y1),
+        (card_x1, card_y2), (card_x2, card_y2),
+    ]
+    for i, coin in enumerate(data.get("coins", [])[:4]):
+        try:
+            card_img = Image.open(io.BytesIO(generate_coin_card(coin, data)))
+            canvas.paste(card_img, positions[i])
+        except Exception as e:
+            import traceback
+            print(f"Collage card {coin.get('symbol','?')}: {e}", flush=True)
+            traceback.print_exc()
+
+    # ── Export PDF @ 200 DPI ──────────────────────────────────────────────────
+    buf = io.BytesIO()
+    canvas.save(buf, format="PDF", resolution=200)
     buf.seek(0)
     return buf.read()
 
