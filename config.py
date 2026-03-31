@@ -17,13 +17,18 @@ BSC_HTTP_RPC_BACKUP = os.getenv("BSC_HTTP_RPC_BACKUP", "https://bsc-dataseed1.de
 
 # ── Trading params ────────────────────────────────────────────────────────────
 BUY_AMOUNT_BNB    = float(os.getenv("BUY_AMOUNT_BNB",    "0.02"))
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
-MAX_BUY_TAX       = float(os.getenv("MAX_BUY_TAX",       "10"))
-MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "10"))
-TAKE_PROFIT       = float(os.getenv("TAKE_PROFIT",       "50"))
-STOP_LOSS         = float(os.getenv("STOP_LOSS",         "25"))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "10000"))
+MAX_BUY_TAX       = float(os.getenv("MAX_BUY_TAX",       "5"))
+MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "5"))
+# Dual take-profit: sell TP1_PCT% of position at TP1, rest at TP2
+TAKE_PROFIT_1     = float(os.getenv("TAKE_PROFIT_1",     "80"))   # % gain → first exit
+TAKE_PROFIT_1_PCT = float(os.getenv("TAKE_PROFIT_1_PCT", "50"))   # % of tokens to sell
+TAKE_PROFIT_2     = float(os.getenv("TAKE_PROFIT_2",     "200"))  # % gain → full exit
+STOP_LOSS         = float(os.getenv("STOP_LOSS",         "20"))
 SLIPPAGE          = float(os.getenv("SLIPPAGE",          "15"))
-GAS_MULTIPLIER    = float(os.getenv("GAS_MULTIPLIER",    "1.2"))
+GAS_MULTIPLIER    = float(os.getenv("GAS_MULTIPLIER",    "1.3"))
+MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS",       "3"))    # max open positions at once
+PENDING_TTL       = int(os.getenv("PENDING_TTL",         "120"))  # seconds before alert expires
 
 # ── BSC contract addresses ────────────────────────────────────────────────────
 WBNB  = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
