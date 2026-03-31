@@ -27,6 +27,8 @@ TAKE_PROFIT_2     = float(os.getenv("TAKE_PROFIT_2",     "200"))  # % gain → f
 STOP_LOSS         = float(os.getenv("STOP_LOSS",         "20"))
 SLIPPAGE          = float(os.getenv("SLIPPAGE",          "15"))
 GAS_MULTIPLIER    = float(os.getenv("GAS_MULTIPLIER",    "1.3"))
+MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS",       "3"))    # max open positions at once
+PENDING_TTL       = int(os.getenv("PENDING_TTL",         "120"))  # seconds before alert expires
 
 # ── BSC contract addresses ────────────────────────────────────────────────────
 WBNB  = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"

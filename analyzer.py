@@ -129,7 +129,20 @@ async def check_token(
         # GoPlus key may be lowercase or checksum
         data = result.get(token_address.lower()) or result.get(token_address)
         if not data:
-            return {"ok": False, "reason": "GoPlus: токен не найден в базе"}
+            # Token is brand-new — GoPlus may not have indexed it yet, retry once
+            log.info(f"GoPlus: токен не найден, ждём 15с и повторяем ({token_address})")
+            await asyncio.sleep(15)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    GOPLUS_URL,
+                    params={"contract_addresses": token_address.lower()},
+                    timeout=aiohttp.ClientTimeout(total=12),
+                ) as resp:
+                    body = await resp.json(content_type=None)
+            result = body.get("result", {})
+            data = result.get(token_address.lower()) or result.get(token_address)
+            if not data:
+                return {"ok": False, "reason": "GoPlus: токен не найден после повторного запроса"}
 
     except Exception as e:
         log.error(f"GoPlus API error for {token_address}: {e}")
@@ -143,6 +156,8 @@ async def check_token(
         "selfdestruct":            "Selfdestruct функция",
         "transfer_pausable":       "Переводы можно заморозить",
         "is_blacklisted":          "Blacklist функция",
+        "cannot_buy":              "Покупка заблокирована контрактом",
+        "trading_cooldown":        "Trading cooldown (anti-bot)",
     }
     for field, reason in CRITICAL.items():
         if data.get(field) == "1":

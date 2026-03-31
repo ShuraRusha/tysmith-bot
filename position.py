@@ -51,7 +51,7 @@ class PositionManager:
     async def monitor(self):
         """Check all open positions every 30 seconds and trigger TP1/TP2/SL."""
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(5)
             for token_addr in list(self.positions):
                 pos = self.positions.get(token_addr)
                 if not pos:

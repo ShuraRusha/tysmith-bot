@@ -126,6 +126,41 @@ class Trader:
             log.error(f"get_price({token_address}): {e}")
             return 0.0
 
+    # ── Balance check ─────────────────────────────────────────────────────────
+
+    def has_enough_bnb(self, amount_bnb: float, gas_reserve: float = 0.005) -> bool:
+        """Return True if wallet has enough BNB for the trade + gas reserve."""
+        balance = self.w3.eth.get_balance(self.wallet) / 1e18
+        return balance >= amount_bnb + gas_reserve
+
+    # ── Pre-approve router (call right after buy to save time on sell) ─────────
+
+    def approve_token(self, token_address: str) -> bool:
+        """Approve PancakeSwap router to spend this token. Synchronous."""
+        try:
+            token_address = Web3.to_checksum_address(token_address)
+            token     = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
+            allowance = token.functions.allowance(self.wallet, ROUTER_ADDRESS).call()
+            if allowance > 0:
+                return True  # already approved
+            approve_tx = token.functions.approve(
+                ROUTER_ADDRESS, 2 ** 256 - 1
+            ).build_transaction({
+                "from":     self.wallet,
+                "gas":      100_000,
+                "gasPrice": self._gas_price(),
+                "nonce":    self._nonce(),
+                "chainId":  56,
+            })
+            signed  = self.account.sign_transaction(approve_tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            log.info(f"Pre-approved {token_address}")
+            return True
+        except Exception as e:
+            log.error(f"approve_token({token_address}): {e}")
+            return False
+
     # ── Buy ───────────────────────────────────────────────────────────────────
 
     def buy(self, token_address: str, amount_bnb: float) -> dict:

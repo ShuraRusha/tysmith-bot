@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from datetime import datetime
 
 import pytz
@@ -109,6 +110,7 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         "base_token":    base_token,
         "pair_address":  pair_address,
         "info":          info,
+        "ts":            time.time(),   # TTL: reject if user clicks too late
     }
 
     keyboard = InlineKeyboardMarkup([[
@@ -133,27 +135,59 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ Время ожидания истекло — пара уже устарела.")
             return
 
-        sym = token_info["info"]["symbol"]
+        sym           = token_info["info"]["symbol"]
+        token_address = token_info["token_address"]
+
+        # ── Guard: TTL — reject stale alerts ─────────────────────────────────
+        if time.time() - token_info["ts"] > config.PENDING_TTL:
+            await query.edit_message_text(
+                f"⏰ Время истекло — {sym} уже {config.PENDING_TTL // 60} мин назад.\n"
+                f"Цена могла сильно измениться."
+            )
+            return
+
+        # ── Guard: no duplicate positions ─────────────────────────────────────
+        if token_address in pos_manager.positions:
+            await query.edit_message_text(f"⚠️ Позиция по {sym} уже открыта.")
+            return
+
+        # ── Guard: max positions limit ────────────────────────────────────────
+        if len(pos_manager.positions) >= config.MAX_POSITIONS:
+            await query.edit_message_text(
+                f"🚫 Достигнут лимит позиций ({config.MAX_POSITIONS}).\n"
+                f"Закрой одну из текущих перед новой покупкой."
+            )
+            return
+
+        # ── Guard: sufficient BNB balance ─────────────────────────────────────
+        if not trader.has_enough_bnb(config.BUY_AMOUNT_BNB):
+            await query.edit_message_text(
+                f"💸 Недостаточно BNB для покупки {sym}.\n"
+                f"Нужно: {config.BUY_AMOUNT_BNB} BNB + ~0.005 BNB на газ."
+            )
+            return
+
         await query.edit_message_text(
             f"⏳ Покупаю *{sym}*...", parse_mode=ParseMode.MARKDOWN
         )
 
+        # Get price BEFORE buying (not inflated by our own tx)
+        price_before = await asyncio.to_thread(
+            trader.get_price, token_address, token_info["base_token"]
+        )
+
         result = await asyncio.to_thread(
-            trader.buy, token_info["token_address"], config.BUY_AMOUNT_BNB
+            trader.buy, token_address, config.BUY_AMOUNT_BNB
         )
 
         if result["ok"]:
-            price = await asyncio.to_thread(
-                trader.get_price,
-                token_info["token_address"],
-                token_info["base_token"],
-            )
             pos = Position(
-                token_address     = token_info["token_address"],
+                token_address     = token_address,
                 symbol            = sym,
                 name              = token_info["info"]["name"],
                 pair_address      = token_info["pair_address"],
-                buy_price_bnb     = price,
+                buy_price_bnb     = price_before if price_before > 0 else
+                                    result["tokens_received"] and config.BUY_AMOUNT_BNB / (result["tokens_received"] / 10 ** result["decimals"]),
                 tokens_amount     = result["tokens_received"],
                 decimals          = result["decimals"],
                 buy_bnb           = config.BUY_AMOUNT_BNB,
@@ -163,11 +197,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 stop_loss         = config.STOP_LOSS,
             )
             pos_manager.add(pos)
+
+            # Pre-approve router in background so sell is instant later
+            asyncio.create_task(
+                asyncio.to_thread(trader.approve_token, token_address)
+            )
+
             amount_fmt = result["tokens_received"] / 10 ** result["decimals"]
             await query.edit_message_text(
                 f"✅ *Куплено!* — {sym}\n\n"
                 f"Получено: {amount_fmt:.4f} {sym}\n"
-                f"Цена входа: {price:.8f} BNB\n"
+                f"Цена входа: {price_before:.8f} BNB\n"
                 f"Tx: `{result['tx_hash']}`\n\n"
                 f"TP1: +{config.TAKE_PROFIT_1}% → продать {config.TAKE_PROFIT_1_PCT:.0f}%\n"
                 f"TP2: +{config.TAKE_PROFIT_2}% → продать остаток\n"
@@ -249,12 +289,13 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (price - pos.buy_price_bnb) / pos.buy_price_bnb * 100
             if pos.buy_price_bnb and price else 0
         )
+        tp1_status = "✅" if pos.tp1_done else f"+{pos.take_profit_1}%"
         text = (
             f"*{pos.name}* ({pos.symbol})\n"
             f"Вход: {pos.buy_price_bnb:.8f} BNB\n"
             f"Сейчас: {price:.8f} BNB\n"
             f"P&L: {pnl_pct:+.1f}%\n"
-            f"TP: +{pos.take_profit}%  |  SL: -{pos.stop_loss}%"
+            f"TP1: {tp1_status}  TP2: +{pos.take_profit_2}%  SL: -{pos.stop_loss}%"
         )
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton(
@@ -285,6 +326,20 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Max tax: {config.MAX_BUY_TAX}% buy / {config.MAX_SELL_TAX}% sell",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+# ── Background: remove expired pending alerts ────────────────────────────────
+
+async def _cleanup_pending():
+    """Remove pending tokens older than PENDING_TTL every 60 seconds."""
+    while True:
+        await asyncio.sleep(60)
+        now     = time.time()
+        expired = [k for k, v in pending.items() if now - v["ts"] > config.PENDING_TTL]
+        for k in expired:
+            pending.pop(k, None)
+        if expired:
+            log.info(f"Cleaned up {len(expired)} expired pending token(s)")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -325,6 +380,7 @@ async def main():
 
     asyncio.create_task(pos_manager.monitor())
     asyncio.create_task(watch_pairs(config.BSC_WS_RPC, on_pair_found))
+    asyncio.create_task(_cleanup_pending())
 
     log.info(f"Ready. Wallet: {trader.wallet}")
     await tg_send(
