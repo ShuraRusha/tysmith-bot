@@ -3,7 +3,7 @@ import logging
 
 from web3 import Web3
 
-from config import PANCAKE_ROUTER_V2, WBNB
+from config import PANCAKE_ROUTER_V2, WBNB, SLIPPAGE_BUY, SLIPPAGE_SELL, TX_DEADLINE_SEC
 
 log = logging.getLogger(__name__)
 
@@ -87,12 +87,11 @@ ERC20_ABI = [
 
 
 class Trader:
-    def __init__(self, w3: Web3, private_key: str, slippage: float, gas_multiplier: float):
+    def __init__(self, w3: Web3, private_key: str, gas_multiplier: float):
         self.w3             = w3
         self.account        = w3.eth.account.from_key(private_key)
         self.wallet         = self.account.address
         self.router         = w3.eth.contract(address=ROUTER_ADDRESS, abi=ROUTER_ABI)
-        self.slippage       = slippage        # percent, e.g. 15 = 15%
         self.gas_multiplier = gas_multiplier
 
     # ── Internal helpers ──────────────────────────────────────────────────────
@@ -104,7 +103,7 @@ class Trader:
         return self.w3.eth.get_transaction_count(self.wallet, "pending")
 
     def _deadline(self) -> int:
-        return int(time.time()) + 300  # 5 minutes
+        return int(time.time()) + TX_DEADLINE_SEC  # short window — reject stale txs
 
     # ── Price ─────────────────────────────────────────────────────────────────
 
@@ -176,11 +175,11 @@ class Trader:
             token_address = Web3.to_checksum_address(token_address)
             amount_wei    = Web3.to_wei(amount_bnb, "ether")
 
-            # Expected output with slippage tolerance
+            # Expected output with buy slippage tolerance
             amounts  = self.router.functions.getAmountsOut(
                 amount_wei, [WBNB_ADDRESS, token_address]
             ).call()
-            min_out  = int(amounts[1] * (1 - self.slippage / 100))
+            min_out  = int(amounts[1] * (1 - SLIPPAGE_BUY / 100))
 
             tx = self.router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
                 min_out,
@@ -255,11 +254,11 @@ class Trader:
                 self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
                 log.info(f"Approved {token_address}")
 
-            # Expected BNB output with slippage tolerance
+            # Expected BNB output with sell slippage tolerance (tighter than buy)
             amounts = self.router.functions.getAmountsOut(
                 amount_tokens, [token_address, WBNB_ADDRESS]
             ).call()
-            min_out = int(amounts[1] * (1 - self.slippage / 100))
+            min_out = int(amounts[1] * (1 - SLIPPAGE_SELL / 100))
 
             tx = self.router.functions.swapExactTokensForETHSupportingFeeOnTransferTokens(
                 amount_tokens,

@@ -20,15 +20,31 @@ BUY_AMOUNT_BNB    = float(os.getenv("BUY_AMOUNT_BNB",    "0.02"))
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "10000"))
 MAX_BUY_TAX       = float(os.getenv("MAX_BUY_TAX",       "5"))
 MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "5"))
-# Dual take-profit: sell TP1_PCT% of position at TP1, rest at TP2
-TAKE_PROFIT_1     = float(os.getenv("TAKE_PROFIT_1",     "80"))   # % gain → first exit
-TAKE_PROFIT_1_PCT = float(os.getenv("TAKE_PROFIT_1_PCT", "50"))   # % of tokens to sell
-TAKE_PROFIT_2     = float(os.getenv("TAKE_PROFIT_2",     "200"))  # % gain → full exit
-STOP_LOSS         = float(os.getenv("STOP_LOSS",         "20"))
-SLIPPAGE          = float(os.getenv("SLIPPAGE",          "15"))
-GAS_MULTIPLIER    = float(os.getenv("GAS_MULTIPLIER",    "1.3"))
-MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS",       "3"))    # max open positions at once
-PENDING_TTL       = int(os.getenv("PENDING_TTL",         "120"))  # seconds before alert expires
+
+# ── Entry/Exit strategy ───────────────────────────────────────────────────────
+# Phase 1 — fixed TP: sell TAKE_PROFIT_1_PCT% at TAKE_PROFIT_1% gain
+TAKE_PROFIT_1     = float(os.getenv("TAKE_PROFIT_1",     "50"))   # % gain → partial exit
+TAKE_PROFIT_1_PCT = float(os.getenv("TAKE_PROFIT_1_PCT", "25"))   # % of tokens to sell at TP1
+
+# Phase 2 — trailing stop on remaining position after TP1
+# Sells all remaining tokens if price drops TRAILING_STOP_PCT% from peak
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "10"))   # % drop from peak → full exit
+
+# Fixed stop loss before TP1 is reached
+STOP_LOSS         = float(os.getenv("STOP_LOSS",         "15"))
+
+# ── Execution params ──────────────────────────────────────────────────────────
+SLIPPAGE_BUY      = float(os.getenv("SLIPPAGE_BUY",      "5"))    # % slippage tolerance on buy
+SLIPPAGE_SELL     = float(os.getenv("SLIPPAGE_SELL",      "8"))    # % slippage tolerance on sell
+GAS_MULTIPLIER    = float(os.getenv("GAS_MULTIPLIER",     "1.3"))
+TX_DEADLINE_SEC   = int(os.getenv("TX_DEADLINE_SEC",      "60"))   # tx expiry in seconds
+
+# ── Bot behaviour ─────────────────────────────────────────────────────────────
+MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS",        "3"))    # max open positions at once
+PENDING_TTL       = int(os.getenv("PENDING_TTL",          "60"))   # seconds before alert expires
+
+# ── Safety filters ────────────────────────────────────────────────────────────
+TOP_HOLDER_MAX_PCT = float(os.getenv("TOP_HOLDER_MAX_PCT", "30"))  # reject if single wallet > X%
 
 # ── BSC contract addresses ────────────────────────────────────────────────────
 WBNB  = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"

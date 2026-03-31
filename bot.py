@@ -42,7 +42,7 @@ if not w3.is_connected():
     log.warning("Primary RPC unavailable — switching to backup")
     w3 = _make_w3(config.BSC_HTTP_RPC_BACKUP)
 
-trader = Trader(w3, config.PRIVATE_KEY, config.SLIPPAGE, config.GAS_MULTIPLIER)
+trader = Trader(w3, config.PRIVATE_KEY, config.GAS_MULTIPLIER)
 
 # callback_id (first 10 chars of token address) → token info
 # cleaned up after user action (buy or skip)
@@ -97,8 +97,9 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         f"💸 Buy tax: *{info['buy_tax']:.1f}%*  |  Sell tax: *{info['sell_tax']:.1f}%*\n"
         f"👥 Холдеры: {info['holder_count']}\n\n"
         f"{warn_block}\n\n"
-        f"📊 TP1: +{config.TAKE_PROFIT_1}% ({config.TAKE_PROFIT_1_PCT:.0f}% позиции)  "
-        f"TP2: +{config.TAKE_PROFIT_2}%  |  SL: -{config.STOP_LOSS}%\n"
+        f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
+        f"| Trailing: -{config.TRAILING_STOP_PCT}% от пика  "
+        f"| SL: -{config.STOP_LOSS}%\n"
         f"💰 Покупка: *{config.BUY_AMOUNT_BNB} BNB* "
         f"(~${config.BUY_AMOUNT_BNB * bnb_price:.0f})\n"
         f"⏰ {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')} МСК"
@@ -168,8 +169,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await query.edit_message_text(
-            f"⏳ Покупаю *{sym}*...", parse_mode=ParseMode.MARKDOWN
+            f"⏳ Одобряю и покупаю *{sym}*...", parse_mode=ParseMode.MARKDOWN
         )
+
+        # Pre-approve router BEFORE buying — eliminates race condition on sell
+        approved = await asyncio.to_thread(trader.approve_token, token_address)
+        if not approved:
+            await query.edit_message_text(
+                f"❌ Не удалось одобрить контракт для {sym}. Пропускаем.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
 
         # Get price BEFORE buying (not inflated by our own tx)
         price_before = await asyncio.to_thread(
@@ -181,36 +191,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if result["ok"]:
+            # Fallback entry price: derive from BNB spent / tokens received
+            entry_price = price_before if price_before > 0 else (
+                config.BUY_AMOUNT_BNB / (result["tokens_received"] / 10 ** result["decimals"])
+            )
             pos = Position(
-                token_address     = token_address,
-                symbol            = sym,
-                name              = token_info["info"]["name"],
-                pair_address      = token_info["pair_address"],
-                buy_price_bnb     = price_before if price_before > 0 else
-                                    result["tokens_received"] and config.BUY_AMOUNT_BNB / (result["tokens_received"] / 10 ** result["decimals"]),
-                tokens_amount     = result["tokens_received"],
-                decimals          = result["decimals"],
-                buy_bnb           = config.BUY_AMOUNT_BNB,
-                take_profit_1     = config.TAKE_PROFIT_1,
-                take_profit_1_pct = config.TAKE_PROFIT_1_PCT,
-                take_profit_2     = config.TAKE_PROFIT_2,
-                stop_loss         = config.STOP_LOSS,
+                token_address      = token_address,
+                symbol             = sym,
+                name               = token_info["info"]["name"],
+                pair_address       = token_info["pair_address"],
+                buy_price_bnb      = entry_price,
+                tokens_amount      = result["tokens_received"],
+                decimals           = result["decimals"],
+                buy_bnb            = config.BUY_AMOUNT_BNB,
+                take_profit_1      = config.TAKE_PROFIT_1,
+                take_profit_1_pct  = config.TAKE_PROFIT_1_PCT,
+                trailing_stop_pct  = config.TRAILING_STOP_PCT,
+                stop_loss          = config.STOP_LOSS,
             )
             pos_manager.add(pos)
-
-            # Pre-approve router in background so sell is instant later
-            asyncio.create_task(
-                asyncio.to_thread(trader.approve_token, token_address)
-            )
 
             amount_fmt = result["tokens_received"] / 10 ** result["decimals"]
             await query.edit_message_text(
                 f"✅ *Куплено!* — {sym}\n\n"
                 f"Получено: {amount_fmt:.4f} {sym}\n"
-                f"Цена входа: {price_before:.8f} BNB\n"
+                f"Цена входа: {entry_price:.8f} BNB\n"
                 f"Tx: `{result['tx_hash']}`\n\n"
                 f"TP1: +{config.TAKE_PROFIT_1}% → продать {config.TAKE_PROFIT_1_PCT:.0f}%\n"
-                f"TP2: +{config.TAKE_PROFIT_2}% → продать остаток\n"
+                f"Далее: trailing stop -{config.TRAILING_STOP_PCT}% от пика\n"
                 f"SL: -{config.STOP_LOSS}%",
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -289,13 +297,16 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (price - pos.buy_price_bnb) / pos.buy_price_bnb * 100
             if pos.buy_price_bnb and price else 0
         )
-        tp1_status = "✅" if pos.tp1_done else f"+{pos.take_profit_1}%"
+        if pos.tp1_done:
+            phase = f"Trailing stop: -{pos.trailing_stop_pct}% от пика ({pos.peak_price:.8f})"
+        else:
+            phase = f"TP1: +{pos.take_profit_1}%  |  SL: -{pos.stop_loss}%"
         text = (
             f"*{pos.name}* ({pos.symbol})\n"
             f"Вход: {pos.buy_price_bnb:.8f} BNB\n"
             f"Сейчас: {price:.8f} BNB\n"
             f"P&L: {pnl_pct:+.1f}%\n"
-            f"TP1: {tp1_status}  TP2: +{pos.take_profit_2}%  SL: -{pos.stop_loss}%"
+            f"{phase}"
         )
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton(
@@ -319,9 +330,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Баланс: *{balance:.4f} BNB* (~${balance * bnb_price:.0f})\n"
         f"Позиций открыто: {len(pos_manager.positions)}\n\n"
         f"*Настройки:*\n"
-        f"Buy: {config.BUY_AMOUNT_BNB} BNB  |  Slippage: {config.SLIPPAGE}%\n"
+        f"Buy: {config.BUY_AMOUNT_BNB} BNB  |  Slip buy/sell: {config.SLIPPAGE_BUY}%/{config.SLIPPAGE_SELL}%\n"
         f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции\n"
-        f"TP2: +{config.TAKE_PROFIT_2}% → остаток  |  SL: -{config.STOP_LOSS}%\n"
+        f"Trailing stop: -{config.TRAILING_STOP_PCT}% от пика  |  SL: -{config.STOP_LOSS}%\n"
         f"Min ликвидность: ${config.MIN_LIQUIDITY_USD:,.0f}\n"
         f"Max tax: {config.MAX_BUY_TAX}% buy / {config.MAX_SELL_TAX}% sell",
         parse_mode=ParseMode.MARKDOWN,
