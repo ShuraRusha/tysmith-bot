@@ -96,7 +96,8 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         f"💸 Buy tax: *{info['buy_tax']:.1f}%*  |  Sell tax: *{info['sell_tax']:.1f}%*\n"
         f"👥 Холдеры: {info['holder_count']}\n\n"
         f"{warn_block}\n\n"
-        f"📊 TP: +{config.TAKE_PROFIT}%  |  SL: -{config.STOP_LOSS}%\n"
+        f"📊 TP1: +{config.TAKE_PROFIT_1}% ({config.TAKE_PROFIT_1_PCT:.0f}% позиции)  "
+        f"TP2: +{config.TAKE_PROFIT_2}%  |  SL: -{config.STOP_LOSS}%\n"
         f"💰 Покупка: *{config.BUY_AMOUNT_BNB} BNB* "
         f"(~${config.BUY_AMOUNT_BNB * bnb_price:.0f})\n"
         f"⏰ {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')} МСК"
@@ -148,16 +149,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 token_info["base_token"],
             )
             pos = Position(
-                token_address = token_info["token_address"],
-                symbol        = sym,
-                name          = token_info["info"]["name"],
-                pair_address  = token_info["pair_address"],
-                buy_price_bnb = price,
-                tokens_amount = result["tokens_received"],
-                decimals      = result["decimals"],
-                buy_bnb       = config.BUY_AMOUNT_BNB,
-                take_profit   = config.TAKE_PROFIT,
-                stop_loss     = config.STOP_LOSS,
+                token_address     = token_info["token_address"],
+                symbol            = sym,
+                name              = token_info["info"]["name"],
+                pair_address      = token_info["pair_address"],
+                buy_price_bnb     = price,
+                tokens_amount     = result["tokens_received"],
+                decimals          = result["decimals"],
+                buy_bnb           = config.BUY_AMOUNT_BNB,
+                take_profit_1     = config.TAKE_PROFIT_1,
+                take_profit_1_pct = config.TAKE_PROFIT_1_PCT,
+                take_profit_2     = config.TAKE_PROFIT_2,
+                stop_loss         = config.STOP_LOSS,
             )
             pos_manager.add(pos)
             amount_fmt = result["tokens_received"] / 10 ** result["decimals"]
@@ -166,7 +169,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Получено: {amount_fmt:.4f} {sym}\n"
                 f"Цена входа: {price:.8f} BNB\n"
                 f"Tx: `{result['tx_hash']}`\n\n"
-                f"TP: +{config.TAKE_PROFIT}%  |  SL: -{config.STOP_LOSS}%",
+                f"TP1: +{config.TAKE_PROFIT_1}% → продать {config.TAKE_PROFIT_1_PCT:.0f}%\n"
+                f"TP2: +{config.TAKE_PROFIT_2}% → продать остаток\n"
+                f"SL: -{config.STOP_LOSS}%",
                 parse_mode=ParseMode.MARKDOWN,
             )
         else:
@@ -274,7 +279,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Позиций открыто: {len(pos_manager.positions)}\n\n"
         f"*Настройки:*\n"
         f"Buy: {config.BUY_AMOUNT_BNB} BNB  |  Slippage: {config.SLIPPAGE}%\n"
-        f"TP: +{config.TAKE_PROFIT}%  |  SL: -{config.STOP_LOSS}%\n"
+        f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции\n"
+        f"TP2: +{config.TAKE_PROFIT_2}% → остаток  |  SL: -{config.STOP_LOSS}%\n"
         f"Min ликвидность: ${config.MIN_LIQUIDITY_USD:,.0f}\n"
         f"Max tax: {config.MAX_BUY_TAX}% buy / {config.MAX_SELL_TAX}% sell",
         parse_mode=ParseMode.MARKDOWN,
