@@ -1,7 +1,11 @@
 import asyncio
+import json
 import logging
+import os
+import sys
 import time
 from datetime import datetime
+from functools import wraps
 
 import pytz
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -27,7 +31,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-MOSCOW_TZ = pytz.timezone("Europe/Moscow")
+MOSCOW_TZ     = pytz.timezone("Europe/Moscow")
+TRADE_LOG_FILE = "/tmp/tysmith_trades.json"
 
 
 # ── Web3 setup ────────────────────────────────────────────────────────────────
@@ -48,6 +53,47 @@ trader = Trader(w3, config.PRIVATE_KEY, config.GAS_MULTIPLIER)
 # cleaned up after user action (buy or skip)
 pending: dict[str, dict] = {}
 
+# ── Bot state ─────────────────────────────────────────────────────────────────
+
+is_paused: bool = False
+trade_history: list[dict] = []
+
+
+def _load_history():
+    global trade_history
+    try:
+        if os.path.exists(TRADE_LOG_FILE):
+            with open(TRADE_LOG_FILE) as f:
+                trade_history = json.load(f)
+            log.info(f"Loaded {len(trade_history)} trades from history")
+    except Exception as e:
+        log.warning(f"Could not load trade history: {e}")
+        trade_history = []
+
+
+def _save_history():
+    try:
+        with open(TRADE_LOG_FILE, "w") as f:
+            json.dump(trade_history[-500:], f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.error(f"Failed to save trade history: {e}")
+
+
+def _record_trade(pos: Position, pnl_pct: float, reason: str, sell_price: float = 0.0):
+    pnl_bnb = round(pos.buy_bnb * pnl_pct / 100, 6)
+    trade_history.append({
+        "symbol":         pos.symbol,
+        "token_address":  pos.token_address,
+        "buy_price_bnb":  pos.buy_price_bnb,
+        "sell_price_bnb": sell_price,
+        "buy_bnb":        pos.buy_bnb,
+        "pnl_pct":        round(pnl_pct, 2),
+        "pnl_bnb":        pnl_bnb,
+        "reason":         reason,
+        "closed_at":      datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M"),
+    })
+    _save_history()
+
 
 # ── Telegram helper ───────────────────────────────────────────────────────────
 
@@ -62,11 +108,27 @@ async def tg_send(text: str, reply_markup=None):
     )
 
 pos_manager = PositionManager(trader, tg_send)
+pos_manager.on_close = _record_trade
+
+
+# ── Owner-only guard ──────────────────────────────────────────────────────────
+
+def owner_only(fn):
+    @wraps(fn)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if str(update.effective_chat.id) != str(config.CHAT_ID):
+            return
+        return await fn(update, context)
+    return wrapper
 
 
 # ── New pair handler ──────────────────────────────────────────────────────────
 
 async def on_pair_found(token_address: str, base_token: str, pair_address: str):
+    if is_paused:
+        log.info(f"Bot paused — skipping {token_address}")
+        return
+
     log.info(f"Analyzing: {token_address}")
 
     result = await check_token(
@@ -81,7 +143,6 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
     info      = result["info"]
     bnb_price = info["bnb_price"]
 
-    # Build warning lines for non-critical flags
     warnings = []
     if info["is_mintable"]:   warnings.append("⚠️ Mintable — могут допечатать токены")
     if info["hidden_owner"]:  warnings.append("⚠️ Hidden owner")
@@ -111,7 +172,7 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         "base_token":    base_token,
         "pair_address":  pair_address,
         "info":          info,
-        "ts":            time.time(),   # TTL: reject if user clicks too late
+        "ts":            time.time(),
     }
 
     keyboard = InlineKeyboardMarkup([[
@@ -139,7 +200,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sym           = token_info["info"]["symbol"]
         token_address = token_info["token_address"]
 
-        # ── Guard: TTL — reject stale alerts ─────────────────────────────────
         if time.time() - token_info["ts"] > config.PENDING_TTL:
             await query.edit_message_text(
                 f"⏰ Время истекло — {sym} уже {config.PENDING_TTL // 60} мин назад.\n"
@@ -147,12 +207,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # ── Guard: no duplicate positions ─────────────────────────────────────
         if token_address in pos_manager.positions:
             await query.edit_message_text(f"⚠️ Позиция по {sym} уже открыта.")
             return
 
-        # ── Guard: max positions limit ────────────────────────────────────────
         if len(pos_manager.positions) >= config.MAX_POSITIONS:
             await query.edit_message_text(
                 f"🚫 Достигнут лимит позиций ({config.MAX_POSITIONS}).\n"
@@ -160,7 +218,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # ── Guard: sufficient BNB balance ─────────────────────────────────────
         if not trader.has_enough_bnb(config.BUY_AMOUNT_BNB):
             await query.edit_message_text(
                 f"💸 Недостаточно BNB для покупки {sym}.\n"
@@ -172,7 +229,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ Одобряю и покупаю *{sym}*...", parse_mode=ParseMode.MARKDOWN
         )
 
-        # Pre-approve router BEFORE buying — eliminates race condition on sell
         approved = await asyncio.to_thread(trader.approve_token, token_address)
         if not approved:
             await query.edit_message_text(
@@ -181,7 +237,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Get price BEFORE buying (not inflated by our own tx)
         price_before = await asyncio.to_thread(
             trader.get_price, token_address, token_info["base_token"]
         )
@@ -191,7 +246,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if result["ok"]:
-            # Fallback entry price: derive from BNB spent / tokens received
             entry_price = price_before if price_before > 0 else (
                 config.BUY_AMOUNT_BNB / (result["tokens_received"] / 10 ** result["decimals"])
             )
@@ -251,11 +305,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if result["ok"]:
-            price   = await asyncio.to_thread(trader.get_price, token_address)
+            sell_price = await asyncio.to_thread(trader.get_price, token_address)
             pnl_pct = (
-                (price - pos.buy_price_bnb) / pos.buy_price_bnb * 100
-                if pos.buy_price_bnb and price else 0
+                (sell_price - pos.buy_price_bnb) / pos.buy_price_bnb * 100
+                if pos.buy_price_bnb and sell_price else 0
             )
+            _record_trade(pos, pnl_pct, "Manual", sell_price)
             pos_manager.remove(token_address)
             await query.edit_message_text(
                 f"✅ *Продано вручную* — {pos.symbol}\n"
@@ -272,19 +327,192 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Command handlers ──────────────────────────────────────────────────────────
 
+@owner_only
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Sniper Bot активен*\n\n"
         "Слежу за новыми парами на PancakeSwap V2 (BSC).\n"
         "Каждый токен проходит автоматическую проверку:\n"
         "honeypot · налог · ликвидность · опасные функции\n\n"
-        "При появлении чистого токена — пришлю уведомление с кнопками.\n\n"
+        "*/help* — все команды\n"
+        "*/status* — баланс и настройки\n"
         "*/positions* — открытые позиции\n"
-        "*/status* — состояние бота и баланс кошелька",
+        "*/stats* — статистика сделок\n"
+        "*/history* — последние 10 сделок",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
+@owner_only
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *Команды бота*\n\n"
+        "*Мониторинг*\n"
+        "/status — баланс кошелька и текущие настройки\n"
+        "/positions — открытые позиции с P&L\n\n"
+        "*Статистика*\n"
+        "/stats — общая статистика (win rate, PnL)\n"
+        "/history — последние 10 закрытых сделок\n\n"
+        "*Управление*\n"
+        "/pause — приостановить снайпинг\n"
+        "/resume — возобновить снайпинг\n\n"
+        "*Настройки* (изменить без перезапуска)\n"
+        "`/set buy 0.05` — сумма покупки в BNB\n"
+        "`/set sl 20` — стоп-лосс в %\n"
+        "`/set tp1 60` — TP1 в %\n"
+        "`/set trail 15` — trailing stop в %\n"
+        "`/set liq 5000` — мин. ликвидность в USD\n"
+        "`/set tax 8` — макс. налог на покупку и продажу\n"
+        "`/set max 5` — макс. кол-во позиций",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@owner_only
+async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global is_paused
+    if is_paused:
+        await update.message.reply_text("⏸ Бот уже на паузе. Используй /resume для возобновления.")
+        return
+    is_paused = True
+    await update.message.reply_text(
+        "⏸ *Снайпинг приостановлен*\n\n"
+        "Новые токены не будут отправляться.\n"
+        "Открытые позиции продолжают мониториться.\n\n"
+        "Используй /resume для возобновления.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@owner_only
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global is_paused
+    if not is_paused:
+        await update.message.reply_text("▶️ Бот уже активен.")
+        return
+    is_paused = False
+    await update.message.reply_text(
+        "▶️ *Снайпинг возобновлён*\n\n"
+        "Слежу за новыми парами на PancakeSwap V2.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@owner_only
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not trade_history:
+        await update.message.reply_text("📊 Нет закрытых сделок.")
+        return
+
+    total   = len(trade_history)
+    wins    = [t for t in trade_history if t["pnl_pct"] > 0]
+    losses  = [t for t in trade_history if t["pnl_pct"] <= 0]
+    win_rate = len(wins) / total * 100
+
+    total_pnl_bnb = sum(t["pnl_bnb"] for t in trade_history)
+    avg_pnl_pct   = sum(t["pnl_pct"] for t in trade_history) / total
+
+    bnb_price = await get_bnb_price(w3)
+    total_pnl_usd = total_pnl_bnb * bnb_price
+
+    best  = max(trade_history, key=lambda t: t["pnl_pct"])
+    worst = min(trade_history, key=lambda t: t["pnl_pct"])
+
+    await update.message.reply_text(
+        f"📊 *Статистика сделок*\n\n"
+        f"Всего сделок: *{total}*\n"
+        f"Прибыльных: *{len(wins)}*  |  Убыточных: *{len(losses)}*\n"
+        f"Win rate: *{win_rate:.1f}%*\n\n"
+        f"Общий P&L: *{total_pnl_bnb:+.4f} BNB* (~${total_pnl_usd:+.0f})\n"
+        f"Средний P&L: *{avg_pnl_pct:+.1f}%* за сделку\n\n"
+        f"Лучшая: *{best['symbol']}* {best['pnl_pct']:+.1f}%\n"
+        f"Худшая: *{worst['symbol']}* {worst['pnl_pct']:+.1f}%",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@owner_only
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not trade_history:
+        await update.message.reply_text("📜 История пустая — нет закрытых сделок.")
+        return
+
+    last10 = trade_history[-10:][::-1]
+    lines = ["📜 *Последние сделки*\n"]
+    for t in last10:
+        emoji = "✅" if t["pnl_pct"] > 0 else "🔴"
+        lines.append(
+            f"{emoji} *{t['symbol']}* {t['pnl_pct']:+.1f}% "
+            f"({t['pnl_bnb']:+.4f} BNB) — {t['reason']}\n"
+            f"    `{t['closed_at']}`"
+        )
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@owner_only
+async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) != 2:
+        await update.message.reply_text(
+            "❌ Формат: `/set <параметр> <значение>`\n\n"
+            "Параметры: `buy`, `sl`, `tp1`, `trail`, `liq`, `tax`, `max`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    param, raw = args[0].lower(), args[1]
+    try:
+        value = float(raw)
+    except ValueError:
+        await update.message.reply_text("❌ Значение должно быть числом.")
+        return
+
+    PARAMS = {
+        "buy":   ("BUY_AMOUNT_BNB",    0.001, 10.0,   "BNB на покупку"),
+        "sl":    ("STOP_LOSS",          1.0,   90.0,   "Стоп-лосс %"),
+        "tp1":   ("TAKE_PROFIT_1",      5.0,   500.0,  "TP1 %"),
+        "trail": ("TRAILING_STOP_PCT",  1.0,   90.0,   "Trailing stop %"),
+        "liq":   ("MIN_LIQUIDITY_USD",  500.0, 1e7,    "Мин. ликвидность USD"),
+        "tax":   ("MAX_BUY_TAX",        1.0,   50.0,   "Макс. налог %"),
+        "max":   ("MAX_POSITIONS",      1,     20,     "Макс. позиций"),
+    }
+
+    if param not in PARAMS:
+        await update.message.reply_text(
+            f"❌ Неизвестный параметр `{param}`.\n"
+            f"Доступные: `{', '.join(PARAMS.keys())}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    attr, min_val, max_val, label = PARAMS[param]
+    if not (min_val <= value <= max_val):
+        await update.message.reply_text(
+            f"❌ Значение вне диапазона: {min_val} — {max_val}"
+        )
+        return
+
+    old_value = getattr(config, attr)
+    # For MAX_POSITIONS store as int
+    if attr == "MAX_POSITIONS":
+        value = int(value)
+    setattr(config, attr, value)
+
+    # tax changes both buy and sell
+    if param == "tax":
+        setattr(config, "MAX_SELL_TAX", value)
+
+    await update.message.reply_text(
+        f"✅ *{label}* обновлён\n"
+        f"{old_value} → *{value}*",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@owner_only
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     positions = pos_manager.get_all()
     if not positions:
@@ -319,16 +547,19 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+@owner_only
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     connected = w3.is_connected()
     balance   = w3.eth.get_balance(trader.wallet) / 1e18
     bnb_price = await get_bnb_price(w3)
+    status_icon = "⏸ ПАУЗА" if is_paused else "▶️ активен"
     await update.message.reply_text(
-        f"*Статус Sniper Bot*\n\n"
+        f"*Статус Sniper Bot* — {status_icon}\n\n"
         f"RPC: {'✅ подключён' if connected else '❌ нет соединения'}\n"
         f"Кошелёк: `{trader.wallet}`\n"
         f"Баланс: *{balance:.4f} BNB* (~${balance * bnb_price:.0f})\n"
-        f"Позиций открыто: {len(pos_manager.positions)}\n\n"
+        f"Позиций открыто: {len(pos_manager.positions)}\n"
+        f"Сделок в истории: {len(trade_history)}\n\n"
         f"*Настройки:*\n"
         f"Buy: {config.BUY_AMOUNT_BNB} BNB  |  Slip buy/sell: {config.SLIPPAGE_BUY}%/{config.SLIPPAGE_SELL}%\n"
         f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции\n"
@@ -362,11 +593,11 @@ def _acquire_pid_lock():
     if os.path.exists(PID_FILE):
         try:
             old_pid = int(open(PID_FILE).read().strip())
-            os.kill(old_pid, 0)   # signal 0 = check if process exists
+            os.kill(old_pid, 0)
             log.error(f"Бот уже запущен (PID {old_pid}). Выход.")
             sys.exit(1)
         except (ProcessLookupError, ValueError):
-            pass   # stale PID file — overwrite it
+            pass
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
@@ -376,13 +607,21 @@ def _release_pid_lock():
     except FileNotFoundError:
         pass
 
+
 async def main():
+    _load_history()
     log.info("Sniper Bot starting...")
 
     app = Application.builder().token(config.BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",     cmd_start))
+    app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("positions", cmd_positions))
     app.add_handler(CommandHandler("status",    cmd_status))
+    app.add_handler(CommandHandler("pause",     cmd_pause))
+    app.add_handler(CommandHandler("resume",    cmd_resume))
+    app.add_handler(CommandHandler("stats",     cmd_stats))
+    app.add_handler(CommandHandler("history",   cmd_history))
+    app.add_handler(CommandHandler("set",       cmd_set))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     await app.initialize()
@@ -397,17 +636,19 @@ async def main():
     await tg_send(
         "🚀 *Sniper Bot запущен*\n"
         "Слежу за новыми парами на PancakeSwap V2 (BSC)...\n\n"
-        "/status — баланс и настройки"
+        "/help — все команды"
     )
 
     try:
         while True:
             await asyncio.sleep(60)
     except (KeyboardInterrupt, SystemExit):
+        _release_pid_lock()
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
 
 
 if __name__ == "__main__":
+    _acquire_pid_lock()
     asyncio.run(main())

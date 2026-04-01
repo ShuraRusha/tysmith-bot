@@ -29,6 +29,7 @@ class PositionManager:
         self.trader    = trader
         self.notify    = notify_fn
         self.positions: dict[str, Position] = {}
+        self.on_close  = None  # optional callback(pos, pnl_pct, reason, sell_price)
 
     # ── CRUD ──────────────────────────────────────────────────────────────────
 
@@ -91,7 +92,7 @@ class PositionManager:
 
                         elif pnl_pct <= -pos.stop_loss:
                             log.info(f"SL hit for {pos.symbol}: {pnl_pct:.1f}%")
-                            await self._close_full(pos, pnl_pct, reason="SL")
+                            await self._close_full(pos, pnl_pct, reason="SL", sell_price=current_price)
 
                     else:
                         # ── Phase 2: trailing stop on remaining tokens ─────────
@@ -104,7 +105,7 @@ class PositionManager:
                                 f"peak={pos.peak_price:.8f}, now={current_price:.8f}, "
                                 f"drop={drop_from_peak:.1f}%"
                             )
-                            await self._close_full(pos, pnl_pct, reason="Trailing Stop")
+                            await self._close_full(pos, pnl_pct, reason="Trailing Stop", sell_price=current_price)
 
                 except Exception as e:
                     log.error(f"Monitor error for {token_addr}: {e}")
@@ -132,7 +133,7 @@ class PositionManager:
                 f"⚠️ Ошибка TP1 для *{pos.symbol}*: {result['reason']}"
             )
 
-    async def _close_full(self, pos: Position, pnl_pct: float, reason: str):
+    async def _close_full(self, pos: Position, pnl_pct: float, reason: str, sell_price: float = 0.0):
         """Sell all remaining tokens."""
         result = await asyncio.to_thread(
             self.trader.sell, pos.token_address, pos.tokens_amount
@@ -149,6 +150,8 @@ class PositionManager:
                 f"Потрачено: {pos.buy_bnb} BNB\n"
                 f"Tx: `{result['tx_hash']}`"
             )
+            if self.on_close:
+                self.on_close(pos, pnl_pct, reason, sell_price)
             self.remove(pos.token_address)
         else:
             await self.notify(
