@@ -16,7 +16,14 @@ BSC_HTTP_RPC        = os.getenv("BSC_HTTP_RPC",        "https://bsc-dataseed.bin
 BSC_HTTP_RPC_BACKUP = os.getenv("BSC_HTTP_RPC_BACKUP", "https://bsc-dataseed1.defibit.io/")
 
 # ── Trading params ────────────────────────────────────────────────────────────
-BUY_AMOUNT_BNB    = float(os.getenv("BUY_AMOUNT_BNB",    "0.02"))
+# Dynamic position sizing: buy BUY_PCT_OF_BALANCE % of wallet per trade
+# Tiers (auto-applied):  balance ≤ 1 BNB → 5% | 1-5 BNB → 3% | >5 BNB → 2%
+# Trade is skipped if calculated amount < BUY_MIN_BNB (gas would eat too much profit)
+BUY_PCT_OF_BALANCE = float(os.getenv("BUY_PCT_OF_BALANCE", "0"))    # 0 = auto-tier
+BUY_MIN_BNB        = float(os.getenv("BUY_MIN_BNB",        "0.03")) # skip trade if below
+BUY_MAX_BNB        = float(os.getenv("BUY_MAX_BNB",        "0.5"))  # hard cap per trade
+GAS_RESERVE_BNB    = float(os.getenv("GAS_RESERVE_BNB",    "0.015"))# always keep in wallet
+
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "10000"))
 MAX_BUY_TAX       = float(os.getenv("MAX_BUY_TAX",       "5"))
 MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "5"))

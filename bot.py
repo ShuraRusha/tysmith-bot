@@ -53,6 +53,41 @@ trader = Trader(w3, config.PRIVATE_KEY, config.GAS_MULTIPLIER)
 # cleaned up after user action (buy or skip)
 pending: dict[str, dict] = {}
 
+# ── Dynamic position sizing ───────────────────────────────────────────────────
+
+def calculate_buy_amount(balance_bnb: float) -> float:
+    """
+    Returns BNB amount to spend on a single trade based on current balance.
+    Returns 0.0 if trade should be skipped (balance too low or gas would dominate).
+
+    Auto-tier logic (when BUY_PCT_OF_BALANCE == 0):
+      balance ≤ 1 BNB  → 5%  (small account, grow faster)
+      balance 1–5 BNB  → 3%  (balanced)
+      balance > 5 BNB  → 2%  (conservative, protect capital)
+
+    Manual override: set BUY_PCT_OF_BALANCE > 0 to bypass tiers.
+    """
+    available = balance_bnb - config.GAS_RESERVE_BNB
+    if available <= 0:
+        return 0.0
+
+    if config.BUY_PCT_OF_BALANCE > 0:
+        pct = config.BUY_PCT_OF_BALANCE
+    elif balance_bnb <= 1.0:
+        pct = 5.0
+    elif balance_bnb <= 5.0:
+        pct = 3.0
+    else:
+        pct = 2.0
+
+    amount = available * pct / 100.0
+
+    if amount < config.BUY_MIN_BNB:
+        return 0.0  # too small — gas would eat most of any profit
+
+    return round(min(amount, config.BUY_MAX_BNB), 4)
+
+
 # ── Bot state ─────────────────────────────────────────────────────────────────
 
 is_paused: bool = False
@@ -143,6 +178,12 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
     info      = result["info"]
     bnb_price = info["bnb_price"]
 
+    balance   = w3.eth.get_balance(trader.wallet) / 1e18
+    buy_amount = calculate_buy_amount(balance)
+    if buy_amount == 0.0:
+        log.info(f"Skipping {token_address}: balance too low for min trade size")
+        return
+
     warnings = []
     if info["is_mintable"]:   warnings.append("⚠️ Mintable — могут допечатать токены")
     if info["hidden_owner"]:  warnings.append("⚠️ Hidden owner")
@@ -161,8 +202,8 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
         f"| Trailing: -{config.TRAILING_STOP_PCT}% от пика  "
         f"| SL: -{config.STOP_LOSS}%\n"
-        f"💰 Покупка: *{config.BUY_AMOUNT_BNB} BNB* "
-        f"(~${config.BUY_AMOUNT_BNB * bnb_price:.0f})\n"
+        f"💰 Покупка: *{buy_amount} BNB* (~${buy_amount * bnb_price:.0f}) "
+        f"| Баланс: {balance:.3f} BNB\n"
         f"⏰ {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')} МСК"
     )
 
@@ -173,6 +214,7 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         "pair_address":  pair_address,
         "info":          info,
         "ts":            time.time(),
+        "buy_amount":    buy_amount,
     }
 
     keyboard = InlineKeyboardMarkup([[
@@ -218,10 +260,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if not trader.has_enough_bnb(config.BUY_AMOUNT_BNB):
+        # Recalculate at buy time — balance may have changed since notification
+        current_balance = w3.eth.get_balance(trader.wallet) / 1e18
+        buy_amount = calculate_buy_amount(current_balance)
+        if buy_amount == 0.0:
             await query.edit_message_text(
-                f"💸 Недостаточно BNB для покупки {sym}.\n"
-                f"Нужно: {config.BUY_AMOUNT_BNB} BNB + ~0.005 BNB на газ."
+                f"💸 Баланс слишком мал для покупки {sym}.\n"
+                f"Нужно минимум {config.BUY_MIN_BNB + config.GAS_RESERVE_BNB:.3f} BNB "
+                f"(торговля + газ). Текущий баланс: {current_balance:.4f} BNB."
             )
             return
 
@@ -242,12 +288,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         result = await asyncio.to_thread(
-            trader.buy, token_address, config.BUY_AMOUNT_BNB
+            trader.buy, token_address, buy_amount
         )
 
         if result["ok"]:
             entry_price = price_before if price_before > 0 else (
-                config.BUY_AMOUNT_BNB / (result["tokens_received"] / 10 ** result["decimals"])
+                buy_amount / (result["tokens_received"] / 10 ** result["decimals"])
             )
             pos = Position(
                 token_address      = token_address,
@@ -257,7 +303,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 buy_price_bnb      = entry_price,
                 tokens_amount      = result["tokens_received"],
                 decimals           = result["decimals"],
-                buy_bnb            = config.BUY_AMOUNT_BNB,
+                buy_bnb            = buy_amount,
                 take_profit_1      = config.TAKE_PROFIT_1,
                 take_profit_1_pct  = config.TAKE_PROFIT_1_PCT,
                 trailing_stop_pct  = config.TRAILING_STOP_PCT,
@@ -357,7 +403,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/pause — приостановить снайпинг\n"
         "/resume — возобновить снайпинг\n\n"
         "*Настройки* (изменить без перезапуска)\n"
-        "`/set buy 0.05` — сумма покупки в BNB\n"
+        "`/set pct 3` — % баланса на сделку (0 = авто-тир)\n"
+        "`/set minbuy 0.03` — мин. сумма сделки BNB\n"
+        "`/set maxbuy 0.5` — макс. сумма сделки BNB\n"
         "`/set sl 20` — стоп-лосс в %\n"
         "`/set tp1 60` — TP1 в %\n"
         "`/set trail 15` — trailing stop в %\n"
@@ -471,13 +519,15 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     PARAMS = {
-        "buy":   ("BUY_AMOUNT_BNB",    0.001, 10.0,   "BNB на покупку"),
-        "sl":    ("STOP_LOSS",          1.0,   90.0,   "Стоп-лосс %"),
-        "tp1":   ("TAKE_PROFIT_1",      5.0,   500.0,  "TP1 %"),
-        "trail": ("TRAILING_STOP_PCT",  1.0,   90.0,   "Trailing stop %"),
-        "liq":   ("MIN_LIQUIDITY_USD",  500.0, 1e7,    "Мин. ликвидность USD"),
-        "tax":   ("MAX_BUY_TAX",        1.0,   50.0,   "Макс. налог %"),
-        "max":   ("MAX_POSITIONS",      1,     20,     "Макс. позиций"),
+        "pct":    ("BUY_PCT_OF_BALANCE", 0.0,  20.0,  "% баланса на сделку (0 = авто-тир)"),
+        "minbuy": ("BUY_MIN_BNB",        0.01, 1.0,   "Мин. сумма сделки BNB"),
+        "maxbuy": ("BUY_MAX_BNB",        0.05, 10.0,  "Макс. сумма сделки BNB"),
+        "sl":     ("STOP_LOSS",          1.0,  90.0,  "Стоп-лосс %"),
+        "tp1":    ("TAKE_PROFIT_1",      5.0,  500.0, "TP1 %"),
+        "trail":  ("TRAILING_STOP_PCT",  1.0,  90.0,  "Trailing stop %"),
+        "liq":    ("MIN_LIQUIDITY_USD",  500.0, 1e7,  "Мин. ликвидность USD"),
+        "tax":    ("MAX_BUY_TAX",        1.0,  50.0,  "Макс. налог %"),
+        "max":    ("MAX_POSITIONS",      1,    20,    "Макс. позиций"),
     }
 
     if param not in PARAMS:
@@ -549,10 +599,21 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    connected = w3.is_connected()
-    balance   = w3.eth.get_balance(trader.wallet) / 1e18
-    bnb_price = await get_bnb_price(w3)
+    connected  = w3.is_connected()
+    balance    = w3.eth.get_balance(trader.wallet) / 1e18
+    bnb_price  = await get_bnb_price(w3)
+    buy_amount = calculate_buy_amount(balance)
     status_icon = "⏸ ПАУЗА" if is_paused else "▶️ активен"
+
+    if config.BUY_PCT_OF_BALANCE > 0:
+        size_mode = f"{config.BUY_PCT_OF_BALANCE}% (ручной)"
+    elif balance <= 1.0:
+        size_mode = f"5% авто (баланс ≤ 1 BNB)"
+    elif balance <= 5.0:
+        size_mode = f"3% авто (баланс 1–5 BNB)"
+    else:
+        size_mode = f"2% авто (баланс > 5 BNB)"
+
     await update.message.reply_text(
         f"*Статус Sniper Bot* — {status_icon}\n\n"
         f"RPC: {'✅ подключён' if connected else '❌ нет соединения'}\n"
@@ -560,8 +621,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Баланс: *{balance:.4f} BNB* (~${balance * bnb_price:.0f})\n"
         f"Позиций открыто: {len(pos_manager.positions)}\n"
         f"Сделок в истории: {len(trade_history)}\n\n"
+        f"*Размер позиции:*\n"
+        f"Режим: {size_mode}\n"
+        f"Следующая сделка: *{buy_amount} BNB* (~${buy_amount * bnb_price:.0f})\n"
+        f"Мин: {config.BUY_MIN_BNB} BNB  |  Макс: {config.BUY_MAX_BNB} BNB  "
+        f"|  Газ-резерв: {config.GAS_RESERVE_BNB} BNB\n\n"
         f"*Настройки:*\n"
-        f"Buy: {config.BUY_AMOUNT_BNB} BNB  |  Slip buy/sell: {config.SLIPPAGE_BUY}%/{config.SLIPPAGE_SELL}%\n"
+        f"Slip buy/sell: {config.SLIPPAGE_BUY}%/{config.SLIPPAGE_SELL}%\n"
         f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции\n"
         f"Trailing stop: -{config.TRAILING_STOP_PCT}% от пика  |  SL: -{config.STOP_LOSS}%\n"
         f"Min ликвидность: ${config.MIN_LIQUIDITY_USD:,.0f}\n"
