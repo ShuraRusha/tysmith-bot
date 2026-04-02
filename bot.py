@@ -55,6 +55,25 @@ pending: dict[str, dict] = {}
 
 # ── Dynamic position sizing ───────────────────────────────────────────────────
 
+def calculate_max_positions(balance_bnb: float) -> int:
+    """
+    Max concurrent positions in auto mode = floor(15% of balance / % per trade).
+    Keeps ~15% of capital deployed at any time.
+      ≤1 BNB  (5%/trade) → 3 positions
+      1-5 BNB (3%/trade) → 5 positions
+      >5 BNB  (2%/trade) → 7 positions
+    Manual override: set MAX_AUTO_POSITIONS > 0 in config.
+    """
+    if config.MAX_AUTO_POSITIONS > 0:
+        return config.MAX_AUTO_POSITIONS
+    if balance_bnb <= 1.0:
+        return 3
+    elif balance_bnb <= 5.0:
+        return 5
+    else:
+        return 7
+
+
 def calculate_buy_amount(balance_bnb: float) -> float:
     """
     Returns BNB amount to spend on a single trade based on current balance.
@@ -91,6 +110,7 @@ def calculate_buy_amount(balance_bnb: float) -> float:
 # ── Bot state ─────────────────────────────────────────────────────────────────
 
 is_paused: bool = False
+is_auto:   bool = config.AUTO_BUY
 trade_history: list[dict] = []
 
 
@@ -208,6 +228,66 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
     )
 
     cb_id = token_address[:10]
+
+    # ── AUTO-BUY MODE ─────────────────────────────────────────────────────────
+    if is_auto:
+        max_pos = calculate_max_positions(balance)
+        if len(pos_manager.positions) >= max_pos:
+            log.info(f"Auto: max positions ({max_pos}) reached, skipping {info['symbol']}")
+            return
+        if token_address in pos_manager.positions:
+            return
+
+        await tg_send(
+            f"⚡ *Авто-покупка* — {info['name']} (`{info['symbol']}`)\n"
+            f"💰 {buy_amount} BNB (~${buy_amount * bnb_price:.0f}) | "
+            f"Ликвидность: ${info['liquidity_usd']:,.0f}\n"
+            f"{warn_block}"
+        )
+
+        approved = await asyncio.to_thread(trader.approve_token, token_address)
+        if not approved:
+            await tg_send(f"❌ Авто: не удалось одобрить *{info['symbol']}*")
+            return
+
+        price_before = await asyncio.to_thread(trader.get_price, token_address, base_token)
+        result       = await asyncio.to_thread(trader.buy, token_address, buy_amount)
+
+        if result["ok"]:
+            entry_price = price_before if price_before > 0 else (
+                buy_amount / (result["tokens_received"] / 10 ** result["decimals"])
+            )
+            pos = Position(
+                token_address     = token_address,
+                symbol            = info["symbol"],
+                name              = info["name"],
+                pair_address      = pair_address,
+                buy_price_bnb     = entry_price,
+                tokens_amount     = result["tokens_received"],
+                decimals          = result["decimals"],
+                buy_bnb           = buy_amount,
+                take_profit_1     = config.TAKE_PROFIT_1,
+                take_profit_1_pct = config.TAKE_PROFIT_1_PCT,
+                trailing_stop_pct = config.TRAILING_STOP_PCT,
+                stop_loss         = config.STOP_LOSS,
+            )
+            pos_manager.add(pos)
+            amount_fmt = result["tokens_received"] / 10 ** result["decimals"]
+            await tg_send(
+                f"✅ *Куплено авто* — {info['symbol']}\n\n"
+                f"Получено: {amount_fmt:.4f} {info['symbol']}\n"
+                f"Цена входа: {entry_price:.8f} BNB\n"
+                f"Tx: `{result['tx_hash']}`\n\n"
+                f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}%  "
+                f"| Trailing: -{config.TRAILING_STOP_PCT}%  "
+                f"| SL: -{config.STOP_LOSS}%\n"
+                f"Позиций открыто: {len(pos_manager.positions)}/{max_pos}"
+            )
+        else:
+            await tg_send(f"❌ Авто: ошибка покупки *{info['symbol']}*: {result['reason']}")
+        return
+
+    # ── MANUAL MODE: send notification with buttons ───────────────────────────
     pending[cb_id] = {
         "token_address": token_address,
         "base_token":    base_token,
@@ -400,6 +480,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stats — общая статистика (win rate, PnL)\n"
         "/history — последние 10 закрытых сделок\n\n"
         "*Управление*\n"
+        "/auto on|off — авто-режим (покупает сам без подтверждения)\n"
         "/pause — приостановить снайпинг\n"
         "/resume — возобновить снайпинг\n\n"
         "*Настройки* (изменить без перезапуска)\n"
@@ -444,6 +525,54 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Слежу за новыми парами на PancakeSwap V2.",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+@owner_only
+async def cmd_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global is_auto
+    args = context.args
+    if not args or args[0].lower() not in ("on", "off"):
+        status = "включён ✅" if is_auto else "выключен ❌"
+        balance = w3.eth.get_balance(trader.wallet) / 1e18
+        max_pos = calculate_max_positions(balance)
+        await update.message.reply_text(
+            f"⚡ *Авто-режим*: {status}\n\n"
+            f"Текущий лимит позиций: *{max_pos}* "
+            f"(баланс {balance:.3f} BNB)\n\n"
+            f"`/auto on` — включить\n"
+            f"`/auto off` — выключить",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if args[0].lower() == "on":
+        if is_auto:
+            await update.message.reply_text("⚡ Авто-режим уже включён.")
+            return
+        is_auto = True
+        balance = w3.eth.get_balance(trader.wallet) / 1e18
+        max_pos = calculate_max_positions(balance)
+        buy_amt = calculate_buy_amount(balance)
+        await update.message.reply_text(
+            f"⚡ *Авто-режим включён*\n\n"
+            f"Бот будет покупать самостоятельно без твоего подтверждения.\n\n"
+            f"Баланс: {balance:.4f} BNB\n"
+            f"Сумма на сделку: *{buy_amt} BNB*\n"
+            f"Макс. позиций: *{max_pos}* (~15% капитала в работе)\n\n"
+            f"⚠️ Убедись что фильтры настроены правильно (/status).\n"
+            f"Отключить: /auto off",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        if not is_auto:
+            await update.message.reply_text("⚡ Авто-режим уже выключен.")
+            return
+        is_auto = False
+        await update.message.reply_text(
+            "🔵 *Авто-режим выключен*\n\n"
+            "Бот снова будет присылать уведомления с кнопками для ручного подтверждения.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 
 @owner_only
@@ -603,7 +732,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     balance    = w3.eth.get_balance(trader.wallet) / 1e18
     bnb_price  = await get_bnb_price(w3)
     buy_amount = calculate_buy_amount(balance)
-    status_icon = "⏸ ПАУЗА" if is_paused else "▶️ активен"
+    auto_icon   = "⚡ авто" if is_auto else "👆 ручной"
+    status_icon = "⏸ ПАУЗА" if is_paused else f"▶️ активен | {auto_icon}"
 
     if config.BUY_PCT_OF_BALANCE > 0:
         size_mode = f"{config.BUY_PCT_OF_BALANCE}% (ручной)"
@@ -619,7 +749,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"RPC: {'✅ подключён' if connected else '❌ нет соединения'}\n"
         f"Кошелёк: `{trader.wallet}`\n"
         f"Баланс: *{balance:.4f} BNB* (~${balance * bnb_price:.0f})\n"
-        f"Позиций открыто: {len(pos_manager.positions)}\n"
+        f"Позиций открыто: {len(pos_manager.positions)}/{calculate_max_positions(balance) if is_auto else config.MAX_POSITIONS}\n"
         f"Сделок в истории: {len(trade_history)}\n\n"
         f"*Размер позиции:*\n"
         f"Режим: {size_mode}\n"
@@ -683,6 +813,7 @@ async def main():
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("positions", cmd_positions))
     app.add_handler(CommandHandler("status",    cmd_status))
+    app.add_handler(CommandHandler("auto",      cmd_auto))
     app.add_handler(CommandHandler("pause",     cmd_pause))
     app.add_handler(CommandHandler("resume",    cmd_resume))
     app.add_handler(CommandHandler("stats",     cmd_stats))

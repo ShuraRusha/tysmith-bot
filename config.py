@@ -47,8 +47,13 @@ GAS_MULTIPLIER    = float(os.getenv("GAS_MULTIPLIER",     "1.3"))
 TX_DEADLINE_SEC   = int(os.getenv("TX_DEADLINE_SEC",      "60"))   # tx expiry in seconds
 
 # ── Bot behaviour ─────────────────────────────────────────────────────────────
-MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS",        "3"))    # max open positions at once
-PENDING_TTL       = int(os.getenv("PENDING_TTL",          "60"))   # seconds before alert expires
+MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS",     "3"))    # manual mode cap
+PENDING_TTL       = int(os.getenv("PENDING_TTL",       "60"))   # seconds before alert expires
+
+# Auto-buy mode: bot buys immediately without user confirmation
+# MAX_AUTO_POSITIONS=0 → calculated automatically from balance tier (recommended)
+AUTO_BUY           = os.getenv("AUTO_BUY",           "false").lower() == "true"
+MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "0"))  # 0 = auto formula
 
 # ── Safety filters ────────────────────────────────────────────────────────────
 TOP_HOLDER_MAX_PCT = float(os.getenv("TOP_HOLDER_MAX_PCT", "30"))  # reject if single wallet > X%
