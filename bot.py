@@ -189,6 +189,7 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
     result = await check_token(
         token_address, pair_address, base_token, w3,
         config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
+        wallet_address=trader.wallet,
     )
 
     if not result["ok"]:
@@ -204,7 +205,7 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         log.info(f"Skipping {token_address}: balance too low for min trade size")
         return
 
-    warnings = []
+    warnings = info.get("extra_warnings", [])
     if info["is_mintable"]:   warnings.append("⚠️ Mintable — могут допечатать токены")
     if info["hidden_owner"]:  warnings.append("⚠️ Hidden owner")
     if info["is_proxy"]:      warnings.append("⚠️ Proxy контракт")
