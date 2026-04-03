@@ -21,6 +21,7 @@ from web3.middleware import geth_poa_middleware
 
 import config
 from analyzer import check_token, get_bnb_price
+from demo import DemoManager
 from position import Position, PositionManager
 from trader import Trader
 from watcher import watch_pairs
@@ -165,6 +166,9 @@ async def tg_send(text: str, reply_markup=None):
 pos_manager = PositionManager(trader, tg_send)
 pos_manager.on_close = _record_trade
 
+# Demo manager — initialised with placeholder BNB; reset at /demo on
+demo_manager: DemoManager | None = None
+
 
 # ── Owner-only guard ──────────────────────────────────────────────────────────
 
@@ -229,6 +233,47 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
     )
 
     cb_id = token_address[:10]
+
+    # ── DEMO MODE — virtual trade, no real money ──────────────────────────────
+    if demo_manager and demo_manager.enabled:
+        max_pos = calculate_max_positions(demo_manager.balance_bnb)
+        if len(demo_manager.positions) >= max_pos:
+            log.info(f"Demo: max positions ({max_pos}) reached, skipping {info['symbol']}")
+            return
+        if token_address in demo_manager.positions:
+            return
+        demo_buy = calculate_buy_amount(demo_manager.balance_bnb)
+        if demo_buy == 0.0:
+            log.info(f"Demo: virtual balance too low, skipping {info['symbol']}")
+            return
+
+        price = await asyncio.to_thread(trader.get_price, token_address, base_token)
+        if price <= 0:
+            return
+
+        ok = demo_manager.buy(
+            token_address     = token_address,
+            symbol            = info["symbol"],
+            name              = info["name"],
+            buy_price_bnb     = price,
+            buy_bnb           = demo_buy,
+            take_profit_1     = config.TAKE_PROFIT_1,
+            take_profit_1_pct = config.TAKE_PROFIT_1_PCT,
+            trailing_stop_pct = config.TRAILING_STOP_PCT,
+            stop_loss         = config.STOP_LOSS,
+        )
+        if ok:
+            await tg_send(
+                f"📊 *\[ДЕМО\] Куплено — {info['name']} ({info['symbol']})*\n\n"
+                f"Цена входа: `{price:.8f}` BNB\n"
+                f"Сумма: *{demo_buy} BNB* виртуальных\n"
+                f"Ликвидность: ${info['liquidity_usd']:,.0f}\n\n"
+                f"TP1: +{config.TAKE_PROFIT_1}%  "
+                f"| Trailing: -{config.TRAILING_STOP_PCT}%  "
+                f"| SL: -{config.STOP_LOSS}%\n"
+                f"Виртуальный баланс: {demo_manager.balance_bnb:.4f} BNB"
+            )
+        return
 
     # ── AUTO-BUY MODE ─────────────────────────────────────────────────────────
     if is_auto:
@@ -529,6 +574,117 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
+async def cmd_demo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global demo_manager
+    args    = context.args
+    subcmd  = args[0].lower() if args else "status"
+
+    if subcmd == "on":
+        bnb_price = await get_bnb_price(w3)
+        if bnb_price <= 0:
+            await update.message.reply_text("❌ Не удалось получить цену BNB.")
+            return
+        initial_bnb = round(1000.0 / bnb_price, 4)
+        fresh = demo_manager is None
+        if fresh:
+            demo_manager = DemoManager(trader, tg_send, initial_bnb)
+        else:
+            demo_manager.reset(initial_bnb)
+        demo_manager.enabled = True
+        demo_manager._save()
+        if fresh:
+            asyncio.create_task(demo_manager.monitor())
+        await update.message.reply_text(
+            f"📊 *Демо-режим запущен*\n\n"
+            f"Виртуальный баланс: *{initial_bnb:.4f} BNB* (~$1000)\n"
+            f"Курс BNB: ${bnb_price:.0f}\n\n"
+            f"Бот анализирует реальные токены и совершает виртуальные сделки.\n"
+            f"Реальные деньги не тратятся.\n\n"
+            f"Следи за статистикой: /demo\n"
+            f"Остановить: /demo off",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if subcmd == "off":
+        if demo_manager:
+            demo_manager.enabled = False
+            demo_manager._save()
+        await update.message.reply_text("📊 Демо-режим остановлен. Статистика сохранена.")
+        return
+
+    if subcmd == "reset":
+        bnb_price = await get_bnb_price(w3)
+        initial_bnb = round(1000.0 / bnb_price, 4) if bnb_price > 0 else 1.67
+        if demo_manager is None:
+            demo_manager = DemoManager(trader, tg_send, initial_bnb)
+        else:
+            demo_manager.reset(initial_bnb)
+        demo_manager.enabled = True
+        demo_manager._save()
+        await update.message.reply_text(
+            f"🔄 Демо сброшен. Новый баланс: *{initial_bnb:.4f} BNB* (~$1000)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if subcmd == "history":
+        if not demo_manager or not demo_manager.trades:
+            await update.message.reply_text("📊 История демо-сделок пустая.")
+            return
+        last10 = demo_manager.trades[-10:][::-1]
+        lines  = ["📊 *Последние демо-сделки*\n"]
+        for t in last10:
+            emoji = "✅" if t["pnl_pct"] > 0 else "🔴"
+            lines.append(
+                f"{emoji} *{t['symbol']}* {t['pnl_pct']:+.1f}% "
+                f"({t['pnl_bnb']:+.4f} BNB) — {t['reason']}\n"
+                f"    {t['opened_at']} → {t['closed_at']}"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # Default: show stats
+    if not demo_manager:
+        await update.message.reply_text(
+            "📊 Демо не запущен.\n\n"
+            "Запустить: /demo on\n"
+            "Бот начнёт виртуальные сделки с $1000 на реальных токенах."
+        )
+        return
+
+    bnb_price = await get_bnb_price(w3)
+    s         = demo_manager.get_stats(bnb_price)
+    status    = "▶️ активен" if demo_manager.enabled else "⏸ остановлен"
+
+    open_lines = []
+    for pos in demo_manager.positions.values():
+        price   = await asyncio.to_thread(trader.get_price, pos.token_address)
+        pnl_pct = (price - pos.buy_price_bnb) / pos.buy_price_bnb * 100 if price and pos.buy_price_bnb else 0
+        phase   = "trailing" if pos.tp1_done else "phase1"
+        open_lines.append(f"  • {pos.symbol}: {pnl_pct:+.1f}% [{phase}]")
+
+    open_text = "\n".join(open_lines) if open_lines else "  нет открытых позиций"
+    pnl_emoji = "📈" if s["pnl_pct"] >= 0 else "📉"
+
+    await update.message.reply_text(
+        f"📊 *Демо-счёт* — {status}\n\n"
+        f"Стартовый баланс: *${s['initial_usd']:.0f}* ({s['initial_bnb']:.4f} BNB)\n"
+        f"Текущий баланс:   *${s['balance_usd']:.0f}* ({s['balance_bnb']:.4f} BNB)\n"
+        f"{pnl_emoji} Итого P&L: *{s['pnl_pct']:+.1f}%* ({s['pnl_bnb']:+.4f} BNB / ${s['pnl_usd']:+.0f})\n\n"
+        f"Закрытых сделок: *{s['total_trades']}*\n"
+        f"Прибыльных: {s['wins']}  |  Убыточных: {s['losses']}\n"
+        f"Win rate: *{s['win_rate']:.1f}%*\n\n"
+        f"Открытых позиций: {s['open']}\n"
+        f"{open_text}\n\n"
+        + (f"Лучшая: *{s['best']['symbol']}* {s['best']['pnl_pct']:+.1f}%\n" if s["best"] else "")
+        + (f"Худшая: *{s['worst']['symbol']}* {s['worst']['pnl_pct']:+.1f}%\n" if s["worst"] else "")
+        + "\n`/demo history` — история сделок\n`/demo reset` — начать заново",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@owner_only
 async def cmd_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global is_auto
     args = context.args
@@ -810,6 +966,7 @@ async def main():
     log.info("Sniper Bot starting...")
 
     app = Application.builder().token(config.BOT_TOKEN).build()
+    app.add_handler(CommandHandler("demo",      cmd_demo))
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("positions", cmd_positions))
@@ -829,6 +986,14 @@ async def main():
     asyncio.create_task(pos_manager.monitor())
     asyncio.create_task(watch_pairs(config.BSC_WS_RPC, on_pair_found))
     asyncio.create_task(_cleanup_pending())
+
+    # Restore demo manager if it was running before restart
+    global demo_manager
+    _dm = DemoManager(trader, tg_send, initial_bnb=1.67)  # placeholder
+    if _dm.enabled:
+        demo_manager = _dm
+        asyncio.create_task(demo_manager.monitor())
+        log.info("Demo mode restored from saved state")
 
     log.info(f"Ready. Wallet: {trader.wallet}")
     await tg_send(
