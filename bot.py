@@ -966,6 +966,11 @@ async def main():
     log.info("Sniper Bot starting...")
 
     app = Application.builder().token(config.BOT_TOKEN).build()
+
+    # Drop any webhook that might be set — prevents conflict with polling
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    log.info("Webhook cleared")
+
     app.add_handler(CommandHandler("demo",      cmd_demo))
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_help))
