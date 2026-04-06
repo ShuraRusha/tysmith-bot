@@ -16,7 +16,10 @@ import pytz
 
 log = logging.getLogger(__name__)
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
-DEMO_FILE  = "/tmp/tysmith_demo.json"
+
+_DATA_DIR = os.getenv("DATA_DIR", "/data")
+os.makedirs(_DATA_DIR, exist_ok=True)
+DEMO_FILE = os.path.join(_DATA_DIR, "tysmith_demo.json")
 
 
 # ── Data model ────────────────────────────────────────────────────────────────

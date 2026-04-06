@@ -33,7 +33,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 MOSCOW_TZ     = pytz.timezone("Europe/Moscow")
-TRADE_LOG_FILE = "/tmp/tysmith_trades.json"
+DATA_DIR       = os.getenv("DATA_DIR", "/data")
+os.makedirs(DATA_DIR, exist_ok=True)   # ensure /data exists (Railway Volume or fallback)
+TRADE_LOG_FILE = os.path.join(DATA_DIR, "tysmith_trades.json")
 
 
 # ── Web3 setup ────────────────────────────────────────────────────────────────
@@ -939,7 +941,7 @@ async def _cleanup_pending():
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-PID_FILE = "/tmp/tysmith-bot.pid"
+PID_FILE = "/tmp/tysmith-bot.pid"  # tmp is fine for pid — resets on restart
 
 def _acquire_pid_lock():
     """Exit if another instance is already running."""
