@@ -30,15 +30,15 @@ MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "5"))
 
 # ── Entry/Exit strategy ───────────────────────────────────────────────────────
 # Phase 1 — fixed TP: sell TAKE_PROFIT_1_PCT% at TAKE_PROFIT_1% gain
-TAKE_PROFIT_1     = float(os.getenv("TAKE_PROFIT_1",     "50"))   # % gain → partial exit
-TAKE_PROFIT_1_PCT = float(os.getenv("TAKE_PROFIT_1_PCT", "25"))   # % of tokens to sell at TP1
+TAKE_PROFIT_1     = float(os.getenv("TAKE_PROFIT_1",     "30"))   # % gain → partial exit
+TAKE_PROFIT_1_PCT = float(os.getenv("TAKE_PROFIT_1_PCT", "50"))   # % of tokens to sell at TP1
 
 # Phase 2 — trailing stop on remaining position after TP1
 # Sells all remaining tokens if price drops TRAILING_STOP_PCT% from peak
-TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "10"))   # % drop from peak → full exit
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "20"))   # % drop from peak → full exit
 
 # Fixed stop loss before TP1 is reached
-STOP_LOSS         = float(os.getenv("STOP_LOSS",         "15"))
+STOP_LOSS         = float(os.getenv("STOP_LOSS",         "20"))
 
 # ── Execution params ──────────────────────────────────────────────────────────
 SLIPPAGE_BUY      = float(os.getenv("SLIPPAGE_BUY",      "5"))    # % slippage tolerance on buy
