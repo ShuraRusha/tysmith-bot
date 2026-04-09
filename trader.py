@@ -3,6 +3,7 @@ import logging
 
 from web3 import Web3
 
+import config
 from config import PANCAKE_ROUTER_V2, WBNB, SLIPPAGE_BUY, SLIPPAGE_SELL, TX_DEADLINE_SEC
 
 log = logging.getLogger(__name__)
@@ -94,16 +95,23 @@ class Trader:
         self.router         = w3.eth.contract(address=ROUTER_ADDRESS, abi=ROUTER_ABI)
         self.gas_multiplier = gas_multiplier
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
+    # ── Gas helpers ──────────────────────────────────────────────────────────
 
-    def _gas_price(self) -> int:
+    def _gas_price_buy(self) -> int:
+        """Aggressive gas for buy — speed is critical to get in first."""
+        if config.GAS_BUY_GWEI > 0:
+            return Web3.to_wei(config.GAS_BUY_GWEI, "gwei")
         return int(self.w3.eth.gas_price * self.gas_multiplier)
+
+    def _gas_price_normal(self) -> int:
+        """Standard gas for sell/approve — speed is less critical."""
+        return int(self.w3.eth.gas_price * 1.1)
 
     def _nonce(self) -> int:
         return self.w3.eth.get_transaction_count(self.wallet, "pending")
 
     def _deadline(self) -> int:
-        return int(time.time()) + TX_DEADLINE_SEC  # short window — reject stale txs
+        return int(time.time()) + TX_DEADLINE_SEC
 
     # ── Price ─────────────────────────────────────────────────────────────────
 
@@ -128,11 +136,10 @@ class Trader:
     # ── Balance check ─────────────────────────────────────────────────────────
 
     def has_enough_bnb(self, amount_bnb: float, gas_reserve: float = 0.005) -> bool:
-        """Return True if wallet has enough BNB for the trade + gas reserve."""
         balance = self.w3.eth.get_balance(self.wallet) / 1e18
         return balance >= amount_bnb + gas_reserve
 
-    # ── Pre-approve router (call right after buy to save time on sell) ─────────
+    # ── Pre-approve router ────────────────────────────────────────────────────
 
     def approve_token(self, token_address: str) -> bool:
         """Approve PancakeSwap router to spend this token. Synchronous."""
@@ -141,19 +148,19 @@ class Trader:
             token     = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
             allowance = token.functions.allowance(self.wallet, ROUTER_ADDRESS).call()
             if allowance > 0:
-                return True  # already approved
+                return True
             approve_tx = token.functions.approve(
                 ROUTER_ADDRESS, 2 ** 256 - 1
             ).build_transaction({
                 "from":     self.wallet,
-                "gas":      100_000,
-                "gasPrice": self._gas_price(),
+                "gas":      config.GAS_LIMIT_APPROVE,
+                "gasPrice": self._gas_price_buy(),  # fast approve before buy
                 "nonce":    self._nonce(),
                 "chainId":  56,
             })
             signed  = self.account.sign_transaction(approve_tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-            self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
             log.info(f"Pre-approved {token_address}")
             return True
         except Exception as e:
@@ -165,21 +172,22 @@ class Trader:
     def buy(self, token_address: str, amount_bnb: float) -> dict:
         """
         Buy token with BNB via PancakeSwap V2.
+        Uses aggressive gas price + high slippage for sniper speed.
         Synchronous — call via asyncio.to_thread from async code.
-
-        Returns:
-            {"ok": True,  "tx_hash": "...", "tokens_received": int, "decimals": int}
-            {"ok": False, "reason": "..."}
         """
         try:
             token_address = Web3.to_checksum_address(token_address)
             amount_wei    = Web3.to_wei(amount_bnb, "ether")
 
-            # Expected output with buy slippage tolerance
             amounts  = self.router.functions.getAmountsOut(
                 amount_wei, [WBNB_ADDRESS, token_address]
             ).call()
             min_out  = int(amounts[1] * (1 - SLIPPAGE_BUY / 100))
+
+            gas_price = self._gas_price_buy()
+            log.info(f"Buy {token_address}: {amount_bnb} BNB, "
+                     f"gasPrice={gas_price / 1e9:.1f} gwei, "
+                     f"slippage={SLIPPAGE_BUY}%")
 
             tx = self.router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
                 min_out,
@@ -189,15 +197,15 @@ class Trader:
             ).build_transaction({
                 "from":     self.wallet,
                 "value":    amount_wei,
-                "gas":      300_000,
-                "gasPrice": self._gas_price(),
+                "gas":      config.GAS_LIMIT_BUY,
+                "gasPrice": gas_price,
                 "nonce":    self._nonce(),
                 "chainId":  56,
             })
 
             signed  = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
 
             if receipt.status != 1:
                 return {"ok": False, "reason": "Транзакция отклонена сетью (status=0)"}
@@ -206,7 +214,9 @@ class Trader:
             balance  = token.functions.balanceOf(self.wallet).call()
             decimals = token.functions.decimals().call()
 
-            log.info(f"Buy OK: {token_address}, received={balance}, tx={tx_hash.hex()}")
+            gas_used_bnb = receipt.gasUsed * gas_price / 1e18
+            log.info(f"Buy OK: {token_address}, received={balance}, "
+                     f"gas={gas_used_bnb:.4f} BNB, tx={tx_hash.hex()}")
             return {
                 "ok":              True,
                 "tx_hash":         tx_hash.hex(),
@@ -222,12 +232,8 @@ class Trader:
     def sell(self, token_address: str, amount_tokens: int) -> dict:
         """
         Sell exact token amount back to BNB via PancakeSwap V2.
-        Handles approve automatically.
+        Uses normal gas (no rush on exit).
         Synchronous — call via asyncio.to_thread from async code.
-
-        Returns:
-            {"ok": True,  "tx_hash": "..."}
-            {"ok": False, "reason": "..."}
         """
         try:
             token_address = Web3.to_checksum_address(token_address)
@@ -237,24 +243,22 @@ class Trader:
 
             token = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
 
-            # Approve router if allowance is insufficient
             allowance = token.functions.allowance(self.wallet, ROUTER_ADDRESS).call()
             if allowance < amount_tokens:
                 approve_tx = token.functions.approve(
                     ROUTER_ADDRESS, 2 ** 256 - 1
                 ).build_transaction({
                     "from":     self.wallet,
-                    "gas":      100_000,
-                    "gasPrice": self._gas_price(),
+                    "gas":      config.GAS_LIMIT_APPROVE,
+                    "gasPrice": self._gas_price_normal(),
                     "nonce":    self._nonce(),
                     "chainId":  56,
                 })
                 signed  = self.account.sign_transaction(approve_tx)
                 tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-                self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+                self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
                 log.info(f"Approved {token_address}")
 
-            # Expected BNB output with sell slippage tolerance (tighter than buy)
             amounts = self.router.functions.getAmountsOut(
                 amount_tokens, [token_address, WBNB_ADDRESS]
             ).call()
@@ -268,15 +272,15 @@ class Trader:
                 self._deadline(),
             ).build_transaction({
                 "from":     self.wallet,
-                "gas":      300_000,
-                "gasPrice": self._gas_price(),
+                "gas":      config.GAS_LIMIT_SELL,
+                "gasPrice": self._gas_price_normal(),
                 "nonce":    self._nonce(),
                 "chainId":  56,
             })
 
             signed  = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
 
             if receipt.status != 1:
                 return {"ok": False, "reason": "Продажа отклонена сетью (status=0)"}

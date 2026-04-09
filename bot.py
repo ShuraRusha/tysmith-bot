@@ -37,17 +37,25 @@ os.makedirs(DATA_DIR, exist_ok=True)   # ensure /data exists (Railway Volume or 
 TRADE_LOG_FILE = os.path.join(DATA_DIR, "tysmith_trades.json")
 
 
-# ── Web3 setup ────────────────────────────────────────────────────────────────
+# ── Web3 setup (try all configured RPCs until one connects) ──────────────────
 
 def _make_w3(url: str) -> Web3:
-    w3 = Web3(Web3.HTTPProvider(url))
+    w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 10}))
     w3.middleware_onion.inject(geth_poa_middleware, layer=0)
     return w3
 
-w3 = _make_w3(config.BSC_HTTP_RPC)
-if not w3.is_connected():
-    log.warning("Primary RPC unavailable — switching to backup")
-    w3 = _make_w3(config.BSC_HTTP_RPC_BACKUP)
+w3 = None
+for rpc_url in config.BSC_HTTP_RPCS:
+    _w3 = _make_w3(rpc_url)
+    if _w3.is_connected():
+        w3 = _w3
+        log.info(f"Connected to RPC: {rpc_url[:50]}...")
+        break
+    log.warning(f"RPC unavailable: {rpc_url[:50]}...")
+
+if w3 is None:
+    log.error("All RPCs failed — using primary as fallback")
+    w3 = _make_w3(config.BSC_HTTP_RPC)
 
 trader = Trader(w3, config.PRIVATE_KEY, config.GAS_MULTIPLIER)
 
@@ -747,9 +755,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         size_mode = f"2% авто (баланс > 5 BNB)"
 
+    rpc_label = "NodeReal" if config.BSC_NODEREAL_KEY else "Public"
+    gas_gwei  = w3.eth.gas_price / 1e9 if connected else 0
+    gas_mode  = f"{config.GAS_BUY_GWEI} gwei (фикс)" if config.GAS_BUY_GWEI > 0 else f"{gas_gwei:.1f} x{config.GAS_MULTIPLIER}"
+    ws_count  = len(config.BSC_WS_RPCS)
+
     await update.message.reply_text(
         f"*Статус Sniper Bot* — {status_icon}\n\n"
-        f"RPC: {'✅ подключён' if connected else '❌ нет соединения'}\n"
+        f"RPC: {'✅' if connected else '❌'} {rpc_label} | WS endpoints: {ws_count}\n"
         f"Кошелёк: `{trader.wallet}`\n"
         f"Баланс: *{balance:.4f} BNB* (~${balance * bnb_price:.0f})\n"
         f"Позиций открыто: {len(pos_manager.positions)}/{calculate_max_positions(balance) if is_auto else config.MAX_POSITIONS}\n"
@@ -760,7 +773,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Мин: {config.BUY_MIN_BNB} BNB  |  Макс: {config.BUY_MAX_BNB} BNB  "
         f"|  Газ-резерв: {config.GAS_RESERVE_BNB} BNB\n\n"
         f"*Настройки:*\n"
+        f"Gas buy: {gas_mode}\n"
         f"Slip buy/sell: {config.SLIPPAGE_BUY}%/{config.SLIPPAGE_SELL}%\n"
+        f"Deadline: {config.TX_DEADLINE_SEC}s\n"
         f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции\n"
         f"Trailing stop: -{config.TRAILING_STOP_PCT}% от пика  |  SL: -{config.STOP_LOSS}%\n"
         f"Min ликвидность: ${config.MIN_LIQUIDITY_USD:,.0f}\n"

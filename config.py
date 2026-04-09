@@ -11,9 +11,30 @@ CHAT_ID   = os.getenv("CHAT_ID", "")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 
 # ── BSC RPC ───────────────────────────────────────────────────────────────────
-BSC_WS_RPC          = os.getenv("BSC_WS_RPC",          "wss://bsc-ws-node.nariox.org")
-BSC_HTTP_RPC        = os.getenv("BSC_HTTP_RPC",        "https://bsc-dataseed.binance.org/")
+# Priority: NodeReal (premium, fast) → public Binance → public backup
+# Set BSC_NODEREAL_KEY in env to enable premium RPC (free tier: nodereal.io)
+BSC_NODEREAL_KEY = os.getenv("BSC_NODEREAL_KEY", "")
+
+if BSC_NODEREAL_KEY:
+    _NR_HTTP = f"https://bsc-mainnet.nodereal.io/v1/{BSC_NODEREAL_KEY}"
+    _NR_WS   = f"wss://bsc-mainnet.nodereal.io/ws/v1/{BSC_NODEREAL_KEY}"
+else:
+    _NR_HTTP = ""
+    _NR_WS   = ""
+
+BSC_WS_RPC          = os.getenv("BSC_WS_RPC",          _NR_WS or "wss://bsc-ws-node.nariox.org")
+BSC_HTTP_RPC        = os.getenv("BSC_HTTP_RPC",        _NR_HTTP or "https://bsc-dataseed.binance.org/")
 BSC_HTTP_RPC_BACKUP = os.getenv("BSC_HTTP_RPC_BACKUP", "https://bsc-dataseed1.defibit.io/")
+# All HTTP endpoints for round-robin fallback (filtered to non-empty)
+BSC_HTTP_RPCS = [u for u in [BSC_HTTP_RPC, BSC_HTTP_RPC_BACKUP,
+                              "https://bsc-dataseed2.binance.org/",
+                              "https://bsc-dataseed3.binance.org/"] if u]
+# All WS endpoints for failover
+BSC_WS_RPCS = [u for u in [BSC_WS_RPC,
+                             "wss://bsc-ws-node.nariox.org"] if u]
+# Deduplicate while preserving order
+BSC_HTTP_RPCS = list(dict.fromkeys(BSC_HTTP_RPCS))
+BSC_WS_RPCS   = list(dict.fromkeys(BSC_WS_RPCS))
 
 # ── Trading params ────────────────────────────────────────────────────────────
 # Dynamic position sizing: buy BUY_PCT_OF_BALANCE % of wallet per trade
@@ -41,10 +62,16 @@ TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "20"))   # % drop from 
 STOP_LOSS         = float(os.getenv("STOP_LOSS",         "20"))
 
 # ── Execution params ──────────────────────────────────────────────────────────
-SLIPPAGE_BUY      = float(os.getenv("SLIPPAGE_BUY",      "5"))    # % slippage tolerance on buy
-SLIPPAGE_SELL     = float(os.getenv("SLIPPAGE_SELL",      "8"))    # % slippage tolerance on sell
-GAS_MULTIPLIER    = float(os.getenv("GAS_MULTIPLIER",     "1.3"))
-TX_DEADLINE_SEC   = int(os.getenv("TX_DEADLINE_SEC",      "60"))   # tx expiry in seconds
+# Sniper-optimized: aggressive buy slippage (new tokens are volatile),
+# tighter sell slippage (selling into established pool)
+SLIPPAGE_BUY      = float(os.getenv("SLIPPAGE_BUY",     "12"))    # % — aggressive for new tokens
+SLIPPAGE_SELL     = float(os.getenv("SLIPPAGE_SELL",      "8"))    # % — tighter on exit
+GAS_MULTIPLIER    = float(os.getenv("GAS_MULTIPLIER",    "1.5"))   # outbid other buyers on gas
+GAS_BUY_GWEI      = float(os.getenv("GAS_BUY_GWEI",      "0"))    # 0=auto | fixed gwei for buys
+GAS_LIMIT_BUY      = int(os.getenv("GAS_LIMIT_BUY",   "500000"))  # gas limit for buy txs
+GAS_LIMIT_SELL     = int(os.getenv("GAS_LIMIT_SELL",   "350000"))  # gas limit for sell txs
+GAS_LIMIT_APPROVE  = int(os.getenv("GAS_LIMIT_APPROVE","80000"))   # gas limit for approve txs
+TX_DEADLINE_SEC   = int(os.getenv("TX_DEADLINE_SEC",     "30"))    # short deadline — reject stale
 
 # ── Bot behaviour ─────────────────────────────────────────────────────────────
 MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS",     "3"))    # manual mode cap
