@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
@@ -19,9 +20,14 @@ class Position:
     take_profit_1_pct: float  # % of position to sell at TP1 (e.g. 25)
     trailing_stop_pct: float  # % drop from peak to trigger full exit (e.g. 10)
     stop_loss:        float   # % loss before TP1 to cut position (e.g. 15)
+    # Analytics metadata
+    liquidity_usd:    float = field(default=0.0)   # liquidity at time of buy
+    buy_tax:          float = field(default=0.0)
+    sell_tax:         float = field(default=0.0)
+    opened_at:        float = field(default_factory=time.time)  # unix timestamp
     # Runtime state
     tp1_done:         bool  = field(default=False)
-    peak_price:       float = field(default=0.0)   # highest price seen — updated in monitor
+    peak_price:       float = field(default=0.0)   # highest price seen
 
 
 class PositionManager:

@@ -145,7 +145,10 @@ def _save_history():
 
 
 def _record_trade(pos: Position, pnl_pct: float, reason: str, sell_price: float = 0.0):
-    pnl_bnb = round(pos.buy_bnb * pnl_pct / 100, 6)
+    pnl_bnb      = round(pos.buy_bnb * pnl_pct / 100, 6)
+    hold_sec     = int(time.time() - pos.opened_at)
+    hold_min     = hold_sec // 60
+    hold_str     = f"{hold_min}м {hold_sec % 60}с" if hold_min < 60 else f"{hold_min // 60}ч {hold_min % 60}м"
     trade_history.append({
         "symbol":         pos.symbol,
         "token_address":  pos.token_address,
@@ -155,6 +158,11 @@ def _record_trade(pos: Position, pnl_pct: float, reason: str, sell_price: float 
         "pnl_pct":        round(pnl_pct, 2),
         "pnl_bnb":        pnl_bnb,
         "reason":         reason,
+        "hold_sec":       hold_sec,
+        "hold_str":       hold_str,
+        "liquidity_usd":  pos.liquidity_usd,
+        "buy_tax":        pos.buy_tax,
+        "sell_tax":       pos.sell_tax,
         "closed_at":      datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M"),
     })
     _save_history()
@@ -281,6 +289,9 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
                 take_profit_1_pct = config.TAKE_PROFIT_1_PCT,
                 trailing_stop_pct = config.TRAILING_STOP_PCT,
                 stop_loss         = config.STOP_LOSS,
+                liquidity_usd     = info["liquidity_usd"],
+                buy_tax           = info["buy_tax"],
+                sell_tax          = info["sell_tax"],
             )
             pos_manager.add(pos)
             amount_fmt = result["tokens_received"] / 10 ** result["decimals"]
@@ -399,6 +410,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 take_profit_1_pct  = config.TAKE_PROFIT_1_PCT,
                 trailing_stop_pct  = config.TRAILING_STOP_PCT,
                 stop_loss          = config.STOP_LOSS,
+                liquidity_usd      = token_info["info"]["liquidity_usd"],
+                buy_tax            = token_info["info"]["buy_tax"],
+                sell_tax           = token_info["info"]["sell_tax"],
             )
             pos_manager.add(pos)
 
@@ -488,8 +502,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status — баланс кошелька и текущие настройки\n"
         "/positions — открытые позиции с P&L\n\n"
         "*Статистика*\n"
-        "/stats — общая статистика (win rate, PnL)\n"
-        "/history — последние 10 закрытых сделок\n\n"
+        "/stats — полная статистика (win rate, PnL, breakdown)\n"
+        "/stats today — только сегодня\n"
+        "/stats week — за последние 7 дней\n"
+        "/history — последние 10 сделок с временем удержания\n\n"
         "*Управление*\n"
         "/auto on|off — авто-режим (покупает сам без подтверждения)\n"
         "/pause — приостановить снайпинг\n"
@@ -586,37 +602,98 @@ async def cmd_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+def _build_stats_report(trades: list[dict], bnb_price: float, title: str = "Статистика сделок") -> str:
+    total  = len(trades)
+    wins   = [t for t in trades if t["pnl_pct"] > 0]
+    losses = [t for t in trades if t["pnl_pct"] <= 0]
+
+    total_pnl_bnb = sum(t["pnl_bnb"] for t in trades)
+    avg_pnl_pct   = sum(t["pnl_pct"] for t in trades) / total
+    win_rate      = len(wins) / total * 100
+
+    best  = max(trades, key=lambda t: t["pnl_pct"])
+    worst = min(trades, key=lambda t: t["pnl_pct"])
+
+    # Exit reason breakdown
+    reasons: dict[str, list] = {}
+    for t in trades:
+        r = t.get("reason", "?")
+        reasons.setdefault(r, []).append(t["pnl_pct"])
+    reason_lines = []
+    for r, pcts in sorted(reasons.items()):
+        wr = len([p for p in pcts if p > 0]) / len(pcts) * 100
+        avg = sum(pcts) / len(pcts)
+        reason_lines.append(f"  {r}: {len(pcts)} сд. | WR {wr:.0f}% | avg {avg:+.1f}%")
+
+    # Hold time (winners vs losers)
+    win_holds  = [t.get("hold_sec", 0) for t in wins]
+    loss_holds = [t.get("hold_sec", 0) for t in losses]
+    avg_win_hold  = int(sum(win_holds)  / len(win_holds))  if win_holds  else 0
+    avg_loss_hold = int(sum(loss_holds) / len(loss_holds)) if loss_holds else 0
+
+    def fmt_sec(s: int) -> str:
+        return f"{s // 60}м {s % 60}с" if s < 3600 else f"{s // 3600}ч {(s % 3600) // 60}м"
+
+    # Liquidity breakdown (if data available)
+    liq_trades = [t for t in trades if t.get("liquidity_usd", 0) > 0]
+    liq_lines = []
+    if liq_trades:
+        for lo, hi, label in [(0, 25000, "<$25k"), (25000, 100000, "$25k-100k"), (100000, 1e9, ">$100k")]:
+            bucket = [t for t in liq_trades if lo <= t["liquidity_usd"] < hi]
+            if bucket:
+                bwr = len([t for t in bucket if t["pnl_pct"] > 0]) / len(bucket) * 100
+                bavg = sum(t["pnl_pct"] for t in bucket) / len(bucket)
+                liq_lines.append(f"  {label}: {len(bucket)} сд. | WR {bwr:.0f}% | avg {bavg:+.1f}%")
+
+    lines = [
+        f"📊 *{title}*\n",
+        f"Всего: *{total}* | Прибыльных: *{len(wins)}* | Убыточных: *{len(losses)}*",
+        f"Win rate: *{win_rate:.1f}%*",
+        f"Общий P&L: *{total_pnl_bnb:+.4f} BNB* (~${total_pnl_bnb * bnb_price:+.0f})",
+        f"Средний P&L: *{avg_pnl_pct:+.1f}%* за сделку\n",
+        f"Лучшая: *{best['symbol']}* {best['pnl_pct']:+.1f}%",
+        f"Худшая: *{worst['symbol']}* {worst['pnl_pct']:+.1f}%\n",
+        f"*Причины закрытия:*",
+    ] + reason_lines + [
+        f"\n*Среднее время удержания:*",
+        f"  Победители: {fmt_sec(avg_win_hold)}",
+        f"  Неудачники:  {fmt_sec(avg_loss_hold)}",
+    ]
+    if liq_lines:
+        lines += [f"\n*По ликвидности:*"] + liq_lines
+
+    return "\n".join(lines)
+
+
 @owner_only
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not trade_history:
         await update.message.reply_text("📊 Нет закрытых сделок.")
         return
 
-    total   = len(trade_history)
-    wins    = [t for t in trade_history if t["pnl_pct"] > 0]
-    losses  = [t for t in trade_history if t["pnl_pct"] <= 0]
-    win_rate = len(wins) / total * 100
-
-    total_pnl_bnb = sum(t["pnl_bnb"] for t in trade_history)
-    avg_pnl_pct   = sum(t["pnl_pct"] for t in trade_history) / total
-
     bnb_price = await get_bnb_price(w3)
-    total_pnl_usd = total_pnl_bnb * bnb_price
+    args = context.args
+    subcmd = args[0].lower() if args else ""
 
-    best  = max(trade_history, key=lambda t: t["pnl_pct"])
-    worst = min(trade_history, key=lambda t: t["pnl_pct"])
+    if subcmd == "today":
+        today = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
+        trades = [t for t in trade_history if t.get("closed_at", "").startswith(today)]
+        if not trades:
+            await update.message.reply_text("📊 Сегодня закрытых сделок нет.")
+            return
+        report = _build_stats_report(trades, bnb_price, "Статистика за сегодня")
+    elif subcmd == "week":
+        from datetime import timedelta
+        week_ago = (datetime.now(MOSCOW_TZ) - timedelta(days=7)).strftime("%Y-%m-%d")
+        trades = [t for t in trade_history if t.get("closed_at", "") >= week_ago]
+        if not trades:
+            await update.message.reply_text("📊 За последнюю неделю нет сделок.")
+            return
+        report = _build_stats_report(trades, bnb_price, "Статистика за неделю")
+    else:
+        report = _build_stats_report(trade_history, bnb_price)
 
-    await update.message.reply_text(
-        f"📊 *Статистика сделок*\n\n"
-        f"Всего сделок: *{total}*\n"
-        f"Прибыльных: *{len(wins)}*  |  Убыточных: *{len(losses)}*\n"
-        f"Win rate: *{win_rate:.1f}%*\n\n"
-        f"Общий P&L: *{total_pnl_bnb:+.4f} BNB* (~${total_pnl_usd:+.0f})\n"
-        f"Средний P&L: *{avg_pnl_pct:+.1f}%* за сделку\n\n"
-        f"Лучшая: *{best['symbol']}* {best['pnl_pct']:+.1f}%\n"
-        f"Худшая: *{worst['symbol']}* {worst['pnl_pct']:+.1f}%",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await update.message.reply_text(report, parse_mode=ParseMode.MARKDOWN)
 
 
 @owner_only
@@ -629,10 +706,12 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["📜 *Последние сделки*\n"]
     for t in last10:
         emoji = "✅" if t["pnl_pct"] > 0 else "🔴"
+        hold  = t.get("hold_str", "?")
+        liq   = f" | 💧${t['liquidity_usd']:,.0f}" if t.get("liquidity_usd") else ""
         lines.append(
             f"{emoji} *{t['symbol']}* {t['pnl_pct']:+.1f}% "
             f"({t['pnl_bnb']:+.4f} BNB) — {t['reason']}\n"
-            f"    `{t['closed_at']}`"
+            f"    ⏱ {hold}{liq} | `{t['closed_at']}`"
         )
     await update.message.reply_text(
         "\n".join(lines),
@@ -798,6 +877,46 @@ async def _cleanup_pending():
             log.info(f"Cleaned up {len(expired)} expired pending token(s)")
 
 
+# ── Background: daily report at 23:00 MSK ────────────────────────────────────
+
+async def _daily_report():
+    """Send trading summary every day at 23:00 Moscow time."""
+    while True:
+        now_msk   = datetime.now(MOSCOW_TZ)
+        target    = now_msk.replace(hour=23, minute=0, second=0, microsecond=0)
+        if now_msk >= target:
+            target = target.replace(day=target.day + 1)
+        wait_sec  = (target - now_msk).total_seconds()
+        log.info(f"Daily report scheduled in {wait_sec/3600:.1f}h")
+        await asyncio.sleep(wait_sec)
+
+        today  = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
+        trades = [t for t in trade_history if t.get("closed_at", "").startswith(today)]
+
+        try:
+            bnb_price = await get_bnb_price(w3)
+            balance   = w3.eth.get_balance(trader.wallet) / 1e18
+
+            if trades:
+                report = _build_stats_report(trades, bnb_price,
+                                             f"Итоги дня {today}")
+                pnl_bnb = sum(t["pnl_bnb"] for t in trades)
+                await tg_send(
+                    f"{report}\n\n"
+                    f"💼 Баланс кошелька: *{balance:.4f} BNB* (~${balance * bnb_price:.0f})\n"
+                    f"Открытых позиций: *{len(pos_manager.positions)}*"
+                )
+            else:
+                await tg_send(
+                    f"📊 *Итоги дня {today}*\n\n"
+                    f"Сегодня сделок не было.\n"
+                    f"💼 Баланс: *{balance:.4f} BNB* (~${balance * bnb_price:.0f})\n"
+                    f"Открытых позиций: *{len(pos_manager.positions)}*"
+                )
+        except Exception as e:
+            log.error(f"Daily report error: {e}")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 PID_FILE = "/tmp/tysmith-bot.pid"  # tmp is fine for pid — resets on restart
@@ -851,6 +970,7 @@ async def main():
     asyncio.create_task(pos_manager.monitor())
     asyncio.create_task(watch_pairs(config.BSC_WS_RPC, on_pair_found))
     asyncio.create_task(_cleanup_pending())
+    asyncio.create_task(_daily_report())
 
     log.info(f"Ready. Wallet: {trader.wallet}")
     await tg_send(
