@@ -519,7 +519,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/set trail 15` — trailing stop в %\n"
         "`/set liq 5000` — мин. ликвидность в USD\n"
         "`/set tax 8` — макс. налог на покупку и продажу\n"
-        "`/set max 5` — макс. кол-во позиций",
+        "`/set max 5` — макс. кол-во позиций\n"
+        "`/set gwei 3` — gas для покупки в gwei (0 = авто)",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -747,6 +748,7 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "liq":    ("MIN_LIQUIDITY_USD",  500.0, 1e7,  "Мин. ликвидность USD"),
         "tax":    ("MAX_BUY_TAX",        1.0,  50.0,  "Макс. налог %"),
         "max":    ("MAX_POSITIONS",      1,    20,    "Макс. позиций"),
+        "gwei":   ("GAS_BUY_GWEI",       0.0,  100.0, "Фикс. gas для покупки (0 = авто)"),
     }
 
     if param not in PARAMS:
