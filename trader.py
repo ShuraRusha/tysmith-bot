@@ -183,7 +183,7 @@ class Trader:
                 "chainId":  56,
             })
             signed  = self.account.sign_transaction(approve_tx)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
             self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
             log.info(f"Approved {token_address}")
             return {"ok": True}
@@ -229,7 +229,7 @@ class Trader:
             })
 
             signed  = self.account.sign_transaction(tx)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
 
             if receipt.status != 1:
@@ -281,7 +281,7 @@ class Trader:
                     "chainId":  56,
                 })
                 signed  = self.account.sign_transaction(approve_tx)
-                tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+                tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
                 self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
                 log.info(f"Approved {token_address}")
 
@@ -305,7 +305,7 @@ class Trader:
             })
 
             signed  = self.account.sign_transaction(tx)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
 
             if receipt.status != 1:
