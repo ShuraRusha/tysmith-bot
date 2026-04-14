@@ -138,20 +138,28 @@ trade_history: list[dict] = []
 
 # ── Settings persistence ──────────────────────────────────────────────────────
 
+# Increment when adding new persistent params or changing hardcoded defaults.
+# Used to migrate old settings files that pre-date a change.
+SETTINGS_VERSION = 2
+
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
     "STOP_LOSS", "TAKE_PROFIT_1", "TRAILING_STOP_PCT",
     "MIN_LIQUIDITY_USD", "MAX_BUY_TAX", "MAX_SELL_TAX",
     "MAX_POSITIONS", "GAS_BUY_GWEI",
+    # Added in v2 (new buying filters):
+    "MIN_MARKET_CAP_USD", "MIN_FDV_USD", "MAX_FDV_USD",
+    "MIN_VOLUME_5M_USD", "MAX_TOKEN_AGE_DAYS", "MAX_TOP10_HOLDER_PCT",
+    "MOON_BAG_MIN_USD", "MOON_BAG_PCT",
 ]
 
 
 def _save_settings():
     try:
         data = {k: getattr(config, k) for k in _PERSISTENT_SETTINGS}
-        # Also persist bot mode state so it survives restarts/redeploys
         data["__is_auto"]   = is_auto
         data["__is_paused"] = is_paused
+        data["__version"]   = SETTINGS_VERSION
         with open(SETTINGS_FILE, "w") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
@@ -165,18 +173,31 @@ def _load_settings():
             return
         with open(SETTINGS_FILE) as f:
             data = json.load(f)
+
+        saved_version = int(data.get("__version", 1))
+
         for key, val in data.items():
             if key.startswith("__"):
-                continue  # handled separately below
+                continue
             if key in _PERSISTENT_SETTINGS and hasattr(config, key):
                 setattr(config, key, val)
+
+        # ── Migrations ────────────────────────────────────────────────────────
+        # v1→v2: MIN_LIQUIDITY_USD default raised 10k→50k.
+        # If the file still has the old default (≤10k), apply the new one.
+        # User can always lower it back via /set liq <value>.
+        if saved_version < 2 and config.MIN_LIQUIDITY_USD <= 10_000:
+            config.MIN_LIQUIDITY_USD = 50_000.0
+            log.info("Settings migration v1→v2: MIN_LIQUIDITY_USD set to 50000")
+
         # Restore bot mode
         if "__is_auto" in data:
             is_auto = bool(data["__is_auto"])
         if "__is_paused" in data:
             is_paused = bool(data["__is_paused"])
+
         log.info(
-            f"Loaded persisted settings ({len(data)} params) | "
+            f"Loaded persisted settings (file v{saved_version}, current v{SETTINGS_VERSION}) | "
             f"auto={'on' if is_auto else 'off'} | "
             f"paused={'yes' if is_paused else 'no'}"
         )
@@ -673,8 +694,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/set sl 20` — стоп-лосс в %\n"
         "`/set tp1 60` — TP1 в %\n"
         "`/set trail 15` — trailing stop в %\n"
-        "`/set liq 5000` — мин. ликвидность в USD\n"
-        "`/set tax 8` — макс. налог на покупку и продажу\n"
+        "`/set liq 50000` — мин. ликвидность USD\n"
+        "`/set mcap 30000` — мин. market cap USD\n"
+        "`/set fdvmin 200000` — мин. FDV USD\n"
+        "`/set fdvmax 10000000` — макс. FDV USD\n"
+        "`/set vol5m 1000` — мин. объём за 5 мин USD\n"
+        "`/set age 30` — макс. возраст токена (дней)\n"
+        "`/set top10 30` — макс. топ-10 холдеры % (excl. DEX)\n"
+        "`/set tax 5` — макс. налог buy+sell в %\n"
         "`/set max 5` — макс. кол-во позиций\n"
         "`/set gwei 3` — gas для покупки в gwei (0 = авто)",
         parse_mode=ParseMode.MARKDOWN,
@@ -922,16 +949,26 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     PARAMS = {
-        "pct":    ("BUY_PCT_OF_BALANCE", 0.0,  20.0,  "% баланса на сделку (0 = авто-тир)"),
-        "minbuy": ("BUY_MIN_BNB",        0.01, 1.0,   "Мин. сумма сделки BNB"),
-        "maxbuy": ("BUY_MAX_BNB",        0.05, 10.0,  "Макс. сумма сделки BNB"),
-        "sl":     ("STOP_LOSS",          1.0,  90.0,  "Стоп-лосс %"),
-        "tp1":    ("TAKE_PROFIT_1",      5.0,  500.0, "TP1 %"),
-        "trail":  ("TRAILING_STOP_PCT",  1.0,  90.0,  "Trailing stop %"),
-        "liq":    ("MIN_LIQUIDITY_USD",  500.0, 1e7,  "Мин. ликвидность USD"),
-        "tax":    ("MAX_BUY_TAX",        1.0,  50.0,  "Макс. налог %"),
-        "max":    ("MAX_POSITIONS",      1,    20,    "Макс. позиций"),
-        "gwei":   ("GAS_BUY_GWEI",       0.0,  100.0, "Фикс. gas для покупки (0 = авто)"),
+        # Trade sizing
+        "pct":    ("BUY_PCT_OF_BALANCE",  0.0,   20.0,  "% баланса на сделку (0 = авто-тир)"),
+        "minbuy": ("BUY_MIN_BNB",         0.01,  1.0,   "Мин. сумма сделки BNB"),
+        "maxbuy": ("BUY_MAX_BNB",         0.05,  10.0,  "Макс. сумма сделки BNB"),
+        # Exit strategy
+        "sl":     ("STOP_LOSS",           1.0,   90.0,  "Стоп-лосс %"),
+        "tp1":    ("TAKE_PROFIT_1",       5.0,   500.0, "TP1 %"),
+        "trail":  ("TRAILING_STOP_PCT",   1.0,   90.0,  "Trailing stop %"),
+        # Token quality filters
+        "liq":    ("MIN_LIQUIDITY_USD",   500.0, 1e7,   "Мин. ликвидность USD"),
+        "mcap":   ("MIN_MARKET_CAP_USD",  1000.0,1e7,   "Мин. market cap USD"),
+        "fdvmin": ("MIN_FDV_USD",         1000.0,1e7,   "Мин. FDV USD"),
+        "fdvmax": ("MAX_FDV_USD",         1000.0,1e9,   "Макс. FDV USD"),
+        "vol5m":  ("MIN_VOLUME_5M_USD",   0.0,   1e6,   "Мин. объём за 5 мин USD"),
+        "age":    ("MAX_TOKEN_AGE_DAYS",  1,     365,   "Макс. возраст токена (дней)"),
+        "top10":  ("MAX_TOP10_HOLDER_PCT",1.0,   99.0,  "Макс. топ-10 холдеры % (excl. DEX)"),
+        # Taxes and limits
+        "tax":    ("MAX_BUY_TAX",         1.0,   50.0,  "Макс. налог %"),
+        "max":    ("MAX_POSITIONS",       1,     20,    "Макс. позиций"),
+        "gwei":   ("GAS_BUY_GWEI",        0.0,   100.0, "Фикс. gas для покупки (0 = авто)"),
     }
 
     if param not in PARAMS:
@@ -1036,6 +1073,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gas_mode  = f"{config.GAS_BUY_GWEI} gwei (фикс)" if config.GAS_BUY_GWEI > 0 else f"{gas_gwei:.1f} x{config.GAS_MULTIPLIER}"
     ws_count  = len(config.BSC_WS_RPCS)
 
+    moon_str = (
+        f"Moon bag: {config.MOON_BAG_PCT:.0f}% при сделке ≥${config.MOON_BAG_MIN_USD:.0f}"
+    )
+
     await update.message.reply_text(
         f"*Статус Sniper Bot* — {status_icon}\n\n"
         f"RPC: {'✅' if connected else '❌'} {rpc_label} | WS endpoints: {ws_count}\n"
@@ -1048,14 +1089,22 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Следующая сделка: *{buy_amount} BNB* (~${buy_amount * bnb_price:.0f})\n"
         f"Мин: {config.BUY_MIN_BNB} BNB  |  Макс: {config.BUY_MAX_BNB} BNB  "
         f"|  Газ-резерв: {config.GAS_RESERVE_BNB} BNB\n\n"
-        f"*Настройки:*\n"
-        f"Gas buy: {gas_mode}\n"
-        f"Slip buy/sell: {config.SLIPPAGE_BUY}%/{config.SLIPPAGE_SELL}%\n"
-        f"Deadline: {config.TX_DEADLINE_SEC}s\n"
+        f"*Выход:*\n"
         f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции\n"
         f"Trailing stop: -{config.TRAILING_STOP_PCT}% от пика  |  SL: -{config.STOP_LOSS}%\n"
-        f"Min ликвидность: ${config.MIN_LIQUIDITY_USD:,.0f}\n"
-        f"Max tax: {config.MAX_BUY_TAX}% buy / {config.MAX_SELL_TAX}% sell",
+        f"{moon_str}\n\n"
+        f"*Фильтры покупки:*\n"
+        f"Ликвидность: ${config.MIN_LIQUIDITY_USD:,.0f} мин\n"
+        f"Market cap: ${config.MIN_MARKET_CAP_USD:,.0f} мин\n"
+        f"FDV: ${config.MIN_FDV_USD/1000:.0f}k – ${config.MAX_FDV_USD/1000000:.0f}М\n"
+        f"Объём 5м: ${config.MIN_VOLUME_5M_USD:,.0f} мин\n"
+        f"Возраст: {config.MAX_TOKEN_AGE_DAYS} дней макс\n"
+        f"Топ-10 холдеры: {config.MAX_TOP10_HOLDER_PCT:.0f}% макс\n"
+        f"Max tax: {config.MAX_BUY_TAX}% buy / {config.MAX_SELL_TAX}% sell\n\n"
+        f"*Исполнение:*\n"
+        f"Gas buy: {gas_mode}\n"
+        f"Slip buy/sell: {config.SLIPPAGE_BUY}%/{config.SLIPPAGE_SELL}%\n"
+        f"Deadline: {config.TX_DEADLINE_SEC}s",
         parse_mode=ParseMode.MARKDOWN,
     )
 
