@@ -1180,19 +1180,14 @@ async def main():
     # Restore open positions from disk (survive restarts/redeploys)
     restored = pos_manager.load()
 
-    # Clean up broken positions on startup:
-    #   • zombie: buy_price_bnb == 0 or tokens_amount == 0 — unmonitorable
-    #   • stuck:  sell was impossible (honeypot) — already gave up, free the slot
+    # Clean up only true "zombie" positions on startup:
+    # buy_price_bnb == 0 or tokens_amount == 0 → unmonitorable, can never trigger SL/TP.
+    # Stuck (honeypot) positions are kept — they show in /positions with the write-off
+    # button so the user can see what happened and act manually.
     zombie_names = []
-    stuck_names  = []
     for addr in list(pos_manager.positions):
         pos = pos_manager.positions[addr]
-        if pos.stuck:
-            log.warning(f"Startup: removing stuck position {pos.symbol}")
-            _record_trade(pos, pnl_pct=-100.0, reason="Honeypot", sell_price=0.0)
-            pos_manager.remove(addr)
-            stuck_names.append(pos.symbol)
-        elif pos.buy_price_bnb <= 0 or pos.tokens_amount <= 0:
+        if pos.buy_price_bnb <= 0 or pos.tokens_amount <= 0:
             log.warning(
                 f"Startup: removing zombie position {pos.symbol} "
                 f"(price={pos.buy_price_bnb}, amount={pos.tokens_amount})"
@@ -1201,23 +1196,26 @@ async def main():
             pos_manager.remove(addr)
             zombie_names.append(pos.symbol)
 
+    # Use post-cleanup count so the message matches what /positions actually shows
+    active_count = len(pos_manager.positions)
+    stuck_count  = sum(1 for p in pos_manager.get_all() if p.stuck)
+
     log.info(f"Ready. Wallet: {trader.wallet}")
     startup_msg = (
         "🚀 *Sniper Bot запущен*\n"
         "Слежу за новыми парами на PancakeSwap V2 (BSC)...\n\n"
         "/help — все команды"
     )
-    if restored:
-        startup_msg += f"\n\n♻️ Восстановлено позиций: *{restored}* — мониторинг возобновлён"
-    if stuck_names:
-        startup_msg += (
-            f"\n\n🚫 Удалены honeypot-позиции: *{', '.join(stuck_names)}*\n"
-            f"Записаны в историю как убыток"
-        )
+    if active_count:
+        startup_msg += f"\n\n♻️ Восстановлено позиций: *{active_count}* — мониторинг возобновлён"
+        if stuck_count:
+            startup_msg += (
+                f"\n⚠️ Из них заблокированы (honeypot): *{stuck_count}* — "
+                f"используй /positions → 🗑 Убрать в историю"
+            )
     if zombie_names:
         startup_msg += (
-            f"\n\n🗑 Удалены зомби-позиции (нет цены входа): *{', '.join(zombie_names)}*\n"
-            f"Записаны в историю как `Invalid`"
+            f"\n\n🗑 Удалены невалидные позиции (нет цены входа): *{', '.join(zombie_names)}*"
         )
     await tg_send(startup_msg)
 
