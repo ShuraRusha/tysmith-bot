@@ -413,7 +413,7 @@ async def check_token(
         lp_holders = goplus_data.get("lp_holders") or []
         if lp_holders:
             for lph in lp_holders[:10]:
-                lp_pct   = float(lph.get("percent", 0)) * 100
+                lp_pct    = float(lph.get("percent", 0)) * 100
                 is_locked = lph.get("is_locked", 0) == 1
                 tag       = (lph.get("tag") or "").lower()
                 is_safe   = is_locked or any(s in tag for s in SAFE_HOLDER_TAGS)
@@ -423,7 +423,9 @@ async def check_token(
                         "reason": f"Rug риск: {lp_pct:.0f}% LP не заблокирован — девы могут слить ликвидность",
                     }
         else:
-            # LP data empty → GoPlus hasn't indexed it yet; warn but don't block
+            # LP data empty → GoPlus hasn't indexed it yet
+            if require_goplus:
+                return {"ok": False, "reason": "LP-холдеры не проиндексированы — rug-риск неизвестен, пропуск"}
             warnings_from_goplus.append("⚠️ LP-холдеры не проиндексированы — rug-риск неизвестен")
 
         # Non-critical warnings
