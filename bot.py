@@ -16,12 +16,14 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 from web3 import Web3
 from web3.middleware import geth_poa_middleware
 
 import config
-from analyzer import check_token, get_bnb_price
+from analyzer import analyze_token, check_token, get_bnb_price
 from position import Position, PositionManager
 from trader import Trader
 from watcher import watch_pairs
@@ -639,7 +641,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*/status* — баланс и настройки\n"
         "*/positions* — открытые позиции\n"
         "*/stats* — статистика сделок\n"
-        "*/history* — последние 10 сделок",
+        "*/history* — последние 10 сделок\n\n"
+        "💡 Пришли адрес контракта (0x...) — получи полный анализ токена",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -651,6 +654,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Мониторинг*\n"
         "/status — баланс кошелька и текущие настройки\n"
         "/positions — открытые позиции с P&L\n\n"
+        "*Анализ токенов*\n"
+        "/analyze 0x... — полный анализ токена по адресу\n"
+        "_(или просто пришли адрес контракта — бот проанализирует автоматически)_\n\n"
         "*Статистика*\n"
         "/stats — полная статистика (win rate, PnL, breakdown)\n"
         "/stats today — только сегодня\n"
@@ -1054,6 +1060,203 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@owner_only
+async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Analyze a token by address. Usage: /analyze 0x... or just paste the address."""
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "❌ Укажи адрес токена:\n`/analyze 0x...`\n\n"
+            "Или просто пришли адрес контракта (42 символа, начинается с 0x).",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    await _do_analyze(update, args[0].strip())
+
+
+@owner_only
+async def handle_address_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle plain token address messages (0x... 42 chars) as analyze requests."""
+    text = (update.message.text or "").strip()
+    if Web3.is_address(text):
+        await _do_analyze(update, text)
+
+
+async def _do_analyze(update, raw_address: str):
+    """Core analyze logic shared between command and message handler."""
+    if not Web3.is_address(raw_address):
+        await update.message.reply_text("❌ Некорректный адрес токена.")
+        return
+
+    token_address = Web3.to_checksum_address(raw_address)
+    wait_msg = await update.message.reply_text(
+        "🔍 *Анализирую токен...*\n_(GoPlus + Honeypot.is + DexScreener + on-chain)_",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    try:
+        data = await analyze_token(token_address, w3, trader.wallet)
+    except Exception as e:
+        log.error(f"analyze_token error: {e}")
+        await wait_msg.edit_text(f"❌ Ошибка анализа: {e}")
+        return
+
+    if not data["found"]:
+        await wait_msg.edit_text(f"❌ {data['reason']}")
+        return
+
+    # ── Format report ──────────────────────────────────────────────────────────
+    sym  = data["symbol"]
+    name = data["name"]
+
+    # Liquidity line
+    liq_str = f"${data['liquidity_usd']:,.0f}" if data["liquidity_usd"] else "неизвестно"
+    liq_ok  = data["liquidity_usd"] >= config.MIN_LIQUIDITY_USD if data["liquidity_usd"] else None
+    liq_icon = ("✅" if liq_ok else "❌") if liq_ok is not None else "❓"
+
+    # FDV line
+    fdv_str  = f"${data['fdv_usd']:,.0f}" if data["fdv_usd"] else "неизвестно"
+    fdv_ok   = config.MIN_FDV_USD <= data["fdv_usd"] <= config.MAX_FDV_USD if data["fdv_usd"] else None
+    fdv_icon = ("✅" if fdv_ok else "❌") if fdv_ok is not None else "❓"
+
+    # Age line
+    if data["age_days"] is not None:
+        age_str  = f"{data['age_days']:.0f} дней" if data["age_days"] >= 1 else f"{data['age_days'] * 24:.0f} часов"
+        age_ok   = data["age_days"] <= config.MAX_TOKEN_AGE_DAYS
+        age_icon = "✅" if age_ok else "❌"
+    else:
+        age_str  = "не проиндексирован"
+        age_icon = "❓"
+
+    # Volume line
+    if data["vol_5m"] is not None:
+        vol_str  = f"${data['vol_5m']:,.0f}"
+        vol_ok   = data["vol_5m"] >= config.MIN_VOLUME_5M_USD
+        vol_icon = "✅" if vol_ok else "❌"
+    else:
+        vol_str  = "нет данных"
+        vol_icon = "❓"
+
+    # Tax lines
+    tax_buy_ok  = data["buy_tax"]  <= config.MAX_BUY_TAX
+    tax_sell_ok = data["sell_tax"] <= config.MAX_SELL_TAX
+    tax_buy_icon  = "✅" if tax_buy_ok  else "❌"
+    tax_sell_icon = "✅" if tax_sell_ok else "❌"
+
+    # Top-10 holders
+    top10 = data["top10_pct"]
+    top10_ok   = top10 <= config.MAX_TOP10_HOLDER_PCT
+    top10_icon = "✅" if top10_ok else "❌"
+
+    # LP lock
+    lp_locked = data["lp_locked"]
+    if lp_locked is True:
+        lp_str = "✅ Заблокирован"
+    elif lp_locked is False:
+        lp_str = "❌ Не заблокирован (rug risk!)"
+    else:
+        lp_str = "❓ Данных нет"
+
+    # Simulation checks
+    buy_sim_icon  = "✅" if data["sim_buy_ok"]  else "❌"
+    sell_sim_icon = "✅" if data["sim_sell_ok"] else "❌"
+    hp_icon       = "✅" if data["hp_is_ok"]    else "❌"
+    gp_icon       = "✅" if data["goplus_ok"]   else "⚠️"
+
+    # Critical flags block
+    if data["critical_flags"]:
+        flags_block = "\n".join(f"🚨 {v}" for v in data["critical_flags"].values())
+    else:
+        flags_block = "✅ Критических флагов нет"
+
+    # Warnings block
+    if data["warnings"]:
+        warn_block = "\n".join(f"⚠️ {w}" for w in data["warnings"])
+    else:
+        warn_block = "✅ Предупреждений нет"
+
+    # ── Recommendation ─────────────────────────────────────────────────────────
+    red_flags = []
+    if data["critical_flags"]:
+        red_flags.append(f"критические GoPlus-флаги: {', '.join(data['critical_flags'].values())}")
+    if not data["sim_buy_ok"]:
+        red_flags.append(f"покупка отклонена симуляцией: {data['sim_buy_reason']}")
+    if not data["sim_sell_ok"]:
+        red_flags.append(f"продажа отклонена симуляцией: {data['sim_sell_reason']}")
+    if not data["hp_is_ok"]:
+        red_flags.append(f"honeypot.is: {data['hp_is_reason']}")
+    if liq_ok is False:
+        red_flags.append(f"ликвидность ${data['liquidity_usd']:,.0f} < минимума")
+    if fdv_ok is False:
+        red_flags.append(f"FDV вне диапазона")
+    if age_icon == "❌":
+        red_flags.append(f"токен слишком старый ({age_str})")
+    if vol_icon == "❌":
+        red_flags.append(f"объём за 5м слишком низкий ({vol_str})")
+    if not tax_buy_ok:
+        red_flags.append(f"buy tax {data['buy_tax']:.1f}% > {config.MAX_BUY_TAX}%")
+    if not tax_sell_ok:
+        red_flags.append(f"sell tax {data['sell_tax']:.1f}% > {config.MAX_SELL_TAX}%")
+    if not top10_ok:
+        red_flags.append(f"топ-10 холдеры {top10:.1f}% > {config.MAX_TOP10_HOLDER_PCT}%")
+    if lp_locked is False:
+        red_flags.append("ликвидность не заблокирована")
+
+    caution_flags = list(data["warnings"])
+    if lp_locked is None:
+        caution_flags.append("LP-холдеры не проиндексированы")
+    if not data["goplus_ok"]:
+        caution_flags.append("GoPlus недоступен")
+
+    if red_flags:
+        rec_icon = "🔴"
+        rec_text = "НЕ ПОКУПАТЬ"
+        rec_detail = "Причины: " + "; ".join(red_flags[:3])
+    elif caution_flags:
+        rec_icon = "🟡"
+        rec_text = "ОСТОРОЖНО"
+        rec_detail = "Риски: " + "; ".join(caution_flags[:3])
+    else:
+        rec_icon = "🟢"
+        rec_text = "ПРОШЁЛ ВСЕ ФИЛЬТРЫ"
+        rec_detail = "Токен соответствует всем условиям покупки"
+
+    base_sym = "BNB" if data["base_token"].lower() == config.WBNB.lower() else (
+        "BUSD" if data["base_token"].lower() == config.BUSD.lower() else "USDT"
+    )
+
+    text = (
+        f"🔍 *Анализ токена*\n\n"
+        f"🪙 *{name}* (`{sym}`)\n"
+        f"📄 `{token_address}`\n"
+        f"🔗 Пара: {base_sym}/PancakeSwap V2\n\n"
+        f"*📊 Метрики:*\n"
+        f"{liq_icon} Ликвидность: *{liq_str}* (мин ${config.MIN_LIQUIDITY_USD:,.0f})\n"
+        f"{fdv_icon} FDV: *{fdv_str}* (${config.MIN_FDV_USD/1000:.0f}k–${config.MAX_FDV_USD/1000000:.0f}М)\n"
+        f"{age_icon} Возраст пары: *{age_str}* (макс {config.MAX_TOKEN_AGE_DAYS} дн.)\n"
+        f"{vol_icon} Объём 5м: *{vol_str}* (мин ${config.MIN_VOLUME_5M_USD:,.0f})\n"
+        f"👥 Холдеры: *{data['holder_count']}*\n\n"
+        f"*💸 Налоги:*\n"
+        f"{tax_buy_icon} Buy tax: *{data['buy_tax']:.1f}%* (макс {config.MAX_BUY_TAX}%)\n"
+        f"{tax_sell_icon} Sell tax: *{data['sell_tax']:.1f}%* (макс {config.MAX_SELL_TAX}%)\n\n"
+        f"*🧑‍🤝‍🧑 Концентрация:*\n"
+        f"{top10_icon} Топ-10 холдеры: *{top10:.1f}%* (макс {config.MAX_TOP10_HOLDER_PCT}%)\n"
+        f"🔒 LP: {lp_str}\n\n"
+        f"*🛡 Безопасность:*\n"
+        f"{buy_sim_icon} Buy-симуляция: {'OK' if data['sim_buy_ok'] else data['sim_buy_reason']}\n"
+        f"{sell_sim_icon} Sell-симуляция: {'OK' if data['sim_sell_ok'] else data['sim_sell_reason']}\n"
+        f"{hp_icon} Honeypot.is: {'OK' if data['hp_is_ok'] else data['hp_is_reason']}\n"
+        f"{gp_icon} GoPlus: {'доступен' if data['goplus_ok'] else 'недоступен'}\n\n"
+        f"*🚩 GoPlus флаги:*\n{flags_block}\n\n"
+        f"*⚠️ Предупреждения:*\n{warn_block}\n\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"{rec_icon} *Рекомендация: {rec_text}*\n"
+        f"_{rec_detail}_"
+    )
+
+    await wait_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
 # ── Background: remove expired pending alerts ────────────────────────────────
 
 async def _cleanup_pending():
@@ -1197,7 +1400,13 @@ async def main():
     app.add_handler(CommandHandler("stats",     cmd_stats))
     app.add_handler(CommandHandler("history",   cmd_history))
     app.add_handler(CommandHandler("set",       cmd_set))
+    app.add_handler(CommandHandler("analyze",   cmd_analyze))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    # Handle plain token addresses sent as messages (0x... 42 chars)
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.Regex(r"^0x[0-9a-fA-F]{40}$"),
+        handle_address_message,
+    ))
 
     await app.initialize()
     await app.start()

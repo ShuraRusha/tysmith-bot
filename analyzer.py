@@ -5,7 +5,7 @@ import time
 import aiohttp
 from web3 import Web3
 
-from config import WBNB, BUSD, PANCAKE_ROUTER_V2, TOP_HOLDER_MAX_PCT
+from config import WBNB, BUSD, USDT, PANCAKE_FACTORY_V2, PANCAKE_ROUTER_V2, TOP_HOLDER_MAX_PCT
 
 log = logging.getLogger(__name__)
 
@@ -99,6 +99,19 @@ ERC20_ABI = [
 
 DEXSCREENER_URL     = "https://api.dexscreener.com/latest/dex/pairs/bsc"
 DEXSCREENER_TIMEOUT = 3.0
+
+FACTORY_ABI = [
+    {
+        "inputs": [
+            {"name": "tokenA", "type": "address"},
+            {"name": "tokenB", "type": "address"},
+        ],
+        "name": "getPair",
+        "outputs": [{"name": "pair", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
 
 # ── On-chain helpers ──────────────────────────────────────────────────────────
 
@@ -357,6 +370,167 @@ async def _goplus_fetch(token_address: str) -> dict | None:
 
 async def get_bnb_price(w3: Web3) -> float:
     return await asyncio.to_thread(_get_bnb_price_sync, w3)
+
+
+def _find_pair_sync(w3: Web3, token_address: str) -> tuple[str, str] | None:
+    """
+    Find the best PancakeSwap V2 pair for a token (tries WBNB, BUSD, USDT).
+    Returns (pair_address, base_token) or None if not found.
+    """
+    ZERO = "0x0000000000000000000000000000000000000000"
+    factory = w3.eth.contract(
+        address=Web3.to_checksum_address(PANCAKE_FACTORY_V2), abi=FACTORY_ABI
+    )
+    for base in [WBNB, BUSD, USDT]:
+        try:
+            pair = factory.functions.getPair(
+                Web3.to_checksum_address(token_address),
+                Web3.to_checksum_address(base),
+            ).call()
+            if pair.lower() != ZERO.lower():
+                return pair, base
+        except Exception:
+            continue
+    return None
+
+
+async def analyze_token(token_address: str, w3: Web3,
+                        wallet_address: str = "0x0000000000000000000000000000000000000001") -> dict:
+    """
+    Full non-rejecting analysis of a token — collects all available metrics
+    without early return on failure. Used by the /analyze command.
+
+    Returns a dict with all metrics + per-check pass/fail flags.
+    """
+    # ── Find pair ─────────────────────────────────────────────────────────────
+    pair_info = await asyncio.to_thread(_find_pair_sync, w3, token_address)
+    if not pair_info:
+        return {"found": False, "reason": "Пара не найдена на PancakeSwap V2"}
+
+    pair_address, base_token = pair_info
+
+    # ── Run all checks in parallel ─────────────────────────────────────────────
+    sim_buy_task   = asyncio.to_thread(_simulate_buy_sync,  w3, token_address, wallet_address)
+    sim_sell_task  = asyncio.to_thread(_simulate_sell_sync, w3, token_address, pair_address)
+    goplus_task    = _goplus_fetch(token_address)
+    honeypot_task  = _honeypot_is_check(token_address)
+    dexscreen_task = _dexscreener_fetch(pair_address)
+    bnb_price_task = asyncio.to_thread(_get_bnb_price_sync, w3)
+
+    sim_result, sell_sim, goplus_data, hp_result, dex, bnb_price = await asyncio.gather(
+        sim_buy_task, sim_sell_task, goplus_task, honeypot_task, dexscreen_task, bnb_price_task
+    )
+
+    # ── On-chain metrics ──────────────────────────────────────────────────────
+    liquidity_usd = await asyncio.to_thread(
+        _get_liquidity_usd_sync, w3, pair_address, base_token, bnb_price
+    )
+    fdv_usd = await asyncio.to_thread(_get_fdv_usd_sync, w3, token_address, bnb_price)
+
+    # ── Token identity ────────────────────────────────────────────────────────
+    if goplus_data:
+        name         = goplus_data.get("token_name",   "Unknown")
+        symbol       = goplus_data.get("token_symbol", "???")
+        holder_count = goplus_data.get("holder_count", "?")
+    else:
+        token_meta   = await asyncio.to_thread(_get_token_info_sync, w3, token_address)
+        name         = token_meta["name"]
+        symbol       = token_meta["symbol"]
+        holder_count = "?"
+
+    # ── GoPlus flags ──────────────────────────────────────────────────────────
+    CRITICAL_FLAGS = {
+        "is_honeypot":             "Honeypot",
+        "can_take_back_ownership": "Возврат ownership",
+        "owner_change_balance":    "Владелец меняет балансы",
+        "selfdestruct":            "Selfdestruct",
+        "transfer_pausable":       "Заморозка переводов",
+        "is_blacklisted":          "Blacklist",
+        "cannot_buy":              "Покупка заблокирована",
+        "cannot_sell_all":         "Продажа всех токенов заблокирована",
+        "trading_cooldown":        "Trading cooldown",
+        "is_anti_whale":           "Anti-whale ограничения",
+    }
+    critical_flags = {}
+    warnings       = []
+    buy_tax  = 0.0
+    sell_tax = 0.0
+    top10_pct = 0.0
+    lp_locked = None  # None = unknown
+
+    if goplus_data:
+        for flag, label in CRITICAL_FLAGS.items():
+            if goplus_data.get(flag) == "1":
+                critical_flags[flag] = label
+
+        buy_tax  = float(goplus_data.get("buy_tax")  or 0)
+        sell_tax = float(goplus_data.get("sell_tax") or 0)
+
+        if goplus_data.get("is_mintable")   == "1": warnings.append("Mintable — могут допечатать токены")
+        if goplus_data.get("hidden_owner")  == "1": warnings.append("Hidden owner")
+        if goplus_data.get("is_proxy")      == "1": warnings.append("Proxy контракт")
+        if goplus_data.get("external_call") == "1": warnings.append("External call")
+
+        # Top-10 holder concentration (excl. DEX/locked)
+        for h in (goplus_data.get("holders") or [])[:10]:
+            pct     = float(h.get("percent", 0)) * 100
+            tag     = (h.get("tag") or "").lower()
+            is_safe = h.get("is_locked", 0) == 1 or any(s in tag for s in SAFE_HOLDER_TAGS)
+            if not is_safe:
+                top10_pct += pct
+
+        # LP lock
+        lp_holders = goplus_data.get("lp_holders") or []
+        if lp_holders:
+            lp_locked = True
+            for lph in lp_holders[:10]:
+                lp_pct    = float(lph.get("percent", 0)) * 100
+                is_locked = lph.get("is_locked", 0) == 1
+                tag       = (lph.get("tag") or "").lower()
+                is_safe   = is_locked or any(s in tag for s in SAFE_HOLDER_TAGS)
+                if not is_safe and lp_pct > 50:
+                    lp_locked = False
+                    break
+        # else: lp_locked stays None (not indexed)
+
+    # ── DexScreener data ──────────────────────────────────────────────────────
+    age_days = None
+    vol_5m   = None
+    if dex:
+        created_at_ms = dex.get("pairCreatedAt") or 0
+        if created_at_ms:
+            age_days = (time.time() - created_at_ms / 1000) / 86400
+        vol_5m_raw = (dex.get("volume") or {}).get("m5")
+        if vol_5m_raw is not None:
+            vol_5m = float(vol_5m_raw)
+
+    return {
+        "found":           True,
+        "token_address":   token_address,
+        "pair_address":    pair_address,
+        "base_token":      base_token,
+        "name":            name,
+        "symbol":          symbol,
+        "holder_count":    holder_count,
+        "bnb_price":       bnb_price,
+        "liquidity_usd":   liquidity_usd,
+        "fdv_usd":         fdv_usd,
+        "buy_tax":         buy_tax,
+        "sell_tax":        sell_tax,
+        "sim_buy_ok":      sim_result["ok"],
+        "sim_buy_reason":  sim_result.get("reason", ""),
+        "sim_sell_ok":     sell_sim["ok"],
+        "sim_sell_reason": sell_sim.get("reason", ""),
+        "hp_is_ok":        hp_result["ok"],
+        "hp_is_reason":    hp_result.get("reason", ""),
+        "goplus_ok":       goplus_data is not None,
+        "critical_flags":  critical_flags,
+        "warnings":        warnings,
+        "top10_pct":       top10_pct,
+        "lp_locked":       lp_locked,
+        "age_days":        age_days,
+        "vol_5m":          vol_5m,
+    }
 
 
 # ── Main security check ───────────────────────────────────────────────────────
