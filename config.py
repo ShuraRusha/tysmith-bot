@@ -41,7 +41,7 @@ BSC_WS_RPCS   = list(dict.fromkeys(BSC_WS_RPCS))
 # Tiers (auto-applied):  balance ≤ 1 BNB → 5% | 1-5 BNB → 3% | >5 BNB → 2%
 # Trade is skipped if calculated amount < BUY_MIN_BNB (gas would eat too much profit)
 BUY_PCT_OF_BALANCE = float(os.getenv("BUY_PCT_OF_BALANCE", "0"))    # 0 = auto-tier
-BUY_MIN_BNB        = float(os.getenv("BUY_MIN_BNB",        "0.03")) # skip trade if below
+BUY_MIN_BNB        = float(os.getenv("BUY_MIN_BNB",        "0.02")) # skip trade if below (газ BSC ~0.001-0.002 BNB, 0.02 = 10x газ)
 BUY_MAX_BNB        = float(os.getenv("BUY_MAX_BNB",        "0.5"))  # hard cap per trade
 GAS_RESERVE_BNB    = float(os.getenv("GAS_RESERVE_BNB",    "0.015"))# always keep in wallet
 
