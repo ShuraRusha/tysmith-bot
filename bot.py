@@ -264,7 +264,11 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
             f"{warn_block}"
         )
 
-        approve_result = await asyncio.to_thread(trader.approve_token, token_address)
+        # Run approve + price fetch in parallel to save ~200ms
+        approve_task     = asyncio.to_thread(trader.approve_token, token_address)
+        price_task       = asyncio.to_thread(trader.get_price, token_address, base_token)
+        approve_result, price_before = await asyncio.gather(approve_task, price_task)
+
         if not approve_result["ok"]:
             await tg_send(
                 f"❌ Авто: не удалось одобрить *{info['symbol']}*\n"
@@ -272,8 +276,7 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
             )
             return
 
-        price_before = await asyncio.to_thread(trader.get_price, token_address, base_token)
-        result       = await asyncio.to_thread(trader.buy, token_address, buy_amount)
+        result = await asyncio.to_thread(trader.buy, token_address, buy_amount)
 
         if result["ok"]:
             entry_price = price_before if price_before > 0 else (
