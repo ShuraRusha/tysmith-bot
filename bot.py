@@ -140,7 +140,7 @@ trade_history: list[dict] = []
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 3
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -188,7 +188,25 @@ def _load_settings():
         # User can always lower it back via /set liq <value>.
         if saved_version < 2 and config.MIN_LIQUIDITY_USD <= 10_000:
             config.MIN_LIQUIDITY_USD = 50_000.0
-            log.info("Settings migration v1→v2: MIN_LIQUIDITY_USD set to 50000")
+            log.info("Settings migration v1→v2: MIN_LIQUIDITY_USD 10000 → 50000")
+
+        # Migration v2 → v3: optimized defaults (user-approved 2026-04-14)
+        #   GAS_BUY_GWEI       3 → 5   sniper speed
+        #   TAKE_PROFIT_1     30 → 50  ride momentum longer before partial exit
+        #   TRAILING_STOP_PCT 20 → 15  lock gains faster after TP1
+        #   MIN_MARKET_CAP_USD 30k → 50k
+        #   MIN_FDV_USD       200k → 300k
+        #   MIN_VOLUME_5M_USD   1k → 3k  filter illiquid tokens
+        #   MAX_TOKEN_AGE_DAYS  30 → 7   sniper = fresh pairs only
+        if saved_version < 3:
+            config.GAS_BUY_GWEI       = 5.0
+            config.TAKE_PROFIT_1      = 50.0
+            config.TRAILING_STOP_PCT  = 15.0
+            config.MIN_MARKET_CAP_USD = 50_000.0
+            config.MIN_FDV_USD        = 300_000.0
+            config.MIN_VOLUME_5M_USD  = 3_000.0
+            config.MAX_TOKEN_AGE_DAYS = 7
+            log.info("Settings migration v2→v3: applied optimized sniper defaults")
 
         # Restore bot mode
         if "__is_auto" in data:

@@ -51,12 +51,12 @@ MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "5"))
 
 # ── Entry/Exit strategy ───────────────────────────────────────────────────────
 # Phase 1 — fixed TP: sell TAKE_PROFIT_1_PCT% at TAKE_PROFIT_1% gain
-TAKE_PROFIT_1     = float(os.getenv("TAKE_PROFIT_1",     "30"))   # % gain → partial exit
+TAKE_PROFIT_1     = float(os.getenv("TAKE_PROFIT_1",     "50"))   # % gain → partial exit
 TAKE_PROFIT_1_PCT = float(os.getenv("TAKE_PROFIT_1_PCT", "50"))   # % of tokens to sell at TP1
 
 # Phase 2 — trailing stop on remaining position after TP1
 # Sells all remaining tokens if price drops TRAILING_STOP_PCT% from peak
-TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "20"))   # % drop from peak → full exit
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "15"))   # % drop from peak → full exit
 
 # Fixed stop loss before TP1 is reached
 STOP_LOSS         = float(os.getenv("STOP_LOSS",         "20"))
@@ -87,11 +87,11 @@ TOP_HOLDER_MAX_PCT   = float(os.getenv("TOP_HOLDER_MAX_PCT",   "30"))  # reject 
 MAX_TOP10_HOLDER_PCT = float(os.getenv("MAX_TOP10_HOLDER_PCT", "30"))  # top-10 combined (excl. DEX/locked) > X% → reject
 
 # ── Token quality filters ─────────────────────────────────────────────────────
-MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD",   "30000"))    # min market cap at buy time
-MIN_FDV_USD        = float(os.getenv("MIN_FDV_USD",          "200000"))   # min fully-diluted value
+MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD",   "50000"))    # min market cap at buy time
+MIN_FDV_USD        = float(os.getenv("MIN_FDV_USD",          "300000"))   # min fully-diluted value
 MAX_FDV_USD        = float(os.getenv("MAX_FDV_USD",          "10000000")) # max FDV (avoid huge caps)
-MIN_VOLUME_5M_USD  = float(os.getenv("MIN_VOLUME_5M_USD",    "1000"))     # DexScreener 5-min volume
-MAX_TOKEN_AGE_DAYS = int(os.getenv("MAX_TOKEN_AGE_DAYS",     "30"))       # reject tokens older than this
+MIN_VOLUME_5M_USD  = float(os.getenv("MIN_VOLUME_5M_USD",    "3000"))     # DexScreener 5-min volume
+MAX_TOKEN_AGE_DAYS = int(os.getenv("MAX_TOKEN_AGE_DAYS",     "7"))        # reject tokens older than this
 
 # ── Moon bag ──────────────────────────────────────────────────────────────────
 # When trade size >= MOON_BAG_MIN_USD, keep MOON_BAG_PCT% of tokens as a
