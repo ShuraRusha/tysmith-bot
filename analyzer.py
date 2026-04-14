@@ -10,7 +10,10 @@ from config import WBNB, BUSD, PANCAKE_ROUTER_V2, TOP_HOLDER_MAX_PCT
 log = logging.getLogger(__name__)
 
 GOPLUS_URL   = "https://api.gopluslabs.io/api/v1/token_security/56"
-GOPLUS_TIMEOUT = 1.5   # seconds — fast path; GoPlus is supplementary, not blocking
+GOPLUS_TIMEOUT = 3.0   # increased from 1.5s — new tokens need more time to index
+
+HONEYPOT_IS_URL  = "https://api.honeypot.is/v2/IsHoneypot"
+HONEYPOT_TIMEOUT = 3.0
 
 # Known DEX/locker tags that are safe to ignore in holder checks
 SAFE_HOLDER_TAGS = {"pancakeswap", "uniswap", "burned", "dead", "lock", "locker",
@@ -67,6 +70,26 @@ ROUTER_ABI_SWAP = [
     }
 ]
 
+TRANSFER_ABI = [
+    {
+        "name": "transfer",
+        "type": "function",
+        "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "to",     "type": "address"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "outputs": [{"name": "", "type": "bool"}],
+    },
+    {
+        "name": "balanceOf",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs":  [{"name": "account", "type": "address"}],
+        "outputs": [{"name": "",        "type": "uint256"}],
+    },
+]
+
 ERC20_ABI = [
     {"inputs": [], "name": "name",     "outputs": [{"type": "string"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "symbol",   "outputs": [{"type": "string"}], "stateMutability": "view", "type": "function"},
@@ -116,6 +139,44 @@ def _get_token_info_sync(w3: Web3, token_address: str) -> dict:
         }
     except Exception:
         return {"name": "Unknown", "symbol": "???", "decimals": 18}
+
+
+def _simulate_sell_sync(w3: Web3, token_address: str, pair_address: str) -> dict:
+    """
+    Simulate token transfer FROM the pair contract to detect sell-blocking honeypots.
+
+    The pair always holds token reserves, so transfer(dead, 1) from pair works
+    for legitimate tokens.  Honeypots that block ALL sells (not just whitelisted
+    wallets) will revert here.  This catches the most common BSC honeypot pattern.
+
+    Returns {"ok": True} on success or on any ambiguous error (don't block good tokens).
+    Returns {"ok": False, ...} only when we're confident it's a sell block.
+    """
+    BURN = "0x000000000000000000000000000000000000dEaD"
+    try:
+        token_cs = Web3.to_checksum_address(token_address)
+        pair_cs  = Web3.to_checksum_address(pair_address)
+        token    = w3.eth.contract(address=token_cs, abi=TRANSFER_ABI)
+
+        # Confirm the pair actually holds tokens before simulating
+        pair_balance = token.functions.balanceOf(pair_cs).call()
+        if pair_balance == 0:
+            return {"ok": True}  # brand-new pair with no balance yet — can't judge
+
+        # Simulate transfer of 1 wei from pair → burn address
+        token.functions.transfer(BURN, 1).call({"from": pair_cs})
+        return {"ok": True}
+
+    except Exception as e:
+        err = str(e).lower()
+        # Only flag as honeypot on clear contract-level revert, not node/gas errors
+        if "execution reverted" in err and not any(
+            x in err for x in ["insufficient funds", "gas required", "out of gas"]
+        ):
+            log.info(f"Sell simulation reverted for {token_address}: {e}")
+            return {"ok": False, "reason": "Симуляция продажи: контракт блокирует продажу — вероятно honeypot"}
+        log.debug(f"simulate_sell non-blocking error ({token_address}): {e}")
+        return {"ok": True}
 
 
 def _simulate_buy_sync(w3: Web3, token_address: str, wallet_address: str) -> dict:
@@ -179,6 +240,45 @@ def _simulate_buy_sync(w3: Web3, token_address: str, wallet_address: str) -> dic
 
 # ── GoPlus fetch with short timeout ──────────────────────────────────────────
 
+async def _honeypot_is_check(token_address: str) -> dict:
+    """
+    Check honeypot.is — simulates BOTH buy and sell transactions on-chain.
+    This is the most reliable sell-honeypot detector available for free.
+
+    Returns {"ok": False, "reason": "..."} if honeypot detected.
+    Returns {"ok": True} if safe OR if API is unavailable (fail-open).
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                HONEYPOT_IS_URL,
+                params={"address": token_address, "chainID": "56"},
+                timeout=aiohttp.ClientTimeout(total=HONEYPOT_TIMEOUT),
+            ) as resp:
+                if resp.status != 200:
+                    return {"ok": True}
+                body = await resp.json(content_type=None)
+
+        hp = body.get("honeypotResult", {}) or {}
+        if hp.get("isHoneypot"):
+            reason = hp.get("honeypotReason") or "honeypot.is"
+            return {"ok": False, "reason": f"Honeypot обнаружен: {reason}"}
+
+        sim = body.get("simulationResult", {}) or {}
+        sell_tax = float(sim.get("sellTax", 0) or 0)
+        if sell_tax > 49:
+            return {"ok": False, "reason": f"Sell tax {sell_tax:.0f}% — фактически honeypot"}
+
+        return {"ok": True}
+
+    except asyncio.TimeoutError:
+        log.info(f"honeypot.is timeout for {token_address} — proceeding")
+        return {"ok": True}
+    except Exception as e:
+        log.warning(f"honeypot.is error: {e}")
+        return {"ok": True}
+
+
 async def _goplus_fetch(token_address: str) -> dict | None:
     """
     Fetch GoPlus data with a 1.5s timeout.
@@ -237,15 +337,31 @@ async def check_token(
     If both pass         → merge results.
     """
 
-    # ── Run simulation + GoPlus in parallel ───────────────────────────────────
-    sim_task     = asyncio.to_thread(_simulate_buy_sync, w3, token_address, wallet_address)
-    goplus_task  = _goplus_fetch(token_address)
+    # ── Run all checks in parallel ────────────────────────────────────────────
+    # sim_buy:     eth_call buy simulation  (~200ms)
+    # sim_sell:    eth_call sell simulation from pair  (~200ms)
+    # goplus:      GoPlus security API  (up to 3s)
+    # honeypot_is: honeypot.is sell simulation API  (up to 3s)
+    sim_buy_task  = asyncio.to_thread(_simulate_buy_sync,  w3, token_address, wallet_address)
+    sim_sell_task = asyncio.to_thread(_simulate_sell_sync, w3, token_address, pair_address)
+    goplus_task   = _goplus_fetch(token_address)
+    honeypot_task = _honeypot_is_check(token_address)
 
-    sim_result, goplus_data = await asyncio.gather(sim_task, goplus_task)
+    sim_result, sell_sim, goplus_data, hp_result = await asyncio.gather(
+        sim_buy_task, sim_sell_task, goplus_task, honeypot_task
+    )
 
-    # ── Track A: simulation result ────────────────────────────────────────────
+    # ── Track A: buy simulation ───────────────────────────────────────────────
     if not sim_result["ok"]:
         return {"ok": False, "reason": sim_result["reason"]}
+
+    # ── Track B: sell simulation (pair-based) ─────────────────────────────────
+    if not sell_sim["ok"]:
+        return {"ok": False, "reason": sell_sim["reason"]}
+
+    # ── Track C: honeypot.is ──────────────────────────────────────────────────
+    if not hp_result["ok"]:
+        return {"ok": False, "reason": hp_result["reason"]}
 
     # ── Track B: GoPlus critical flags ────────────────────────────────────────
     buy_tax  = 0.0
