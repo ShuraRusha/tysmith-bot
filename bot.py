@@ -138,6 +138,9 @@ _PERSISTENT_SETTINGS = [
 def _save_settings():
     try:
         data = {k: getattr(config, k) for k in _PERSISTENT_SETTINGS}
+        # Also persist bot mode state so it survives restarts/redeploys
+        data["__is_auto"]   = is_auto
+        data["__is_paused"] = is_paused
         with open(SETTINGS_FILE, "w") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
@@ -145,15 +148,27 @@ def _save_settings():
 
 
 def _load_settings():
+    global is_auto, is_paused
     try:
         if not os.path.exists(SETTINGS_FILE):
             return
         with open(SETTINGS_FILE) as f:
             data = json.load(f)
         for key, val in data.items():
+            if key.startswith("__"):
+                continue  # handled separately below
             if key in _PERSISTENT_SETTINGS and hasattr(config, key):
                 setattr(config, key, val)
-        log.info(f"Loaded persisted settings ({len(data)} params)")
+        # Restore bot mode
+        if "__is_auto" in data:
+            is_auto = bool(data["__is_auto"])
+        if "__is_paused" in data:
+            is_paused = bool(data["__is_paused"])
+        log.info(
+            f"Loaded persisted settings ({len(data)} params) | "
+            f"auto={'on' if is_auto else 'off'} | "
+            f"paused={'yes' if is_paused else 'no'}"
+        )
     except Exception as e:
         log.warning(f"Could not load settings: {e}")
 
@@ -611,6 +626,7 @@ async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏸ Бот уже на паузе. Используй /resume для возобновления.")
         return
     is_paused = True
+    _save_settings()
     await update.message.reply_text(
         "⏸ *Снайпинг приостановлен*\n\n"
         "Новые токены не будут отправляться.\n"
@@ -627,6 +643,7 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("▶️ Бот уже активен.")
         return
     is_paused = False
+    _save_settings()
     await update.message.reply_text(
         "▶️ *Снайпинг возобновлён*\n\n"
         "Слежу за новыми парами на PancakeSwap V2.",
@@ -657,6 +674,7 @@ async def cmd_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚡ Авто-режим уже включён.")
             return
         is_auto = True
+        _save_settings()
         balance = w3.eth.get_balance(trader.wallet) / 1e18
         max_pos = calculate_max_positions(balance)
         buy_amt = calculate_buy_amount(balance)
@@ -675,6 +693,7 @@ async def cmd_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚡ Авто-режим уже выключен.")
             return
         is_auto = False
+        _save_settings()
         await update.message.reply_text(
             "🔵 *Авто-режим выключен*\n\n"
             "Бот снова будет присылать уведомления с кнопками для ручного подтверждения.",
