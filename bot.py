@@ -35,6 +35,7 @@ MOSCOW_TZ     = pytz.timezone("Europe/Moscow")
 DATA_DIR       = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)   # ensure /data exists (Railway Volume or fallback)
 TRADE_LOG_FILE = os.path.join(DATA_DIR, "tysmith_trades.json")
+SETTINGS_FILE  = os.path.join(DATA_DIR, "tysmith_settings.json")
 
 
 # ── Web3 setup (try all configured RPCs until one connects) ──────────────────
@@ -122,6 +123,39 @@ def calculate_buy_amount(balance_bnb: float) -> float:
 is_paused: bool = False
 is_auto:   bool = config.AUTO_BUY
 trade_history: list[dict] = []
+
+
+# ── Settings persistence ──────────────────────────────────────────────────────
+
+_PERSISTENT_SETTINGS = [
+    "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
+    "STOP_LOSS", "TAKE_PROFIT_1", "TRAILING_STOP_PCT",
+    "MIN_LIQUIDITY_USD", "MAX_BUY_TAX", "MAX_SELL_TAX",
+    "MAX_POSITIONS", "GAS_BUY_GWEI",
+]
+
+
+def _save_settings():
+    try:
+        data = {k: getattr(config, k) for k in _PERSISTENT_SETTINGS}
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log.error(f"Failed to save settings: {e}")
+
+
+def _load_settings():
+    try:
+        if not os.path.exists(SETTINGS_FILE):
+            return
+        with open(SETTINGS_FILE) as f:
+            data = json.load(f)
+        for key, val in data.items():
+            if key in _PERSISTENT_SETTINGS and hasattr(config, key):
+                setattr(config, key, val)
+        log.info(f"Loaded persisted settings ({len(data)} params)")
+    except Exception as e:
+        log.warning(f"Could not load settings: {e}")
 
 
 def _load_history():
@@ -782,9 +816,12 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if param == "tax":
         setattr(config, "MAX_SELL_TAX", value)
 
+    _save_settings()
+
     await update.message.reply_text(
         f"✅ *{label}* обновлён\n"
-        f"{old_value} → *{value}*",
+        f"{old_value} → *{value}*\n"
+        f"💾 Сохранено — переживёт перезапуск",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -951,6 +988,7 @@ def _release_pid_lock():
 
 async def main():
     _load_history()
+    _load_settings()
     log.info("Sniper Bot starting...")
 
     app = Application.builder().token(config.BOT_TOKEN).build()
