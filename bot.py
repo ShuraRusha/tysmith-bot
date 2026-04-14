@@ -140,7 +140,7 @@ trade_history: list[dict] = []
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 3
+SETTINGS_VERSION = 4
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -207,6 +207,11 @@ def _load_settings():
             config.MIN_VOLUME_5M_USD  = 3_000.0
             config.MAX_TOKEN_AGE_DAYS = 7
             log.info("Settings migration v2→v3: applied optimized sniper defaults")
+
+        # Migration v3 → v4: MIN_LIQUIDITY_USD 50k → 30k (more signals, same safety)
+        if saved_version < 4:
+            config.MIN_LIQUIDITY_USD = 30_000.0
+            log.info("Settings migration v3→v4: MIN_LIQUIDITY_USD 50000 → 30000")
 
         # Restore bot mode
         if "__is_auto" in data:

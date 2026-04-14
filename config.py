@@ -45,7 +45,7 @@ BUY_MIN_BNB        = float(os.getenv("BUY_MIN_BNB",        "0.02")) # skip trade
 BUY_MAX_BNB        = float(os.getenv("BUY_MAX_BNB",        "0.5"))  # hard cap per trade
 GAS_RESERVE_BNB    = float(os.getenv("GAS_RESERVE_BNB",    "0.015"))# always keep in wallet
 
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "50000"))  # raised: pool liquidity floor
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "30000"))  # raised: pool liquidity floor
 MAX_BUY_TAX       = float(os.getenv("MAX_BUY_TAX",       "5"))
 MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "5"))
 
