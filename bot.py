@@ -569,6 +569,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.MARKDOWN,
             )
 
+    # ── WRITE-OFF (remove to history without selling) ─────────────────────────
+    elif data.startswith("writeoff_"):
+        token_address = data[9:]
+        pos = pos_manager.positions.get(token_address)
+        if not pos:
+            await query.edit_message_text("⚠️ Позиция не найдена или уже закрыта.")
+            return
+
+        current_price = await asyncio.to_thread(trader.get_price, pos.token_address)
+        pnl_pct = (
+            (current_price - pos.buy_price_bnb) / pos.buy_price_bnb * 100
+            if pos.buy_price_bnb > 0 and current_price > 0 else -100.0
+        )
+        _record_trade(pos, pnl_pct, "Списана вручную", current_price)
+        pos_manager.remove(token_address)
+        await query.edit_message_text(
+            f"🗑 *{pos.symbol}* убрана в историю\n"
+            f"P&L: {pnl_pct:+.1f}% | Потрачено: {pos.buy_bnb} BNB\n"
+            f"Слот позиции освобождён.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
 
 # ── Command handlers ──────────────────────────────────────────────────────────
 
@@ -933,12 +955,19 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"P&L: {pnl_pct:+.1f}%\n"
             f"{phase}"
         )
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                f"🔴 Продать {pos.symbol}",
-                callback_data=f"sell_{pos.token_address}",
-            )
-        ]])
+        writeoff_btn = InlineKeyboardButton(
+            "🗑 Убрать в историю",
+            callback_data=f"writeoff_{pos.token_address}",
+        )
+        sell_btn = InlineKeyboardButton(
+            f"🔴 Продать {pos.symbol}",
+            callback_data=f"sell_{pos.token_address}",
+        )
+        # For stuck (honeypot) positions: write-off is primary, sell is secondary
+        if pos.stuck:
+            keyboard = InlineKeyboardMarkup([[writeoff_btn], [sell_btn]])
+        else:
+            keyboard = InlineKeyboardMarkup([[sell_btn, writeoff_btn]])
         await update.message.reply_text(
             text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
         )
@@ -1107,15 +1136,22 @@ async def main():
     # Restore open positions from disk (survive restarts/redeploys)
     restored = pos_manager.load()
 
-    # Clean up "zombie" positions: zero entry price or zero token amount.
-    # These are unmonitorable — SL/TP never trigger. Move them to history.
+    # Clean up broken positions on startup:
+    #   • zombie: buy_price_bnb == 0 or tokens_amount == 0 — unmonitorable
+    #   • stuck:  sell was impossible (honeypot) — already gave up, free the slot
     zombie_names = []
+    stuck_names  = []
     for addr in list(pos_manager.positions):
         pos = pos_manager.positions[addr]
-        if pos.buy_price_bnb <= 0 or pos.tokens_amount <= 0:
+        if pos.stuck:
+            log.warning(f"Startup: removing stuck position {pos.symbol}")
+            _record_trade(pos, pnl_pct=-100.0, reason="Honeypot", sell_price=0.0)
+            pos_manager.remove(addr)
+            stuck_names.append(pos.symbol)
+        elif pos.buy_price_bnb <= 0 or pos.tokens_amount <= 0:
             log.warning(
-                f"Zombie position detected: {pos.symbol} "
-                f"(price={pos.buy_price_bnb}, amount={pos.tokens_amount}) — removing"
+                f"Startup: removing zombie position {pos.symbol} "
+                f"(price={pos.buy_price_bnb}, amount={pos.tokens_amount})"
             )
             _record_trade(pos, pnl_pct=0.0, reason="Invalid (нет данных)", sell_price=0.0)
             pos_manager.remove(addr)
@@ -1129,10 +1165,14 @@ async def main():
     )
     if restored:
         startup_msg += f"\n\n♻️ Восстановлено позиций: *{restored}* — мониторинг возобновлён"
+    if stuck_names:
+        startup_msg += (
+            f"\n\n🚫 Удалены honeypot-позиции: *{', '.join(stuck_names)}*\n"
+            f"Записаны в историю как убыток"
+        )
     if zombie_names:
         startup_msg += (
-            f"\n\n🗑 Удалены зомби-позиции (нет цены входа): "
-            f"*{', '.join(zombie_names)}*\n"
+            f"\n\n🗑 Удалены зомби-позиции (нет цены входа): *{', '.join(zombie_names)}*\n"
             f"Записаны в историю как `Invalid`"
         )
     await tg_send(startup_msg)
