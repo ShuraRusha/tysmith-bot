@@ -313,11 +313,11 @@ class Trader:
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
 
             if receipt.status != 1:
-                # Retry once with 2x slippage if not already retrying
+                # One retry at max slippage (49%) — avoids burning 3 tx fees for honeypots.
+                # Intermediate steps (15%→30%→49%) waste gas without helping.
                 if slippage_pct < 49:
-                    retry_slip = min(slippage_pct * 2, 49)
-                    log.warning(f"Sell status=0 at {slippage_pct}% slip, retrying at {retry_slip}%")
-                    return self.sell(token_address, amount_tokens, slippage_pct=retry_slip)
+                    log.warning(f"Sell status=0 at {slippage_pct}%, retrying at 49%")
+                    return self.sell(token_address, amount_tokens, slippage_pct=49)
                 return {"ok": False, "reason": f"Продажа отклонена сетью (slip={slippage_pct:.0f}%)"}
 
             log.info(f"Sell OK: {token_address}, slippage={slippage_pct}%, tx={tx_hash.hex()}")

@@ -315,10 +315,12 @@ async def check_token(
     pair_address:  str,
     base_token:    str,
     w3:            Web3,
-    min_liquidity_usd: float,
-    max_buy_tax:       float,
-    max_sell_tax:      float,
-    wallet_address:    str = "0x0000000000000000000000000000000000000001",
+    min_liquidity_usd:  float,
+    max_buy_tax:        float,
+    max_sell_tax:       float,
+    wallet_address:     str  = "0x0000000000000000000000000000000000000001",
+    require_goplus:     bool = False,   # True = skip token if GoPlus is down (auto mode)
+    lp_holder_max_pct:  float = 50.0,  # reject if any unlocked wallet holds >X% of LP
 ) -> dict:
     """
     Two-track security check running in parallel:
@@ -350,6 +352,11 @@ async def check_token(
     sim_result, sell_sim, goplus_data, hp_result = await asyncio.gather(
         sim_buy_task, sim_sell_task, goplus_task, honeypot_task
     )
+
+    # ── Require GoPlus in auto mode ───────────────────────────────────────────
+    # Without GoPlus we can't check LP lock, taxes, or owner flags — too risky.
+    if require_goplus and goplus_data is None:
+        return {"ok": False, "reason": "GoPlus недоступен — пропуск в авто-режиме (LP-проверка невозможна)"}
 
     # ── Track A: buy simulation ───────────────────────────────────────────────
     if not sim_result["ok"]:
@@ -392,14 +399,32 @@ async def check_token(
         if sell_tax > max_sell_tax:
             return {"ok": False, "reason": f"Sell tax: {sell_tax:.1f}%"}
 
-        # Top-holder concentration
+        # Top-holder concentration (token holders)
         for h in (goplus_data.get("holders") or [])[:5]:
             pct  = float(h.get("percent", 0)) * 100
             tag  = (h.get("tag") or "").lower()
             if h.get("is_locked", 0) == 1 or any(s in tag for s in SAFE_HOLDER_TAGS):
                 continue
             if pct > TOP_HOLDER_MAX_PCT:
-                return {"ok": False, "reason": f"Кит держит {pct:.1f}% — риск дампа"}
+                return {"ok": False, "reason": f"Кит держит {pct:.1f}% токенов — риск дампа"}
+
+        # LP holder lock check — detect rug pull potential
+        # If any single unlocked wallet holds >lp_holder_max_pct% of LP, devs can rug instantly.
+        lp_holders = goplus_data.get("lp_holders") or []
+        if lp_holders:
+            for lph in lp_holders[:10]:
+                lp_pct   = float(lph.get("percent", 0)) * 100
+                is_locked = lph.get("is_locked", 0) == 1
+                tag       = (lph.get("tag") or "").lower()
+                is_safe   = is_locked or any(s in tag for s in SAFE_HOLDER_TAGS)
+                if not is_safe and lp_pct > lp_holder_max_pct:
+                    return {
+                        "ok":     False,
+                        "reason": f"Rug риск: {lp_pct:.0f}% LP не заблокирован — девы могут слить ликвидность",
+                    }
+        else:
+            # LP data empty → GoPlus hasn't indexed it yet; warn but don't block
+            warnings_from_goplus.append("⚠️ LP-холдеры не проиндексированы — rug-риск неизвестен")
 
         # Non-critical warnings
         if goplus_data.get("is_mintable")   == "1": warnings_from_goplus.append("⚠️ Mintable")

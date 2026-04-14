@@ -294,6 +294,7 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         token_address, pair_address, base_token, w3,
         config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
         wallet_address=trader.wallet,
+        require_goplus=is_auto,   # auto mode requires GoPlus for LP-lock check
     )
 
     if not result["ok"]:
