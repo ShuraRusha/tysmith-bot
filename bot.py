@@ -1107,6 +1107,20 @@ async def main():
     # Restore open positions from disk (survive restarts/redeploys)
     restored = pos_manager.load()
 
+    # Clean up "zombie" positions: zero entry price or zero token amount.
+    # These are unmonitorable — SL/TP never trigger. Move them to history.
+    zombie_names = []
+    for addr in list(pos_manager.positions):
+        pos = pos_manager.positions[addr]
+        if pos.buy_price_bnb <= 0 or pos.tokens_amount <= 0:
+            log.warning(
+                f"Zombie position detected: {pos.symbol} "
+                f"(price={pos.buy_price_bnb}, amount={pos.tokens_amount}) — removing"
+            )
+            _record_trade(pos, pnl_pct=0.0, reason="Invalid (нет данных)", sell_price=0.0)
+            pos_manager.remove(addr)
+            zombie_names.append(pos.symbol)
+
     log.info(f"Ready. Wallet: {trader.wallet}")
     startup_msg = (
         "🚀 *Sniper Bot запущен*\n"
@@ -1115,6 +1129,12 @@ async def main():
     )
     if restored:
         startup_msg += f"\n\n♻️ Восстановлено позиций: *{restored}* — мониторинг возобновлён"
+    if zombie_names:
+        startup_msg += (
+            f"\n\n🗑 Удалены зомби-позиции (нет цены входа): "
+            f"*{', '.join(zombie_names)}*\n"
+            f"Записаны в историю как `Invalid`"
+        )
     await tg_send(startup_msg)
 
     try:

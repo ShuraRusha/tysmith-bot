@@ -35,6 +35,7 @@ class Position:
     peak_price:       float = field(default=0.0)
     sell_failures:    int   = field(default=0)
     stuck:            bool  = field(default=False)
+    age_alerted:      bool  = field(default=False)
 
 
 class PositionManager:
@@ -134,6 +135,23 @@ class PositionManager:
 
                     pnl_pct = (current_price - pos.buy_price_bnb) / pos.buy_price_bnb * 100
 
+                    # 24h age alert — fire once if position is stale
+                    if (
+                        not pos.age_alerted
+                        and not pos.tp1_done
+                        and not pos.stuck
+                        and (time.time() - pos.opened_at) > 24 * 3600
+                    ):
+                        pos.age_alerted = True
+                        self._save()
+                        age_h = int((time.time() - pos.opened_at) / 3600)
+                        log.warning(f"{pos.symbol} open {age_h}h without TP1 — alerting")
+                        await self.notify(
+                            f"⏰ *{pos.symbol}* открыта уже *{age_h}+ ч.* без TP1\n\n"
+                            f"Вход: {pos.buy_price_bnb:.8f} BNB | P&L: {pnl_pct:+.1f}%\n"
+                            f"Проверь позицию вручную или продай через /positions"
+                        )
+
                     if not pos.tp1_done:
                         if pnl_pct >= pos.take_profit_1:
                             log.info(f"TP1 hit for {pos.symbol}: +{pnl_pct:.1f}%")
@@ -159,6 +177,8 @@ class PositionManager:
     async def _close_partial(self, pos: Position, pnl_pct: float):
         """Sell TP1_PCT% at TP1 then activate trailing stop for remainder."""
         sell_amount = int(pos.tokens_amount * pos.take_profit_1_pct / 100)
+        # Derive current price from pnl so _handle_sell_failure can record it
+        sell_price = pos.buy_price_bnb * (1 + pnl_pct / 100) if pos.buy_price_bnb else 0.0
         result = await asyncio.to_thread(
             self.trader.sell, pos.token_address, sell_amount
         )
@@ -174,7 +194,7 @@ class PositionManager:
                 f"Tx: `{result['tx_hash']}`"
             )
         else:
-            await self._handle_sell_failure(pos, result["reason"])
+            await self._handle_sell_failure(pos, result["reason"], sell_price)
 
     async def _close_full(self, pos: Position, pnl_pct: float, reason: str, sell_price: float = 0.0):
         """Sell all remaining tokens."""
@@ -197,10 +217,10 @@ class PositionManager:
                 self.on_close(pos, pnl_pct, reason, sell_price)
             self.remove(pos.token_address)
         else:
-            await self._handle_sell_failure(pos, result["reason"])
+            await self._handle_sell_failure(pos, result["reason"], sell_price)
 
-    async def _handle_sell_failure(self, pos: Position, reason: str):
-        """Track consecutive sell failures; mark position stuck after 5 attempts."""
+    async def _handle_sell_failure(self, pos: Position, reason: str, sell_price: float = 0.0):
+        """Track consecutive sell failures; after 5 attempts mark stuck, record loss, remove."""
         MAX_FAILURES = 5
         pos.sell_failures += 1
         self._save()
@@ -208,15 +228,22 @@ class PositionManager:
 
         if pos.sell_failures >= MAX_FAILURES:
             pos.stuck = True
-            self._save()
-            log.error(f"{pos.symbol} marked STUCK after {MAX_FAILURES} sell failures")
+            log.error(f"{pos.symbol} marked STUCK after {MAX_FAILURES} sell failures — removing from active positions")
+            pnl_pct = (
+                (sell_price - pos.buy_price_bnb) / pos.buy_price_bnb * 100
+                if sell_price > 0 and pos.buy_price_bnb > 0
+                else -100.0
+            )
+            # Record as a loss in trade history before removing
+            if self.on_close:
+                self.on_close(pos, pnl_pct, "Honeypot", sell_price)
+            self.remove(pos.token_address)
             await self.notify(
-                f"🚫 *{pos.symbol}* — продажа невозможна\n\n"
+                f"🚫 *{pos.symbol}* — honeypot, позиция закрыта как убыток\n\n"
                 f"Продажа отклонена контрактом *{MAX_FAILURES} раз подряд*.\n"
-                f"Скорее всего это *honeypot* — токен можно купить, но нельзя продать.\n\n"
-                f"Бот прекратил попытки.\n"
+                f"Записан убыток: *{pnl_pct:+.1f}%* ({pos.buy_bnb} BNB)\n\n"
                 f"Попробуй продать вручную на PancakeSwap (slippage 99%):\n"
-                f"pancakeswap.finance → Swap → вставь адрес:\n"
+                f"pancakeswap.finance → Swap → адрес:\n"
                 f"`{pos.token_address}`"
             )
         else:
