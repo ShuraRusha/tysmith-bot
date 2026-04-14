@@ -229,19 +229,16 @@ class PositionManager:
         if pos.sell_failures >= MAX_FAILURES:
             pos.stuck = True
             log.error(f"{pos.symbol} marked STUCK after {MAX_FAILURES} sell failures — removing from active positions")
-            pnl_pct = (
-                (sell_price - pos.buy_price_bnb) / pos.buy_price_bnb * 100
-                if sell_price > 0 and pos.buy_price_bnb > 0
-                else -100.0
-            )
-            # Record as a loss in trade history before removing
+            # Honeypot = tokens cannot be sold regardless of price.
+            # Any paper gain is unrealizable — record the full buy as a loss.
+            pnl_pct = -100.0
             if self.on_close:
-                self.on_close(pos, pnl_pct, "Honeypot", sell_price)
+                self.on_close(pos, pnl_pct, "Honeypot", 0.0)
             self.remove(pos.token_address)
             await self.notify(
-                f"🚫 *{pos.symbol}* — honeypot, позиция закрыта как убыток\n\n"
+                f"🚫 *{pos.symbol}* — honeypot, токены продать невозможно\n\n"
                 f"Продажа отклонена контрактом *{MAX_FAILURES} раз подряд*.\n"
-                f"Записан убыток: *{pnl_pct:+.1f}%* ({pos.buy_bnb} BNB)\n\n"
+                f"Потеряно: *{pos.buy_bnb} BNB* (токены не продать — убыток -100%)\n\n"
                 f"Попробуй продать вручную на PancakeSwap (slippage 99%):\n"
                 f"pancakeswap.finance → Swap → адрес:\n"
                 f"`{pos.token_address}`"
