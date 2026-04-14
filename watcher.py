@@ -83,7 +83,7 @@ async def _watch_single(ws_url: str, callback):
         except Exception as e:
             log.error(f"WS error ({ws_url[:40]}…): {e}. Reconnecting in {backoff}s...")
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+            backoff = min(backoff * 2, 15)   # max 15s — публичная нода нестабильна, восстанавливаемся быстро
 
 
 # Dedup: don't process the same pair twice if multiple WS see it

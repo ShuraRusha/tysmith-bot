@@ -993,9 +993,12 @@ async def main():
 
     app = Application.builder().token(config.BOT_TOKEN).build()
 
-    # Drop any webhook that might be set — prevents conflict with polling
+    # Drop any webhook that might be set — prevents conflict with polling.
+    # Brief sleep after delete_webhook gives the previous Railway instance time
+    # to receive a 409 Conflict and shut down, avoiding duplicate polling.
     await app.bot.delete_webhook(drop_pending_updates=True)
-    log.info("Webhook cleared")
+    log.info("Webhook cleared — waiting 3s for previous instance to exit...")
+    await asyncio.sleep(3)
 
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_help))
