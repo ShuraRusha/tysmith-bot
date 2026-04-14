@@ -140,7 +140,7 @@ trade_history: list[dict] = []
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 4
+SETTINGS_VERSION = 5
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -151,6 +151,8 @@ _PERSISTENT_SETTINGS = [
     "MIN_MARKET_CAP_USD", "MIN_FDV_USD", "MAX_FDV_USD",
     "MIN_VOLUME_5M_USD", "MAX_TOKEN_AGE_DAYS", "MAX_TOP10_HOLDER_PCT",
     "MOON_BAG_MIN_USD", "MOON_BAG_PCT",
+    # Added in v5:
+    "LP_HOLDER_MAX_PCT", "MIN_HOLDER_COUNT",
 ]
 
 
@@ -212,6 +214,12 @@ def _load_settings():
         if saved_version < 4:
             config.MIN_LIQUIDITY_USD = 30_000.0
             log.info("Settings migration v3→v4: MIN_LIQUIDITY_USD 50000 → 30000")
+
+        # Migration v4 → v5: LP_HOLDER_MAX_PCT 50 → 30, MIN_HOLDER_COUNT = 50
+        if saved_version < 5:
+            config.LP_HOLDER_MAX_PCT = 30.0
+            config.MIN_HOLDER_COUNT  = 50
+            log.info("Settings migration v4→v5: LP_HOLDER_MAX_PCT=30, MIN_HOLDER_COUNT=50")
 
         # Restore bot mode
         if "__is_auto" in data:
@@ -356,6 +364,8 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
         min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
         max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
+        lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
+        min_holder_count=config.MIN_HOLDER_COUNT,
     )
 
     if not result["ok"]:
@@ -724,6 +734,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/set vol5m 1000` — мин. объём за 5 мин USD\n"
         "`/set age 30` — макс. возраст токена (дней)\n"
         "`/set top10 30` — макс. топ-10 холдеры % (excl. DEX)\n"
+        "`/set lp 30` — макс. % LP в одном незаблокированном кошельке\n"
+        "`/set holders 50` — мин. кол-во холдеров токена\n"
         "`/set tax 5` — макс. налог buy+sell в %\n"
         "`/set max 5` — макс. кол-во позиций\n"
         "`/set gwei 3` — gas для покупки в gwei (0 = авто)",
@@ -988,6 +1000,8 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "vol5m":  ("MIN_VOLUME_5M_USD",   0.0,   1e6,   "Мин. объём за 5 мин USD"),
         "age":    ("MAX_TOKEN_AGE_DAYS",  1,     365,   "Макс. возраст токена (дней)"),
         "top10":  ("MAX_TOP10_HOLDER_PCT",1.0,   99.0,  "Макс. топ-10 холдеры % (excl. DEX)"),
+        "lp":     ("LP_HOLDER_MAX_PCT",  1.0,   99.0,  "Макс. % LP в одном незаблокированном кошельке"),
+        "holders":("MIN_HOLDER_COUNT",   1,     10000, "Мин. кол-во холдеров токена"),
         # Taxes and limits
         "tax":    ("MAX_BUY_TAX",         1.0,   50.0,  "Макс. налог %"),
         "max":    ("MAX_POSITIONS",       1,     20,    "Макс. позиций"),
@@ -1010,8 +1024,8 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     old_value = getattr(config, attr)
-    # For MAX_POSITIONS store as int
-    if attr == "MAX_POSITIONS":
+    # Integer params
+    if attr in ("MAX_POSITIONS", "MAX_TOKEN_AGE_DAYS", "MIN_HOLDER_COUNT"):
         value = int(value)
     setattr(config, attr, value)
 
@@ -1122,7 +1136,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"FDV: ${config.MIN_FDV_USD/1000:.0f}k – ${config.MAX_FDV_USD/1000000:.0f}М\n"
         f"Объём 5м: ${config.MIN_VOLUME_5M_USD:,.0f} мин\n"
         f"Возраст: {config.MAX_TOKEN_AGE_DAYS} дней макс\n"
+        f"Холдеры: {config.MIN_HOLDER_COUNT} мин\n"
         f"Топ-10 холдеры: {config.MAX_TOP10_HOLDER_PCT:.0f}% макс\n"
+        f"LP незаблокирован: {config.LP_HOLDER_MAX_PCT:.0f}% макс на кошелёк\n"
         f"Max tax: {config.MAX_BUY_TAX}% buy / {config.MAX_SELL_TAX}% sell\n\n"
         f"*Исполнение:*\n"
         f"Gas buy: {gas_mode}\n"

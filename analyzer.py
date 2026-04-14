@@ -545,13 +545,14 @@ async def check_token(
     max_sell_tax:        float,
     wallet_address:      str   = "0x0000000000000000000000000000000000000001",
     require_goplus:      bool  = False,    # True = skip token if GoPlus is down (auto mode)
-    lp_holder_max_pct:   float = 50.0,    # reject if any unlocked wallet holds >X% of LP
+    lp_holder_max_pct:   float = 30.0,    # reject if any unlocked wallet holds >X% of LP
     min_market_cap_usd:  float = 30_000,
     min_fdv_usd:         float = 200_000,
     max_fdv_usd:         float = 10_000_000,
     max_top10_holder_pct: float = 30.0,   # top-10 non-DEX/locked holders combined
     min_volume_5m_usd:   float = 1_000,   # skip if DexScreener 5-min volume below this
     max_token_age_days:  int   = 30,      # skip if pair is older than this
+    min_holder_count:    int   = 50,      # min number of token holders (GoPlus)
 ) -> dict:
     """
     Two-track security check running in parallel:
@@ -626,6 +627,19 @@ async def check_token(
             return {"ok": False, "reason": f"Buy tax: {buy_tax:.1f}%"}
         if sell_tax > max_sell_tax:
             return {"ok": False, "reason": f"Sell tax: {sell_tax:.1f}%"}
+
+        # Minimum holder count — filters out insider/bot-only tokens
+        raw_holders = goplus_data.get("holder_count")
+        if raw_holders is not None:
+            try:
+                holder_count_int = int(raw_holders)
+                if holder_count_int < min_holder_count:
+                    return {
+                        "ok":     False,
+                        "reason": f"Холдеров слишком мало: {holder_count_int} < {min_holder_count}",
+                    }
+            except (ValueError, TypeError):
+                pass  # can't parse — don't block
 
         # Top-10 combined holder concentration (excluding DEX pools, burned, locked)
         combined_top10 = 0.0

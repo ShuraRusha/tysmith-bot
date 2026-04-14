@@ -85,6 +85,8 @@ MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "0"))  # 0 = auto formu
 # ── Safety filters ────────────────────────────────────────────────────────────
 TOP_HOLDER_MAX_PCT   = float(os.getenv("TOP_HOLDER_MAX_PCT",   "30"))  # reject if single wallet > X%
 MAX_TOP10_HOLDER_PCT = float(os.getenv("MAX_TOP10_HOLDER_PCT", "30"))  # top-10 combined (excl. DEX/locked) > X% → reject
+LP_HOLDER_MAX_PCT    = float(os.getenv("LP_HOLDER_MAX_PCT",    "30"))  # reject if any unlocked wallet holds >X% of LP
+MIN_HOLDER_COUNT     = int(os.getenv("MIN_HOLDER_COUNT",       "50"))  # min token holder count (GoPlus)
 
 # ── Token quality filters ─────────────────────────────────────────────────────
 MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD",   "50000"))    # min market cap at buy time
