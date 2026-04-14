@@ -178,12 +178,49 @@ def _save_history():
         log.error(f"Failed to save trade history: {e}")
 
 
-def _record_trade(pos: Position, pnl_pct: float, reason: str, sell_price: float = 0.0):
-    pnl_bnb      = round(pos.buy_bnb * pnl_pct / 100, 6)
-    hold_sec     = int(time.time() - pos.opened_at)
-    hold_min     = hold_sec // 60
-    hold_str     = f"{hold_min}м {hold_sec % 60}с" if hold_min < 60 else f"{hold_min // 60}ч {hold_min % 60}м"
+def _record_buy(pos: Position, tx_hash: str):
+    """Record a buy event immediately when position opens."""
     trade_history.append({
+        "status":        "open",
+        "symbol":        pos.symbol,
+        "token_address": pos.token_address,
+        "buy_price_bnb": pos.buy_price_bnb,
+        "buy_bnb":       pos.buy_bnb,
+        "liquidity_usd": pos.liquidity_usd,
+        "buy_tax":       pos.buy_tax,
+        "sell_tax":      pos.sell_tax,
+        "tx_hash_buy":   tx_hash,
+        "opened_at":     datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M"),
+    })
+    _save_history()
+
+
+def _record_trade(pos: Position, pnl_pct: float, reason: str, sell_price: float = 0.0):
+    """Close a trade record. Updates the matching open entry if it exists."""
+    pnl_bnb  = round(pos.buy_bnb * pnl_pct / 100, 6)
+    hold_sec = int(time.time() - pos.opened_at)
+    hold_min = hold_sec // 60
+    hold_str = f"{hold_min}м {hold_sec % 60}с" if hold_min < 60 else f"{hold_min // 60}ч {hold_min % 60}м"
+
+    # Try to find and update existing open entry for this token
+    for entry in reversed(trade_history):
+        if entry.get("status") == "open" and entry.get("token_address") == pos.token_address:
+            entry.update({
+                "status":         "closed",
+                "sell_price_bnb": sell_price,
+                "pnl_pct":        round(pnl_pct, 2),
+                "pnl_bnb":        pnl_bnb,
+                "reason":         reason,
+                "hold_sec":       hold_sec,
+                "hold_str":       hold_str,
+                "closed_at":      datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M"),
+            })
+            _save_history()
+            return
+
+    # Fallback: no open entry found (e.g. position restored from disk before fix)
+    trade_history.append({
+        "status":         "closed",
         "symbol":         pos.symbol,
         "token_address":  pos.token_address,
         "buy_price_bnb":  pos.buy_price_bnb,
@@ -334,6 +371,7 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
                 sell_tax          = info["sell_tax"],
             )
             pos_manager.add(pos)
+            _record_buy(pos, result["tx_hash"])
             amount_fmt = result["tokens_received"] / 10 ** result["decimals"]
             await tg_send(
                 f"✅ *Куплено авто* — {info['symbol']}\n\n"
@@ -455,6 +493,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sell_tax           = token_info["info"]["sell_tax"],
             )
             pos_manager.add(pos)
+            _record_buy(pos, result["tx_hash"])
 
             amount_fmt = result["tokens_received"] / 10 ** result["decimals"]
             await query.edit_message_text(
@@ -708,8 +747,16 @@ def _build_stats_report(trades: list[dict], bnb_price: float, title: str = "Ст
 
 @owner_only
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not trade_history:
-        await update.message.reply_text("📊 Нет закрытых сделок.")
+    # Stats only count closed trades
+    closed = [t for t in trade_history if t.get("status") == "closed" or "pnl_pct" in t]
+    open_  = [t for t in trade_history if t.get("status") == "open"]
+
+    if not closed:
+        open_count = len(open_)
+        msg = "📊 Нет закрытых сделок."
+        if open_count:
+            msg += f"\n\nОткрытых позиций в истории: *{open_count}* (ещё не закрыты)"
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
         return
 
     bnb_price = await get_bnb_price(w3)
@@ -717,8 +764,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subcmd = args[0].lower() if args else ""
 
     if subcmd == "today":
-        today = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
-        trades = [t for t in trade_history if t.get("closed_at", "").startswith(today)]
+        today  = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
+        trades = [t for t in closed if t.get("closed_at", "").startswith(today)]
         if not trades:
             await update.message.reply_text("📊 Сегодня закрытых сделок нет.")
             return
@@ -726,34 +773,44 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif subcmd == "week":
         from datetime import timedelta
         week_ago = (datetime.now(MOSCOW_TZ) - timedelta(days=7)).strftime("%Y-%m-%d")
-        trades = [t for t in trade_history if t.get("closed_at", "") >= week_ago]
+        trades   = [t for t in closed if t.get("closed_at", "") >= week_ago]
         if not trades:
             await update.message.reply_text("📊 За последнюю неделю нет сделок.")
             return
         report = _build_stats_report(trades, bnb_price, "Статистика за неделю")
     else:
-        report = _build_stats_report(trade_history, bnb_price)
+        report = _build_stats_report(closed, bnb_price)
 
+    if open_:
+        report += f"\n\n📈 Открытых позиций: *{len(open_)}* (не учтены в статистике)"
     await update.message.reply_text(report, parse_mode=ParseMode.MARKDOWN)
 
 
 @owner_only
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not trade_history:
-        await update.message.reply_text("📜 История пустая — нет закрытых сделок.")
+        await update.message.reply_text("📜 История пустая — покупок ещё не было.")
         return
 
-    last10 = trade_history[-10:][::-1]
-    lines = ["📜 *Последние сделки*\n"]
-    for t in last10:
-        emoji = "✅" if t["pnl_pct"] > 0 else "🔴"
-        hold  = t.get("hold_str", "?")
-        liq   = f" | 💧${t['liquidity_usd']:,.0f}" if t.get("liquidity_usd") else ""
-        lines.append(
-            f"{emoji} *{t['symbol']}* {t['pnl_pct']:+.1f}% "
-            f"({t['pnl_bnb']:+.4f} BNB) — {t['reason']}\n"
-            f"    ⏱ {hold}{liq} | `{t['closed_at']}`"
-        )
+    last15 = trade_history[-15:][::-1]
+    lines  = ["📜 *Последние транзакции*\n"]
+    for t in last15:
+        liq = f" | 💧${t['liquidity_usd']:,.0f}" if t.get("liquidity_usd") else ""
+        if t.get("status") == "open":
+            # Position still open — show as "holding"
+            lines.append(
+                f"📈 *{t['symbol']}* — удерживается\n"
+                f"    Куплено: {t['buy_bnb']} BNB{liq} | `{t.get('opened_at', '?')}`"
+            )
+        else:
+            pnl_pct = t.get("pnl_pct", 0)
+            emoji   = "✅" if pnl_pct > 0 else "🔴"
+            hold    = t.get("hold_str", "?")
+            lines.append(
+                f"{emoji} *{t['symbol']}* {pnl_pct:+.1f}% "
+                f"({t.get('pnl_bnb', 0):+.4f} BNB) — {t.get('reason', '?')}\n"
+                f"    ⏱ {hold}{liq} | `{t.get('closed_at', '?')}`"
+            )
     await update.message.reply_text(
         "\n".join(lines),
         parse_mode=ParseMode.MARKDOWN,
