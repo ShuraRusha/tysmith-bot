@@ -980,12 +980,18 @@ async def main():
     asyncio.create_task(_cleanup_pending())
     asyncio.create_task(_daily_report())
 
+    # Restore open positions from disk (survive restarts/redeploys)
+    restored = pos_manager.load()
+
     log.info(f"Ready. Wallet: {trader.wallet}")
-    await tg_send(
+    startup_msg = (
         "🚀 *Sniper Bot запущен*\n"
         "Слежу за новыми парами на PancakeSwap V2 (BSC)...\n\n"
         "/help — все команды"
     )
+    if restored:
+        startup_msg += f"\n\n♻️ Восстановлено позиций: *{restored}* — мониторинг возобновлён"
+    await tg_send(startup_msg)
 
     try:
         while True:

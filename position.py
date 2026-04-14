@@ -1,9 +1,14 @@
 import asyncio
+import json
 import logging
+import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 log = logging.getLogger(__name__)
+
+_DATA_DIR      = os.getenv("DATA_DIR", "/data")
+POSITIONS_FILE = os.path.join(_DATA_DIR, "tysmith_positions.json")
 
 
 @dataclass
@@ -21,13 +26,13 @@ class Position:
     trailing_stop_pct: float  # % drop from peak to trigger full exit (e.g. 10)
     stop_loss:        float   # % loss before TP1 to cut position (e.g. 15)
     # Analytics metadata
-    liquidity_usd:    float = field(default=0.0)   # liquidity at time of buy
+    liquidity_usd:    float = field(default=0.0)
     buy_tax:          float = field(default=0.0)
     sell_tax:         float = field(default=0.0)
-    opened_at:        float = field(default_factory=time.time)  # unix timestamp
+    opened_at:        float = field(default_factory=time.time)
     # Runtime state
     tp1_done:         bool  = field(default=False)
-    peak_price:       float = field(default=0.0)   # highest price seen
+    peak_price:       float = field(default=0.0)
 
 
 class PositionManager:
@@ -37,11 +42,44 @@ class PositionManager:
         self.positions: dict[str, Position] = {}
         self.on_close  = None  # optional callback(pos, pnl_pct, reason, sell_price)
 
+    # ── Persistence ───────────────────────────────────────────────────────────
+
+    def _save(self):
+        try:
+            os.makedirs(_DATA_DIR, exist_ok=True)
+            data = {addr: asdict(pos) for addr, pos in self.positions.items()}
+            with open(POSITIONS_FILE, "w") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.error(f"Failed to save positions: {e}")
+
+    def load(self) -> int:
+        """Load positions from disk. Returns number of restored positions."""
+        try:
+            if not os.path.exists(POSITIONS_FILE):
+                return 0
+            with open(POSITIONS_FILE) as f:
+                data = json.load(f)
+            for addr, d in data.items():
+                try:
+                    self.positions[addr] = Position(**d)
+                except Exception as e:
+                    log.warning(f"Skipping corrupt position {addr}: {e}")
+            count = len(self.positions)
+            if count:
+                log.info(f"Restored {count} open position(s) from disk")
+            return count
+        except Exception as e:
+            log.warning(f"Could not load positions: {e}")
+            return 0
+
     # ── CRUD ──────────────────────────────────────────────────────────────────
 
     def add(self, pos: Position):
-        pos.peak_price = pos.buy_price_bnb  # initialise peak at entry
+        if pos.peak_price == 0.0:
+            pos.peak_price = pos.buy_price_bnb
         self.positions[pos.token_address] = pos
+        self._save()
         log.info(
             f"Position opened: {pos.symbol} | "
             f"entry={pos.buy_price_bnb:.8f} BNB | "
@@ -52,6 +90,7 @@ class PositionManager:
 
     def remove(self, token_address: str):
         self.positions.pop(token_address, None)
+        self._save()
 
     def get_all(self) -> list[Position]:
         return list(self.positions.values())
@@ -84,27 +123,21 @@ class PositionManager:
                     if current_price <= 0 or pos.buy_price_bnb <= 0:
                         continue
 
-                    # Always track the highest price seen
                     if current_price > pos.peak_price:
                         pos.peak_price = current_price
+                        self._save()
 
                     pnl_pct = (current_price - pos.buy_price_bnb) / pos.buy_price_bnb * 100
 
                     if not pos.tp1_done:
-                        # ── Phase 1: fixed TP1 + fixed SL ────────────────────
                         if pnl_pct >= pos.take_profit_1:
                             log.info(f"TP1 hit for {pos.symbol}: +{pnl_pct:.1f}%")
                             await self._close_partial(pos, pnl_pct)
-
                         elif pnl_pct <= -pos.stop_loss:
                             log.info(f"SL hit for {pos.symbol}: {pnl_pct:.1f}%")
                             await self._close_full(pos, pnl_pct, reason="SL", sell_price=current_price)
-
                     else:
-                        # ── Phase 2: trailing stop on remaining tokens ─────────
-                        drop_from_peak = (
-                            (pos.peak_price - current_price) / pos.peak_price * 100
-                        )
+                        drop_from_peak = (pos.peak_price - current_price) / pos.peak_price * 100
                         if drop_from_peak >= pos.trailing_stop_pct:
                             log.info(
                                 f"Trailing stop hit for {pos.symbol}: "
@@ -127,6 +160,7 @@ class PositionManager:
         if result["ok"]:
             pos.tp1_done      = True
             pos.tokens_amount = pos.tokens_amount - sell_amount
+            self._save()
             await self.notify(
                 f"🟡 *TP1 — {pos.symbol}*\n"
                 f"Продано *{pos.take_profit_1_pct:.0f}%* позиции при +{pnl_pct:.1f}%\n"
