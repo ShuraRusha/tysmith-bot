@@ -152,7 +152,7 @@ def _simulate_sell_sync(w3: Web3, token_address: str, pair_address: str) -> dict
     Returns {"ok": True} on success or on any ambiguous error (don't block good tokens).
     Returns {"ok": False, ...} only when we're confident it's a sell block.
     """
-    BURN = "0x000000000000000000000000000000000000dEaD"
+    BURN = Web3.to_checksum_address("0x000000000000000000000000000000000000dead")
     try:
         token_cs = Web3.to_checksum_address(token_address)
         pair_cs  = Web3.to_checksum_address(pair_address)

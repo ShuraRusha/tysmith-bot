@@ -683,11 +683,16 @@ async def cmd_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _build_stats_report(trades: list[dict], bnb_price: float, title: str = "Статистика сделок") -> str:
+    # Normalise: ensure pnl_pct and pnl_bnb are numeric (guard against corrupt entries)
+    trades = [t for t in trades if isinstance(t.get("pnl_pct"), (int, float))]
     total  = len(trades)
+    if total == 0:
+        return f"📊 *{title}*\n\nНедостаточно данных."
+
     wins   = [t for t in trades if t["pnl_pct"] > 0]
     losses = [t for t in trades if t["pnl_pct"] <= 0]
 
-    total_pnl_bnb = sum(t["pnl_bnb"] for t in trades)
+    total_pnl_bnb = sum(t.get("pnl_bnb", 0) for t in trades)
     avg_pnl_pct   = sum(t["pnl_pct"] for t in trades) / total
     win_rate      = len(wins) / total * 100
 
@@ -896,7 +901,9 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (price - pos.buy_price_bnb) / pos.buy_price_bnb * 100
             if pos.buy_price_bnb and price else 0
         )
-        if pos.tp1_done:
+        if pos.stuck:
+            phase = f"🚫 STUCK — продажа невозможна (honeypot?), попыток: {pos.sell_failures}"
+        elif pos.tp1_done:
             phase = f"Trailing stop: -{pos.trailing_stop_pct}% от пика ({pos.peak_price:.8f})"
         else:
             phase = f"TP1: +{pos.take_profit_1}%  |  SL: -{pos.stop_loss}%"
