@@ -261,7 +261,9 @@ async def check_token(
             "transfer_pausable":       "Переводы можно заморозить",
             "is_blacklisted":          "Blacklist функция",
             "cannot_buy":              "Покупка заблокирована контрактом",
+            "cannot_sell_all":         "Продажа всех токенов заблокирована",
             "trading_cooldown":        "Trading cooldown (anti-bot)",
+            "is_anti_whale":           "Anti-whale: ограничение объёма продажи",
         }
         for flag, reason in CRITICAL.items():
             if goplus_data.get(flag) == "1":

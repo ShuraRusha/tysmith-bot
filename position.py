@@ -33,6 +33,8 @@ class Position:
     # Runtime state
     tp1_done:         bool  = field(default=False)
     peak_price:       float = field(default=0.0)
+    sell_failures:    int   = field(default=0)
+    stuck:            bool  = field(default=False)
 
 
 class PositionManager:
@@ -117,6 +119,9 @@ class PositionManager:
                 if not pos:
                     continue
                 try:
+                    if pos.stuck:
+                        continue   # honeypot / unsellable — stop retrying
+
                     current_price = await asyncio.to_thread(
                         self.trader.get_price, token_addr
                     )
@@ -169,9 +174,7 @@ class PositionManager:
                 f"Tx: `{result['tx_hash']}`"
             )
         else:
-            await self.notify(
-                f"⚠️ Ошибка TP1 для *{pos.symbol}*: {result['reason']}"
-            )
+            await self._handle_sell_failure(pos, result["reason"])
 
     async def _close_full(self, pos: Position, pnl_pct: float, reason: str, sell_price: float = 0.0):
         """Sell all remaining tokens."""
@@ -194,6 +197,30 @@ class PositionManager:
                 self.on_close(pos, pnl_pct, reason, sell_price)
             self.remove(pos.token_address)
         else:
+            await self._handle_sell_failure(pos, result["reason"])
+
+    async def _handle_sell_failure(self, pos: Position, reason: str):
+        """Track consecutive sell failures; mark position stuck after 5 attempts."""
+        MAX_FAILURES = 5
+        pos.sell_failures += 1
+        self._save()
+        log.warning(f"Sell failure #{pos.sell_failures} for {pos.symbol}: {reason}")
+
+        if pos.sell_failures >= MAX_FAILURES:
+            pos.stuck = True
+            self._save()
+            log.error(f"{pos.symbol} marked STUCK after {MAX_FAILURES} sell failures")
             await self.notify(
-                f"⚠️ Ошибка закрытия *{pos.symbol}*: {result['reason']}"
+                f"🚫 *{pos.symbol}* — продажа невозможна\n\n"
+                f"Продажа отклонена контрактом *{MAX_FAILURES} раз подряд*.\n"
+                f"Скорее всего это *honeypot* — токен можно купить, но нельзя продать.\n\n"
+                f"Бот прекратил попытки.\n"
+                f"Попробуй продать вручную на PancakeSwap (slippage 99%):\n"
+                f"pancakeswap.finance → Swap → вставь адрес:\n"
+                f"`{pos.token_address}`"
+            )
+        else:
+            await self.notify(
+                f"⚠️ Ошибка продажи *{pos.symbol}* ({pos.sell_failures}/{MAX_FAILURES}): "
+                f"{reason}"
             )
