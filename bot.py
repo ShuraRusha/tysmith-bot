@@ -1403,12 +1403,18 @@ async def _daily_report():
 
 # Distributed lock on shared /data volume — prevents two Railway containers
 # from running simultaneously during blue-green deploys.
-# Old instance refreshes the lock every LOCK_REFRESH_SEC seconds.
-# New instance waits up to LOCK_WAIT_SEC for the old one to stop, then takes over.
-DIST_LOCK_FILE     = os.path.join(DATA_DIR, "tysmith.lock")
-LOCK_EXPIRY_SEC    = 25   # lock is stale if not refreshed for this long
-LOCK_REFRESH_SEC   = 10   # how often the running instance refreshes its lock
-LOCK_WAIT_SEC      = 40   # how long new instance waits for old one to release
+#
+# Protocol:
+#   1. New instance waits until the lock is stale (old instance stopped refreshing).
+#   2. New instance writes its own hostname into the lock file and starts.
+#   3. Old instance's _lock_refresher detects a foreign hostname in the lock →
+#      gracefully shuts itself down (Telegram polling stop + sys.exit).
+#
+# This guarantees only ONE instance processes Telegram updates at any time.
+DIST_LOCK_FILE   = os.path.join(DATA_DIR, "tysmith.lock")
+LOCK_EXPIRY_SEC  = 20   # lock considered stale if not refreshed within this time
+LOCK_REFRESH_SEC = 7    # how often the running instance refreshes its lock
+LOCK_WAIT_SEC    = 45   # how long new instance waits before force-taking the lock
 
 
 def _read_lock() -> dict:
@@ -1461,10 +1467,38 @@ def _release_distributed_lock():
         pass
 
 
-async def _lock_refresher():
-    """Keep the distributed lock alive while the bot is running."""
+async def _lock_refresher(app):
+    """
+    Keep the distributed lock alive.
+
+    On every refresh cycle, read the lock file first.
+    If another instance (different hostname) has written a fresh lock,
+    that means a new deployment took over → gracefully shut this instance down.
+    This prevents the double-bot problem during Railway blue-green deploys.
+    """
+    my_host = socket.gethostname()
     while True:
         await asyncio.sleep(LOCK_REFRESH_SEC)
+
+        data      = _read_lock()
+        lock_host = data.get("host", "")
+        lock_age  = time.time() - data.get("ts", 0)
+
+        if lock_host and lock_host != my_host and lock_age < LOCK_EXPIRY_SEC:
+            # A newer instance has taken the lock — we are the old one, must exit.
+            log.warning(
+                f"Lock taken by new instance ({lock_host}) — "
+                f"this instance ({my_host}) is shutting down to avoid duplication"
+            )
+            try:
+                await app.updater.stop()
+                await app.stop()
+                await app.shutdown()
+            except Exception as e:
+                log.error(f"Shutdown error: {e}")
+            finally:
+                sys.exit(0)
+
         _write_lock()
 
 
@@ -1504,7 +1538,7 @@ async def main():
     asyncio.create_task(watch_pairs(config.BSC_WS_RPC, on_pair_found))
     asyncio.create_task(_cleanup_pending())
     asyncio.create_task(_daily_report())
-    asyncio.create_task(_lock_refresher())
+    asyncio.create_task(_lock_refresher(app))
 
     # Restore open positions from disk (survive restarts/redeploys)
     restored = pos_manager.load()
