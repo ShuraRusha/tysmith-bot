@@ -45,7 +45,7 @@ BUY_MIN_BNB        = float(os.getenv("BUY_MIN_BNB",        "0.02")) # skip trade
 BUY_MAX_BNB        = float(os.getenv("BUY_MAX_BNB",        "0.5"))  # hard cap per trade
 GAS_RESERVE_BNB    = float(os.getenv("GAS_RESERVE_BNB",    "0.015"))# always keep in wallet
 
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "10000"))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "50000"))  # raised: pool liquidity floor
 MAX_BUY_TAX       = float(os.getenv("MAX_BUY_TAX",       "5"))
 MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "5"))
 
@@ -83,7 +83,21 @@ AUTO_BUY           = os.getenv("AUTO_BUY",           "false").lower() == "true"
 MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "0"))  # 0 = auto formula
 
 # ── Safety filters ────────────────────────────────────────────────────────────
-TOP_HOLDER_MAX_PCT = float(os.getenv("TOP_HOLDER_MAX_PCT", "30"))  # reject if single wallet > X%
+TOP_HOLDER_MAX_PCT   = float(os.getenv("TOP_HOLDER_MAX_PCT",   "30"))  # reject if single wallet > X%
+MAX_TOP10_HOLDER_PCT = float(os.getenv("MAX_TOP10_HOLDER_PCT", "30"))  # top-10 combined (excl. DEX/locked) > X% → reject
+
+# ── Token quality filters ─────────────────────────────────────────────────────
+MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD",   "30000"))    # min market cap at buy time
+MIN_FDV_USD        = float(os.getenv("MIN_FDV_USD",          "200000"))   # min fully-diluted value
+MAX_FDV_USD        = float(os.getenv("MAX_FDV_USD",          "10000000")) # max FDV (avoid huge caps)
+MIN_VOLUME_5M_USD  = float(os.getenv("MIN_VOLUME_5M_USD",    "1000"))     # DexScreener 5-min volume
+MAX_TOKEN_AGE_DAYS = int(os.getenv("MAX_TOKEN_AGE_DAYS",     "30"))       # reject tokens older than this
+
+# ── Moon bag ──────────────────────────────────────────────────────────────────
+# When trade size >= MOON_BAG_MIN_USD, keep MOON_BAG_PCT% of tokens as a
+# long-term hold that is NOT sold at TP/SL — manual sell only (potential 100x).
+MOON_BAG_MIN_USD = float(os.getenv("MOON_BAG_MIN_USD", "100"))  # activate when trade >= $100
+MOON_BAG_PCT     = float(os.getenv("MOON_BAG_PCT",     "5"))    # % of bought tokens to keep
 
 # ── BSC contract addresses ────────────────────────────────────────────────────
 WBNB  = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"

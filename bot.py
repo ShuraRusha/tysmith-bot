@@ -119,6 +119,14 @@ def calculate_buy_amount(balance_bnb: float) -> float:
     return round(min(amount, config.BUY_MAX_BNB), 4)
 
 
+def _calc_moon_bag(tokens_received: int, buy_bnb: float, bnb_price: float) -> int:
+    """Return the number of raw tokens to reserve as a moon bag (not auto-sold).
+    Activated only when trade size >= MOON_BAG_MIN_USD. Returns 0 if disabled."""
+    if buy_bnb * bnb_price < config.MOON_BAG_MIN_USD:
+        return 0
+    return int(tokens_received * config.MOON_BAG_PCT / 100)
+
+
 # ── Bot state ─────────────────────────────────────────────────────────────────
 
 is_paused: bool = False
@@ -295,7 +303,13 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         token_address, pair_address, base_token, w3,
         config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
         wallet_address=trader.wallet,
-        require_goplus=is_auto,   # auto mode requires GoPlus for LP-lock check
+        require_goplus=is_auto,
+        min_market_cap_usd=config.MIN_MARKET_CAP_USD,
+        min_fdv_usd=config.MIN_FDV_USD,
+        max_fdv_usd=config.MAX_FDV_USD,
+        max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
+        min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
+        max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
     )
 
     if not result["ok"]:
@@ -318,11 +332,12 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
     if info["external_call"]: warnings.append("⚠️ External call в коде")
     warn_block = "\n".join(warnings) if warnings else "✅ Дополнительных угроз нет"
 
+    fdv_str = f" | FDV: ${info['fdv_usd']:,.0f}" if info.get("fdv_usd") else ""
     text = (
         f"🎯 *Новый токен прошёл все проверки*\n\n"
         f"🪙 *{info['name']}* (`{info['symbol']}`)\n"
         f"📄 `{token_address}`\n\n"
-        f"💧 Ликвидность: *${info['liquidity_usd']:,.0f}*\n"
+        f"💧 Ликвидность: *${info['liquidity_usd']:,.0f}*{fdv_str}\n"
         f"💸 Buy tax: *{info['buy_tax']:.1f}%*  |  Sell tax: *{info['sell_tax']:.1f}%*\n"
         f"👥 Холдеры: {info['holder_count']}\n\n"
         f"{warn_block}\n\n"
@@ -370,13 +385,15 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
             entry_price = price_before if price_before > 0 else (
                 buy_amount / (result["tokens_received"] / 10 ** result["decimals"])
             )
+            moon_bag = _calc_moon_bag(result["tokens_received"], buy_amount, bnb_price)
+            tradeable = result["tokens_received"] - moon_bag
             pos = Position(
                 token_address     = token_address,
                 symbol            = info["symbol"],
                 name              = info["name"],
                 pair_address      = pair_address,
                 buy_price_bnb     = entry_price,
-                tokens_amount     = result["tokens_received"],
+                tokens_amount     = tradeable,
                 decimals          = result["decimals"],
                 buy_bnb           = buy_amount,
                 take_profit_1     = config.TAKE_PROFIT_1,
@@ -386,10 +403,16 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
                 liquidity_usd     = info["liquidity_usd"],
                 buy_tax           = info["buy_tax"],
                 sell_tax          = info["sell_tax"],
+                moon_bag_tokens   = moon_bag,
             )
             pos_manager.add(pos)
             _record_buy(pos, result["tx_hash"])
             amount_fmt = result["tokens_received"] / 10 ** result["decimals"]
+            fdv_str = f" | FDV: ${info['fdv_usd']:,.0f}" if info.get("fdv_usd") else ""
+            moon_str = (
+                f"\n🌙 Moon bag: *{moon_bag / 10**result['decimals']:.2f} {info['symbol']}* "
+                f"({config.MOON_BAG_PCT:.0f}%) — не продаётся авто"
+            ) if moon_bag > 0 else ""
             await tg_send(
                 f"✅ *Куплено авто* — {info['symbol']}\n\n"
                 f"Получено: {amount_fmt:.4f} {info['symbol']}\n"
@@ -397,7 +420,8 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
                 f"Tx: `{result['tx_hash']}`\n\n"
                 f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}%  "
                 f"| Trailing: -{config.TRAILING_STOP_PCT}%  "
-                f"| SL: -{config.STOP_LOSS}%\n"
+                f"| SL: -{config.STOP_LOSS}%{fdv_str}"
+                f"{moon_str}\n"
                 f"Позиций открыто: {len(pos_manager.positions)}/{max_pos}"
             )
         else:
@@ -492,13 +516,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             entry_price = price_before if price_before > 0 else (
                 buy_amount / (result["tokens_received"] / 10 ** result["decimals"])
             )
+            info_bnb_price = token_info["info"].get("bnb_price", 0) or 0
+            moon_bag = _calc_moon_bag(result["tokens_received"], buy_amount, info_bnb_price)
+            tradeable = result["tokens_received"] - moon_bag
             pos = Position(
                 token_address      = token_address,
                 symbol             = sym,
                 name               = token_info["info"]["name"],
                 pair_address       = token_info["pair_address"],
                 buy_price_bnb      = entry_price,
-                tokens_amount      = result["tokens_received"],
+                tokens_amount      = tradeable,
                 decimals           = result["decimals"],
                 buy_bnb            = buy_amount,
                 take_profit_1      = config.TAKE_PROFIT_1,
@@ -508,19 +535,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 liquidity_usd      = token_info["info"]["liquidity_usd"],
                 buy_tax            = token_info["info"]["buy_tax"],
                 sell_tax           = token_info["info"]["sell_tax"],
+                moon_bag_tokens    = moon_bag,
             )
             pos_manager.add(pos)
             _record_buy(pos, result["tx_hash"])
 
             amount_fmt = result["tokens_received"] / 10 ** result["decimals"]
+            moon_str = (
+                f"\n🌙 Moon bag: *{moon_bag / 10**result['decimals']:.2f} {sym}* "
+                f"({config.MOON_BAG_PCT:.0f}%) — не продаётся авто"
+            ) if moon_bag > 0 else ""
             await query.edit_message_text(
                 f"✅ *Куплено!* — {sym}\n\n"
                 f"Получено: {amount_fmt:.4f} {sym}\n"
                 f"Цена входа: {entry_price:.8f} BNB\n"
                 f"Tx: `{result['tx_hash']}`\n\n"
                 f"TP1: +{config.TAKE_PROFIT_1}% → продать {config.TAKE_PROFIT_1_PCT:.0f}%\n"
-                f"Далее: trailing stop -{config.TRAILING_STOP_PCT}% от пика\n"
-                f"SL: -{config.STOP_LOSS}%",
+                f"Trailing stop: -{config.TRAILING_STOP_PCT}% от пика  |  SL: -{config.STOP_LOSS}%"
+                f"{moon_str}",
                 parse_mode=ParseMode.MARKDOWN,
             )
         else:

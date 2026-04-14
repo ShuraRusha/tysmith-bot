@@ -91,10 +91,14 @@ TRANSFER_ABI = [
 ]
 
 ERC20_ABI = [
-    {"inputs": [], "name": "name",     "outputs": [{"type": "string"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [], "name": "symbol",   "outputs": [{"type": "string"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [], "name": "decimals", "outputs": [{"type": "uint8"}],  "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "name",        "outputs": [{"type": "string"}],  "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "symbol",      "outputs": [{"type": "string"}],  "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "decimals",    "outputs": [{"type": "uint8"}],   "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "totalSupply", "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
 ]
+
+DEXSCREENER_URL     = "https://api.dexscreener.com/latest/dex/pairs/bsc"
+DEXSCREENER_TIMEOUT = 3.0
 
 # ── On-chain helpers ──────────────────────────────────────────────────────────
 
@@ -279,6 +283,53 @@ async def _honeypot_is_check(token_address: str) -> dict:
         return {"ok": True}
 
 
+async def _dexscreener_fetch(pair_address: str) -> dict | None:
+    """
+    Fetch DexScreener data for a pair.
+    Returns the pair dict or None if not indexed yet (brand-new pairs).
+    Fields used: volume.m5, fdv, marketCap, pairCreatedAt, liquidity.usd
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{DEXSCREENER_URL}/{pair_address}",
+                timeout=aiohttp.ClientTimeout(total=DEXSCREENER_TIMEOUT),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                body = await resp.json(content_type=None)
+        pairs = body.get("pairs") or []
+        return pairs[0] if pairs else None
+    except Exception as e:
+        log.debug(f"DexScreener unavailable for {pair_address}: {e}")
+        return None
+
+
+def _get_fdv_usd_sync(w3: Web3, token_address: str, bnb_price: float) -> float:
+    """
+    Calculate FDV (Fully Diluted Value) = totalSupply * pricePerToken_USD.
+    Uses on-chain totalSupply + router getAmountsOut for price.
+    Returns 0.0 on any error (fail-open — don't block on missing data).
+    """
+    try:
+        token_cs = Web3.to_checksum_address(token_address)
+        wbnb_cs  = Web3.to_checksum_address(WBNB)
+        token    = w3.eth.contract(address=token_cs, abi=ERC20_ABI)
+
+        decimals         = token.functions.decimals().call()
+        total_supply_raw = token.functions.totalSupply().call()
+        total_supply     = total_supply_raw / (10 ** decimals)
+
+        router  = w3.eth.contract(address=Web3.to_checksum_address(PANCAKE_ROUTER_V2), abi=ROUTER_ABI_PRICE)
+        amounts = router.functions.getAmountsOut(10 ** decimals, [token_cs, wbnb_cs]).call()
+        price_bnb = amounts[1] / 1e18
+
+        return total_supply * price_bnb * bnb_price
+    except Exception as e:
+        log.debug(f"FDV calc failed for {token_address}: {e}")
+        return 0.0
+
+
 async def _goplus_fetch(token_address: str) -> dict | None:
     """
     Fetch GoPlus data with a 1.5s timeout.
@@ -315,12 +366,18 @@ async def check_token(
     pair_address:  str,
     base_token:    str,
     w3:            Web3,
-    min_liquidity_usd:  float,
-    max_buy_tax:        float,
-    max_sell_tax:       float,
-    wallet_address:     str  = "0x0000000000000000000000000000000000000001",
-    require_goplus:     bool = False,   # True = skip token if GoPlus is down (auto mode)
-    lp_holder_max_pct:  float = 50.0,  # reject if any unlocked wallet holds >X% of LP
+    min_liquidity_usd:   float,
+    max_buy_tax:         float,
+    max_sell_tax:        float,
+    wallet_address:      str   = "0x0000000000000000000000000000000000000001",
+    require_goplus:      bool  = False,    # True = skip token if GoPlus is down (auto mode)
+    lp_holder_max_pct:   float = 50.0,    # reject if any unlocked wallet holds >X% of LP
+    min_market_cap_usd:  float = 30_000,
+    min_fdv_usd:         float = 200_000,
+    max_fdv_usd:         float = 10_000_000,
+    max_top10_holder_pct: float = 30.0,   # top-10 non-DEX/locked holders combined
+    min_volume_5m_usd:   float = 1_000,   # skip if DexScreener 5-min volume below this
+    max_token_age_days:  int   = 30,      # skip if pair is older than this
 ) -> dict:
     """
     Two-track security check running in parallel:
@@ -340,17 +397,14 @@ async def check_token(
     """
 
     # ── Run all checks in parallel ────────────────────────────────────────────
-    # sim_buy:     eth_call buy simulation  (~200ms)
-    # sim_sell:    eth_call sell simulation from pair  (~200ms)
-    # goplus:      GoPlus security API  (up to 3s)
-    # honeypot_is: honeypot.is sell simulation API  (up to 3s)
-    sim_buy_task  = asyncio.to_thread(_simulate_buy_sync,  w3, token_address, wallet_address)
-    sim_sell_task = asyncio.to_thread(_simulate_sell_sync, w3, token_address, pair_address)
-    goplus_task   = _goplus_fetch(token_address)
-    honeypot_task = _honeypot_is_check(token_address)
+    sim_buy_task   = asyncio.to_thread(_simulate_buy_sync,  w3, token_address, wallet_address)
+    sim_sell_task  = asyncio.to_thread(_simulate_sell_sync, w3, token_address, pair_address)
+    goplus_task    = _goplus_fetch(token_address)
+    honeypot_task  = _honeypot_is_check(token_address)
+    dexscreen_task = _dexscreener_fetch(pair_address)
 
-    sim_result, sell_sim, goplus_data, hp_result = await asyncio.gather(
-        sim_buy_task, sim_sell_task, goplus_task, honeypot_task
+    sim_result, sell_sim, goplus_data, hp_result, dex = await asyncio.gather(
+        sim_buy_task, sim_sell_task, goplus_task, honeypot_task, dexscreen_task
     )
 
     # ── Require GoPlus in auto mode ───────────────────────────────────────────
@@ -399,14 +453,16 @@ async def check_token(
         if sell_tax > max_sell_tax:
             return {"ok": False, "reason": f"Sell tax: {sell_tax:.1f}%"}
 
-        # Top-holder concentration (token holders)
-        for h in (goplus_data.get("holders") or [])[:5]:
-            pct  = float(h.get("percent", 0)) * 100
-            tag  = (h.get("tag") or "").lower()
-            if h.get("is_locked", 0) == 1 or any(s in tag for s in SAFE_HOLDER_TAGS):
-                continue
-            if pct > TOP_HOLDER_MAX_PCT:
-                return {"ok": False, "reason": f"Кит держит {pct:.1f}% токенов — риск дампа"}
+        # Top-10 combined holder concentration (excluding DEX pools, burned, locked)
+        combined_top10 = 0.0
+        for h in (goplus_data.get("holders") or [])[:10]:
+            pct      = float(h.get("percent", 0)) * 100
+            tag      = (h.get("tag") or "").lower()
+            is_safe  = h.get("is_locked", 0) == 1 or any(s in tag for s in SAFE_HOLDER_TAGS)
+            if not is_safe:
+                combined_top10 += pct
+        if combined_top10 > max_top10_holder_pct:
+            return {"ok": False, "reason": f"Топ-10 холдеров держат {combined_top10:.1f}% — риск скоординированного дампа"}
 
         # LP holder lock check — detect rug pull potential
         # If any single unlocked wallet holds >lp_holder_max_pct% of LP, devs can rug instantly.
@@ -445,7 +501,33 @@ async def check_token(
         _get_liquidity_usd_sync, w3, pair_address, base_token, bnb_price
     )
     if liquidity_usd < min_liquidity_usd:
-        return {"ok": False, "reason": f"Ликвидность: ${liquidity_usd:,.0f}"}
+        return {"ok": False, "reason": f"Ликвидность: ${liquidity_usd:,.0f} < ${min_liquidity_usd:,.0f}"}
+
+    # ── FDV / Market cap check (on-chain) ─────────────────────────────────────
+    fdv_usd = await asyncio.to_thread(_get_fdv_usd_sync, w3, token_address, bnb_price)
+    if fdv_usd > 0:
+        if fdv_usd < min_market_cap_usd:
+            return {"ok": False, "reason": f"Market cap: ${fdv_usd:,.0f} < ${min_market_cap_usd:,.0f}"}
+        if fdv_usd < min_fdv_usd:
+            return {"ok": False, "reason": f"FDV: ${fdv_usd:,.0f} < ${min_fdv_usd:,.0f}"}
+        if fdv_usd > max_fdv_usd:
+            return {"ok": False, "reason": f"FDV: ${fdv_usd:,.0f} > ${max_fdv_usd:,.0f} (слишком крупный)"}
+
+    # ── DexScreener: token age + 5-minute volume ──────────────────────────────
+    # These checks only apply when DexScreener has indexed the pair.
+    # Brand-new pairs (seconds old) are not yet indexed → checks skipped (fail-open).
+    if dex:
+        # Token age
+        created_at_ms = dex.get("pairCreatedAt") or 0
+        if created_at_ms:
+            age_days = (time.time() - created_at_ms / 1000) / 86400
+            if age_days > max_token_age_days:
+                return {"ok": False, "reason": f"Токен слишком старый: {age_days:.0f} дней (макс {max_token_age_days})"}
+
+        # 5-minute volume
+        vol_5m = float((dex.get("volume") or {}).get("m5") or 0)
+        if vol_5m > 0 and vol_5m < min_volume_5m_usd:
+            return {"ok": False, "reason": f"Объём за 5 мин: ${vol_5m:,.0f} < ${min_volume_5m_usd:,.0f}"}
 
     # ── Build info dict ───────────────────────────────────────────────────────
     if goplus_data:
@@ -465,6 +547,7 @@ async def check_token(
         "buy_tax":       buy_tax,
         "sell_tax":      sell_tax,
         "liquidity_usd": liquidity_usd,
+        "fdv_usd":       fdv_usd,
         "bnb_price":     bnb_price,
         "holder_count":  holder_count,
         "is_mintable":   bool(goplus_data and goplus_data.get("is_mintable")   == "1"),

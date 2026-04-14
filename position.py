@@ -30,6 +30,7 @@ class Position:
     buy_tax:          float = field(default=0.0)
     sell_tax:         float = field(default=0.0)
     opened_at:        float = field(default_factory=time.time)
+    moon_bag_tokens:  int   = field(default=0)    # tokens excluded from auto-sell (moon bag)
     # Runtime state
     tp1_done:         bool  = field(default=False)
     peak_price:       float = field(default=0.0)
