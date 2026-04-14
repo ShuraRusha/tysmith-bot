@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import sys
 import time
 from datetime import datetime
@@ -1077,26 +1078,71 @@ async def _daily_report():
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-PID_FILE = "/tmp/tysmith-bot.pid"  # tmp is fine for pid — resets on restart
+# Distributed lock on shared /data volume — prevents two Railway containers
+# from running simultaneously during blue-green deploys.
+# Old instance refreshes the lock every LOCK_REFRESH_SEC seconds.
+# New instance waits up to LOCK_WAIT_SEC for the old one to stop, then takes over.
+DIST_LOCK_FILE     = os.path.join(DATA_DIR, "tysmith.lock")
+LOCK_EXPIRY_SEC    = 25   # lock is stale if not refreshed for this long
+LOCK_REFRESH_SEC   = 10   # how often the running instance refreshes its lock
+LOCK_WAIT_SEC      = 40   # how long new instance waits for old one to release
 
-def _acquire_pid_lock():
-    """Exit if another instance is already running."""
-    if os.path.exists(PID_FILE):
-        try:
-            old_pid = int(open(PID_FILE).read().strip())
-            os.kill(old_pid, 0)
-            log.error(f"Бот уже запущен (PID {old_pid}). Выход.")
-            sys.exit(1)
-        except (ProcessLookupError, ValueError):
-            pass
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
 
-def _release_pid_lock():
+def _read_lock() -> dict:
     try:
-        os.remove(PID_FILE)
+        with open(DIST_LOCK_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _write_lock():
+    try:
+        with open(DIST_LOCK_FILE, "w") as f:
+            json.dump({
+                "ts":   time.time(),
+                "pid":  os.getpid(),
+                "host": socket.gethostname(),
+            }, f)
+    except Exception as e:
+        log.warning(f"Lock write failed: {e}")
+
+
+def _acquire_distributed_lock():
+    """
+    Block until we own the distributed lock or give up after LOCK_WAIT_SEC.
+    Railway starts a new container before stopping the old one, so we poll
+    until the old instance's lock expires (old instance stopped refreshing it).
+    """
+    deadline = time.time() + LOCK_WAIT_SEC
+    while time.time() < deadline:
+        data = _read_lock()
+        age  = time.time() - data.get("ts", 0)
+        host = data.get("host", "")
+        if age >= LOCK_EXPIRY_SEC or host == socket.gethostname():
+            # Lock is stale or belongs to us already → take it
+            _write_lock()
+            log.info(f"Distributed lock acquired (previous age={age:.0f}s, host={host})")
+            return
+        log.info(f"Waiting for previous instance to stop (lock age={age:.0f}s, host={host})…")
+        time.sleep(3)
+    # Timeout — take over anyway (better than not starting at all)
+    log.warning("Lock wait timed out — taking over")
+    _write_lock()
+
+
+def _release_distributed_lock():
+    try:
+        os.remove(DIST_LOCK_FILE)
     except FileNotFoundError:
         pass
+
+
+async def _lock_refresher():
+    """Keep the distributed lock alive while the bot is running."""
+    while True:
+        await asyncio.sleep(LOCK_REFRESH_SEC)
+        _write_lock()
 
 
 async def main():
@@ -1107,11 +1153,7 @@ async def main():
     app = Application.builder().token(config.BOT_TOKEN).build()
 
     # Drop any webhook that might be set — prevents conflict with polling.
-    # Brief sleep after delete_webhook gives the previous Railway instance time
-    # to receive a 409 Conflict and shut down, avoiding duplicate polling.
     await app.bot.delete_webhook(drop_pending_updates=True)
-    log.info("Webhook cleared — waiting 3s for previous instance to exit...")
-    await asyncio.sleep(3)
 
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_help))
@@ -1133,6 +1175,7 @@ async def main():
     asyncio.create_task(watch_pairs(config.BSC_WS_RPC, on_pair_found))
     asyncio.create_task(_cleanup_pending())
     asyncio.create_task(_daily_report())
+    asyncio.create_task(_lock_refresher())
 
     # Restore open positions from disk (survive restarts/redeploys)
     restored = pos_manager.load()
@@ -1182,12 +1225,12 @@ async def main():
         while True:
             await asyncio.sleep(60)
     except (KeyboardInterrupt, SystemExit):
-        _release_pid_lock()
+        _release_distributed_lock()
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
 
 
 if __name__ == "__main__":
-    _acquire_pid_lock()
+    _acquire_distributed_lock()
     asyncio.run(main())
