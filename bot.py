@@ -264,9 +264,12 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
             f"{warn_block}"
         )
 
-        approved = await asyncio.to_thread(trader.approve_token, token_address)
-        if not approved:
-            await tg_send(f"❌ Авто: не удалось одобрить *{info['symbol']}*")
+        approve_result = await asyncio.to_thread(trader.approve_token, token_address)
+        if not approve_result["ok"]:
+            await tg_send(
+                f"❌ Авто: не удалось одобрить *{info['symbol']}*\n"
+                f"`{approve_result['reason']}`"
+            )
             return
 
         price_before = await asyncio.to_thread(trader.get_price, token_address, base_token)
@@ -377,10 +380,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ Одобряю и покупаю *{sym}*...", parse_mode=ParseMode.MARKDOWN
         )
 
-        approved = await asyncio.to_thread(trader.approve_token, token_address)
-        if not approved:
+        approve_result = await asyncio.to_thread(trader.approve_token, token_address)
+        if not approve_result["ok"]:
             await query.edit_message_text(
-                f"❌ Не удалось одобрить контракт для {sym}. Пропускаем.",
+                f"❌ Не удалось одобрить *{sym}*\n`{approve_result['reason']}`",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return

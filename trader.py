@@ -1,5 +1,6 @@
 import time
 import logging
+import threading
 
 from web3 import Web3
 
@@ -94,6 +95,8 @@ class Trader:
         self.wallet         = self.account.address
         self.router         = w3.eth.contract(address=ROUTER_ADDRESS, abi=ROUTER_ABI)
         self.gas_multiplier = gas_multiplier
+        self._nonce_lock    = threading.Lock()
+        self._nonce_val     = None   # cached nonce, None = fetch fresh on first use
 
     # ── Gas helpers ──────────────────────────────────────────────────────────
 
@@ -108,7 +111,25 @@ class Trader:
         return int(self.w3.eth.gas_price * 1.1)
 
     def _nonce(self) -> int:
-        return self.w3.eth.get_transaction_count(self.wallet, "pending")
+        """
+        Thread-safe nonce manager.
+        Fetches from network on first call, then increments locally.
+        Resyncs from network if a transaction fails (call reset_nonce()).
+        Prevents nonce conflicts when multiple tokens are bought in parallel.
+        """
+        with self._nonce_lock:
+            if self._nonce_val is None:
+                self._nonce_val = self.w3.eth.get_transaction_count(
+                    self.wallet, "pending"
+                )
+            nonce = self._nonce_val
+            self._nonce_val += 1
+            return nonce
+
+    def reset_nonce(self):
+        """Force re-fetch nonce from network on next transaction (call after errors)."""
+        with self._nonce_lock:
+            self._nonce_val = None
 
     def _deadline(self) -> int:
         return int(time.time()) + TX_DEADLINE_SEC
@@ -141,31 +162,35 @@ class Trader:
 
     # ── Pre-approve router ────────────────────────────────────────────────────
 
-    def approve_token(self, token_address: str) -> bool:
-        """Approve PancakeSwap router to spend this token. Synchronous."""
+    def approve_token(self, token_address: str) -> dict:
+        """
+        Approve PancakeSwap router to spend this token. Synchronous.
+        Returns {"ok": True} or {"ok": False, "reason": "..."}
+        """
         try:
             token_address = Web3.to_checksum_address(token_address)
             token     = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
             allowance = token.functions.allowance(self.wallet, ROUTER_ADDRESS).call()
             if allowance > 0:
-                return True
+                return {"ok": True}
             approve_tx = token.functions.approve(
                 ROUTER_ADDRESS, 2 ** 256 - 1
             ).build_transaction({
                 "from":     self.wallet,
                 "gas":      config.GAS_LIMIT_APPROVE,
-                "gasPrice": self._gas_price_buy(),  # fast approve before buy
+                "gasPrice": self._gas_price_buy(),
                 "nonce":    self._nonce(),
                 "chainId":  56,
             })
             signed  = self.account.sign_transaction(approve_tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
             self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
-            log.info(f"Pre-approved {token_address}")
-            return True
+            log.info(f"Approved {token_address}")
+            return {"ok": True}
         except Exception as e:
             log.error(f"approve_token({token_address}): {e}")
-            return False
+            self.reset_nonce()
+            return {"ok": False, "reason": str(e)}
 
     # ── Buy ───────────────────────────────────────────────────────────────────
 
@@ -225,6 +250,7 @@ class Trader:
             }
         except Exception as e:
             log.error(f"buy({token_address}): {e}")
+            self.reset_nonce()
             return {"ok": False, "reason": str(e)}
 
     # ── Sell ──────────────────────────────────────────────────────────────────
@@ -290,4 +316,5 @@ class Trader:
 
         except Exception as e:
             log.error(f"sell({token_address}): {e}")
+            self.reset_nonce()
             return {"ok": False, "reason": str(e)}
