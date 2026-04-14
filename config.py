@@ -65,7 +65,7 @@ STOP_LOSS         = float(os.getenv("STOP_LOSS",         "20"))
 # Sniper-optimized: aggressive buy slippage (new tokens are volatile),
 # tighter sell slippage (selling into established pool)
 SLIPPAGE_BUY      = float(os.getenv("SLIPPAGE_BUY",     "12"))    # % — aggressive for new tokens
-SLIPPAGE_SELL     = float(os.getenv("SLIPPAGE_SELL",      "8"))    # % — tighter on exit
+SLIPPAGE_SELL     = float(os.getenv("SLIPPAGE_SELL",     "15"))    # % — wider to survive hidden taxes
 GAS_MULTIPLIER    = float(os.getenv("GAS_MULTIPLIER",    "1.5"))   # outbid other buyers on gas
 GAS_BUY_GWEI      = float(os.getenv("GAS_BUY_GWEI",      "0"))    # 0=auto | fixed gwei for buys
 GAS_LIMIT_BUY      = int(os.getenv("GAS_LIMIT_BUY",   "500000"))  # gas limit for buy txs

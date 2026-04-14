@@ -255,12 +255,16 @@ class Trader:
 
     # ── Sell ──────────────────────────────────────────────────────────────────
 
-    def sell(self, token_address: str, amount_tokens: int) -> dict:
+    def sell(self, token_address: str, amount_tokens: int,
+             slippage_pct: float = None) -> dict:
         """
         Sell exact token amount back to BNB via PancakeSwap V2.
-        Uses normal gas (no rush on exit).
+        On status=0 failure, automatically retries with 2x slippage.
         Synchronous — call via asyncio.to_thread from async code.
         """
+        if slippage_pct is None:
+            slippage_pct = SLIPPAGE_SELL
+
         try:
             token_address = Web3.to_checksum_address(token_address)
 
@@ -288,7 +292,7 @@ class Trader:
             amounts = self.router.functions.getAmountsOut(
                 amount_tokens, [token_address, WBNB_ADDRESS]
             ).call()
-            min_out = int(amounts[1] * (1 - SLIPPAGE_SELL / 100))
+            min_out = int(amounts[1] * (1 - slippage_pct / 100))
 
             tx = self.router.functions.swapExactTokensForETHSupportingFeeOnTransferTokens(
                 amount_tokens,
@@ -309,9 +313,14 @@ class Trader:
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
 
             if receipt.status != 1:
-                return {"ok": False, "reason": "Продажа отклонена сетью (status=0)"}
+                # Retry once with 2x slippage if not already retrying
+                if slippage_pct < 49:
+                    retry_slip = min(slippage_pct * 2, 49)
+                    log.warning(f"Sell status=0 at {slippage_pct}% slip, retrying at {retry_slip}%")
+                    return self.sell(token_address, amount_tokens, slippage_pct=retry_slip)
+                return {"ok": False, "reason": f"Продажа отклонена сетью (slip={slippage_pct:.0f}%)"}
 
-            log.info(f"Sell OK: {token_address}, tx={tx_hash.hex()}")
+            log.info(f"Sell OK: {token_address}, slippage={slippage_pct}%, tx={tx_hash.hex()}")
             return {"ok": True, "tx_hash": tx_hash.hex()}
 
         except Exception as e:
