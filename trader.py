@@ -327,3 +327,141 @@ class Trader:
             log.error(f"sell({token_address}): {e}")
             self.reset_nonce()
             return {"ok": False, "reason": str(e)}
+
+    # ── Sell with RBF gas escalation ─────────────────────────────────────────
+
+    def sell_escalating(self, token_address: str, amount_tokens: int) -> dict:
+        """
+        Sell with Replace-By-Fee gas escalation for stuck transactions.
+
+        Uses a single nonce across up to 3 attempts with increasing gas+slippage:
+          Attempt 1 (t=0):   gas*1.5  + SLIPPAGE_SELL%
+          Attempt 2 (t+15s): gas*3.0  + min(SLIPPAGE_SELL*2, 30%)
+          Attempt 3 (t+30s): GAS_SELL_MAX_GWEI + 49%
+
+        If a tx reverts (status=0), it's a contract-level reject (honeypot) —
+        escalating gas won't help, so we return failure immediately.
+        Synchronous — call via asyncio.to_thread from async code.
+        """
+        try:
+            token_address = Web3.to_checksum_address(token_address)
+
+            if amount_tokens <= 0:
+                return {"ok": False, "reason": "Нет токенов для продажи"}
+
+            token = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
+
+            # Ensure approval first (uses its own nonce)
+            allowance = token.functions.allowance(self.wallet, ROUTER_ADDRESS).call()
+            if allowance < amount_tokens:
+                approve_tx = token.functions.approve(
+                    ROUTER_ADDRESS, 2 ** 256 - 1
+                ).build_transaction({
+                    "from":     self.wallet,
+                    "gas":      config.GAS_LIMIT_APPROVE,
+                    "gasPrice": self._gas_price_buy(),
+                    "nonce":    self._nonce(),
+                    "chainId":  56,
+                })
+                signed  = self.account.sign_transaction(approve_tx)
+                tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
+                self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+                log.info(f"Approved {token_address}")
+
+            # Reserve ONE nonce for all RBF attempts
+            sell_nonce = self._nonce()
+            market_gas = int(self.w3.eth.gas_price)
+            max_gas    = max(
+                Web3.to_wei(config.GAS_SELL_MAX_GWEI, "gwei"),
+                int(market_gas * 5),
+            )
+
+            schedule = [
+                (int(market_gas * 1.5),  SLIPPAGE_SELL),
+                (int(market_gas * 3.0),  min(SLIPPAGE_SELL * 2, 30.0)),
+                (max_gas,                49.0),
+            ]
+
+            escalation_sec = config.GAS_SELL_ESCALATION_SEC
+            last_reason    = ""
+
+            for attempt, (gas_price, slippage) in enumerate(schedule):
+                try:
+                    amounts = self.router.functions.getAmountsOut(
+                        amount_tokens, [token_address, WBNB_ADDRESS]
+                    ).call()
+                    min_out = int(amounts[1] * (1 - slippage / 100))
+
+                    tx = self.router.functions \
+                        .swapExactTokensForETHSupportingFeeOnTransferTokens(
+                            amount_tokens,
+                            min_out,
+                            [token_address, WBNB_ADDRESS],
+                            self.wallet,
+                            self._deadline(),
+                        ).build_transaction({
+                            "from":     self.wallet,
+                            "gas":      config.GAS_LIMIT_SELL,
+                            "gasPrice": gas_price,
+                            "nonce":    sell_nonce,
+                            "chainId":  56,
+                        })
+
+                    signed = self.account.sign_transaction(tx)
+                    tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
+                    log.info(
+                        f"sell_escalating #{attempt+1}/3: {token_address}, "
+                        f"gas={gas_price/1e9:.1f}gwei, slip={slippage:.0f}%, "
+                        f"tx={tx_hash.hex()}"
+                    )
+
+                except Exception as send_err:
+                    err_msg = str(send_err).lower()
+                    # "nonce too low" means a previous RBF attempt was already mined
+                    if "nonce too low" in err_msg or "already known" in err_msg:
+                        log.info(f"sell_escalating #{attempt+1}: previous tx already mined")
+                        # Try to get receipt for latest known tx
+                        break
+                    log.warning(f"sell_escalating #{attempt+1} send error: {send_err}")
+                    last_reason = str(send_err)
+                    if attempt < 2:
+                        time.sleep(escalation_sec)
+                    continue
+
+                # Wait for confirmation with a timeout
+                wait_timeout = escalation_sec if attempt < 2 else 60
+                try:
+                    receipt = self.w3.eth.wait_for_transaction_receipt(
+                        tx_hash, timeout=wait_timeout
+                    )
+                    if receipt.status == 1:
+                        log.info(
+                            f"sell_escalating OK at attempt #{attempt+1}: "
+                            f"{token_address}, tx={tx_hash.hex()}"
+                        )
+                        return {"ok": True, "tx_hash": tx_hash.hex()}
+                    else:
+                        # status=0 = contract revert (honeypot), gas escalation won't help
+                        return {
+                            "ok": False,
+                            "reason": f"Продажа отклонена контрактом (slip={slippage:.0f}%)",
+                        }
+                except Exception:
+                    # Timeout — escalate to next level
+                    if attempt < 2:
+                        log.info(
+                            f"sell_escalating #{attempt+1} timeout after "
+                            f"{wait_timeout}s — escalating gas…"
+                        )
+                    else:
+                        return {
+                            "ok": False,
+                            "reason": "Таймаут продажи после 3 попыток эскалации газа",
+                        }
+
+            return {"ok": False, "reason": last_reason or "Продажа не выполнена"}
+
+        except Exception as e:
+            log.error(f"sell_escalating({token_address}): {e}")
+            self.reset_nonce()
+            return {"ok": False, "reason": str(e)}

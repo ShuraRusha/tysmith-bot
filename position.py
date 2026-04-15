@@ -184,7 +184,7 @@ class PositionManager:
         # Derive current price from pnl so _handle_sell_failure can record it
         sell_price = pos.buy_price_bnb * (1 + pnl_pct / 100) if pos.buy_price_bnb else 0.0
         result = await asyncio.to_thread(
-            self.trader.sell, pos.token_address, sell_amount
+            self.trader.sell_escalating, pos.token_address, sell_amount
         )
         if result["ok"]:
             pos.tp1_done      = True
@@ -203,7 +203,7 @@ class PositionManager:
     async def _close_full(self, pos: Position, pnl_pct: float, reason: str, sell_price: float = 0.0):
         """Sell all remaining tokens."""
         result = await asyncio.to_thread(
-            self.trader.sell, pos.token_address, pos.tokens_amount
+            self.trader.sell_escalating, pos.token_address, pos.tokens_amount
         )
         if result["ok"]:
             labels = {

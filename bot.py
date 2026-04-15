@@ -27,7 +27,7 @@ import config
 from analyzer import analyze_token, check_token, get_bnb_price
 from position import Position, PositionManager
 from trader import Trader
-from watcher import watch_pairs
+from watcher import watch_pairs, watch_pending_pairs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -412,6 +412,49 @@ def owner_only(fn):
     return wrapper
 
 
+# ── Mempool pre-analysis cache ────────────────────────────────────────────────
+# Stores results from mempool-detected pairs so on_pair_found can skip analysis.
+# Key: token_address (lowercase) → {"result": check_token result, "ts": time.time()}
+_mempool_cache: dict[str, dict] = {}
+_MEMPOOL_CACHE_TTL = 120  # seconds — discard stale pre-analysis results
+
+
+async def on_pending_pair_found(token_address: str, base_token: str, pair_address: str):
+    """
+    Called from mempool watcher when a pending createPair tx is detected.
+    Runs check_token immediately and caches the result.
+    When PairCreated event fires, on_pair_found picks up the cached result.
+    """
+    key = token_address.lower()
+    if key in _mempool_cache:
+        return  # already analyzing or analyzed
+
+    _mempool_cache[key] = {"result": None, "ts": time.time()}  # placeholder = "in progress"
+
+    try:
+        result = await check_token(
+            token_address, pair_address, base_token, w3,
+            config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
+            wallet_address=trader.wallet,
+            min_market_cap_usd=config.MIN_MARKET_CAP_USD,
+            min_fdv_usd=config.MIN_FDV_USD,
+            max_fdv_usd=config.MAX_FDV_USD,
+            max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
+            min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
+            max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
+            lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
+            min_holder_count=config.MIN_HOLDER_COUNT,
+            bscscan_api_key=config.BSCSCAN_API_KEY,
+            max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
+        )
+        _mempool_cache[key] = {"result": result, "ts": time.time()}
+        status = "OK" if result["ok"] else f"rejected: {result['reason']}"
+        log.info(f"Mempool pre-analysis done for {token_address[:10]}…: {status}")
+    except Exception as e:
+        log.warning(f"Mempool pre-analysis error for {token_address[:10]}…: {e}")
+        _mempool_cache.pop(key, None)
+
+
 # ── New pair handler ──────────────────────────────────────────────────────────
 
 async def on_pair_found(token_address: str, base_token: str, pair_address: str):
@@ -419,23 +462,29 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         log.info(f"Bot paused — skipping {token_address}")
         return
 
-    log.info(f"Analyzing: {token_address}")
-
-    result = await check_token(
-        token_address, pair_address, base_token, w3,
-        config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
-        wallet_address=trader.wallet,
-        min_market_cap_usd=config.MIN_MARKET_CAP_USD,
-        min_fdv_usd=config.MIN_FDV_USD,
-        max_fdv_usd=config.MAX_FDV_USD,
-        max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
-        min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
-        max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
-        lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
-        min_holder_count=config.MIN_HOLDER_COUNT,
-        bscscan_api_key=config.BSCSCAN_API_KEY,
-        max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
-    )
+    # Check mempool pre-analysis cache first
+    key = token_address.lower()
+    cached = _mempool_cache.pop(key, None)
+    if cached and cached.get("result") and (time.time() - cached["ts"]) < _MEMPOOL_CACHE_TTL:
+        result = cached["result"]
+        log.info(f"Using mempool pre-analysis cache for {token_address[:10]}…")
+    else:
+        log.info(f"Analyzing: {token_address}")
+        result = await check_token(
+            token_address, pair_address, base_token, w3,
+            config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
+            wallet_address=trader.wallet,
+            min_market_cap_usd=config.MIN_MARKET_CAP_USD,
+            min_fdv_usd=config.MIN_FDV_USD,
+            max_fdv_usd=config.MAX_FDV_USD,
+            max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
+            min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
+            max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
+            lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
+            min_holder_count=config.MIN_HOLDER_COUNT,
+            bscscan_api_key=config.BSCSCAN_API_KEY,
+            max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
+        )
 
     if not result["ok"]:
         log.info(f"Rejected {token_address}: {result['reason']}")
@@ -1748,6 +1797,10 @@ async def main():
     asyncio.create_task(watch_pairs(config.BSC_WS_RPC, on_pair_found))
     asyncio.create_task(_cleanup_pending())
     asyncio.create_task(_daily_report())
+
+    if config.MEMPOOL_ENABLED:
+        asyncio.create_task(watch_pending_pairs(config.BSC_WS_RPC, on_pending_pair_found))
+        log.info("Mempool monitoring enabled — pre-analyzing pending createPair txs")
     asyncio.create_task(_lock_refresher(app))
 
     # Restore open positions from disk (survive restarts/redeploys)
