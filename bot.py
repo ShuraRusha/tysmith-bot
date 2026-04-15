@@ -67,6 +67,14 @@ trader = Trader(w3, config.PRIVATE_KEY, config.GAS_MULTIPLIER)
 # cleaned up after user action (buy or skip)
 pending: dict[str, dict] = {}
 
+# ── Delayed re-check queue ────────────────────────────────────────────────────
+# When GoPlus hasn't indexed a token yet, we don't throw it away.
+# Instead we queue it and re-analyze at 5, 10, 20 minutes after first detection.
+# By then GoPlus has usually finished indexing and the token gets a fair check.
+_recheck_queue: dict[str, dict] = {}          # pair_address → metadata
+_RECHECK_INTERVALS = [5 * 60, 10 * 60, 20 * 60]  # seconds after first detection
+_RECHECK_MAX_AGE   = 25 * 60                   # drop from queue after 25 minutes
+
 # ── Dynamic position sizing ───────────────────────────────────────────────────
 
 def calculate_max_positions(balance_bnb: float) -> int:
@@ -140,7 +148,7 @@ trade_history: list[dict] = []
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 5
+SETTINGS_VERSION = 6
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -220,6 +228,12 @@ def _load_settings():
             config.LP_HOLDER_MAX_PCT = 30.0
             config.MIN_HOLDER_COUNT  = 50
             log.info("Settings migration v4→v5: LP_HOLDER_MAX_PCT=30, MIN_HOLDER_COUNT=50")
+
+        # Migration v5 → v6: MIN_HOLDER_COUNT 50 → 25
+        # New tokens take 15-30 min to reach 50 holders; 25 is realistic threshold
+        if saved_version < 6:
+            config.MIN_HOLDER_COUNT = 25
+            log.info("Settings migration v5→v6: MIN_HOLDER_COUNT 50 → 25")
 
         # Restore bot mode
         if "__is_auto" in data:
@@ -369,7 +383,25 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
     )
 
     if not result["ok"]:
-        log.info(f"Rejected {token_address}: {result['reason']}")
+        reason = result["reason"]
+        # GoPlus / LP not indexed yet — queue for delayed recheck instead of dropping
+        _GOPLUS_PENDING_REASONS = (
+            "GoPlus недоступен",
+            "LP-холдеры не проиндексированы",
+        )
+        if is_auto and any(r in reason for r in _GOPLUS_PENDING_REASONS):
+            if pair_address not in _recheck_queue:
+                _recheck_queue[pair_address] = {
+                    "token":      token_address,
+                    "base":       base_token,
+                    "first_seen": time.time(),
+                }
+                log.info(
+                    f"GoPlus pending for {token_address[:10]}… — "
+                    f"queued for recheck at 5/10/20 min"
+                )
+        else:
+            log.info(f"Rejected {token_address}: {reason}")
         return
 
     info      = result["info"]
@@ -1345,6 +1377,38 @@ async def _do_analyze(update, raw_address: str):
     await wait_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
+# ── Background: delayed re-check worker ──────────────────────────────────────
+
+async def _recheck_worker():
+    """
+    Re-analyze pairs that were skipped because GoPlus hadn't indexed them yet.
+    Fires at 5, 10, and 20 minutes after first detection.
+    If GoPlus still doesn't index the token within 25 minutes, the pair is dropped.
+    """
+    while True:
+        await asyncio.sleep(60)   # scan queue every minute
+        if is_paused:
+            continue
+        now = time.time()
+        for pair_addr, meta in list(_recheck_queue.items()):
+            age = now - meta["first_seen"]
+            if age > _RECHECK_MAX_AGE:
+                _recheck_queue.pop(pair_addr, None)
+                log.debug(f"Recheck expired for {meta['token'][:10]}… ({age/60:.0f}m old)")
+                continue
+            for i, interval in enumerate(_RECHECK_INTERVALS):
+                done_key = f"done_{i}"
+                if not meta.get(done_key) and age >= interval:
+                    meta[done_key] = True
+                    log.info(
+                        f"Recheck #{i+1} for {meta['token'][:10]}… "
+                        f"({age/60:.0f}m after detection)"
+                    )
+                    asyncio.create_task(
+                        on_pair_found(meta["token"], meta["base"], pair_addr)
+                    )
+
+
 # ── Background: remove expired pending alerts ────────────────────────────────
 
 async def _cleanup_pending():
@@ -1537,6 +1601,7 @@ async def main():
     asyncio.create_task(pos_manager.monitor())
     asyncio.create_task(watch_pairs(config.BSC_WS_RPC, on_pair_found))
     asyncio.create_task(_cleanup_pending())
+    asyncio.create_task(_recheck_worker())
     asyncio.create_task(_daily_report())
     asyncio.create_task(_lock_refresher(app))
 
