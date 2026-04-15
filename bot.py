@@ -22,6 +22,7 @@ from telegram.ext import (
 from web3 import Web3
 from web3.middleware import geth_poa_middleware
 
+import blacklist
 import config
 from analyzer import analyze_token, check_token, get_bnb_price
 from position import Position, PositionManager
@@ -66,14 +67,6 @@ trader = Trader(w3, config.PRIVATE_KEY, config.GAS_MULTIPLIER)
 # callback_id (first 10 chars of token address) → token info
 # cleaned up after user action (buy or skip)
 pending: dict[str, dict] = {}
-
-# ── Delayed re-check queue ────────────────────────────────────────────────────
-# When GoPlus hasn't indexed a token yet, we don't throw it away.
-# Instead we queue it and re-analyze at 5, 10, 20 minutes after first detection.
-# By then GoPlus has usually finished indexing and the token gets a fair check.
-_recheck_queue: dict[str, dict] = {}          # pair_address → metadata
-_RECHECK_INTERVALS = [5 * 60, 10 * 60, 20 * 60]  # seconds after first detection
-_RECHECK_MAX_AGE   = 25 * 60                   # drop from queue after 25 minutes
 
 # ── Dynamic position sizing ───────────────────────────────────────────────────
 
@@ -296,6 +289,15 @@ def _record_buy(pos: Position, tx_hash: str):
 
 def _record_trade(pos: Position, pnl_pct: float, reason: str, sell_price: float = 0.0):
     """Close a trade record. Updates the matching open entry if it exists."""
+    # Auto-blacklist deployer when a token is confirmed stuck (honeypot)
+    if reason == "Honeypot" and pos.deployer_address:
+        was_new = blacklist.add(
+            pos.deployer_address,
+            reason=f"Honeypot: {pos.symbol} ({pos.token_address[:10]}…)",
+        )
+        if was_new:
+            log.warning(f"Deployer {pos.deployer_address[:10]}… auto-blacklisted after {pos.symbol} honeypot")
+
     pnl_bnb  = round(pos.buy_bnb * pnl_pct / 100, 6)
     hold_sec = int(time.time() - pos.opened_at)
     hold_min = hold_sec // 60
@@ -378,7 +380,6 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         token_address, pair_address, base_token, w3,
         config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
         wallet_address=trader.wallet,
-        require_goplus=is_auto,
         min_market_cap_usd=config.MIN_MARKET_CAP_USD,
         min_fdv_usd=config.MIN_FDV_USD,
         max_fdv_usd=config.MAX_FDV_USD,
@@ -392,25 +393,7 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
     )
 
     if not result["ok"]:
-        reason = result["reason"]
-        # GoPlus / LP not indexed yet — queue for delayed recheck instead of dropping
-        _GOPLUS_PENDING_REASONS = (
-            "GoPlus недоступен",
-            "LP-холдеры не проиндексированы",
-        )
-        if is_auto and any(r in reason for r in _GOPLUS_PENDING_REASONS):
-            if pair_address not in _recheck_queue:
-                _recheck_queue[pair_address] = {
-                    "token":      token_address,
-                    "base":       base_token,
-                    "first_seen": time.time(),
-                }
-                log.info(
-                    f"GoPlus pending for {token_address[:10]}… — "
-                    f"queued for recheck at 5/10/20 min"
-                )
-        else:
-            log.info(f"Rejected {token_address}: {reason}")
+        log.info(f"Rejected {token_address}: {result['reason']}")
         return
 
     info      = result["info"]
@@ -501,6 +484,7 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
                 buy_tax           = info["buy_tax"],
                 sell_tax          = info["sell_tax"],
                 moon_bag_tokens   = moon_bag,
+                deployer_address  = info.get("deployer") or "",
             )
             pos_manager.add(pos)
             _record_buy(pos, result["tx_hash"])
@@ -633,6 +617,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 buy_tax            = token_info["info"]["buy_tax"],
                 sell_tax           = token_info["info"]["sell_tax"],
                 moon_bag_tokens    = moon_bag,
+                deployer_address   = token_info["info"].get("deployer") or "",
             )
             pos_manager.add(pos)
             _record_buy(pos, result["tx_hash"])
@@ -1422,36 +1407,68 @@ async def _do_analyze(update, raw_address: str):
     await wait_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
-# ── Background: delayed re-check worker ──────────────────────────────────────
+# ── Deployer blacklist commands ──────────────────────────────────────────────
 
-async def _recheck_worker():
+@owner_only
+async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Re-analyze pairs that were skipped because GoPlus hadn't indexed them yet.
-    Fires at 5, 10, and 20 minutes after first detection.
-    If GoPlus still doesn't index the token within 25 minutes, the pair is dropped.
+    Manage the deployer blacklist.
+      /blacklist          — show list
+      /blacklist add 0x…  — add deployer
+      /blacklist remove 0x… — remove deployer
     """
-    while True:
-        await asyncio.sleep(60)   # scan queue every minute
-        if is_paused:
-            continue
-        now = time.time()
-        for pair_addr, meta in list(_recheck_queue.items()):
-            age = now - meta["first_seen"]
-            if age > _RECHECK_MAX_AGE:
-                _recheck_queue.pop(pair_addr, None)
-                log.debug(f"Recheck expired for {meta['token'][:10]}… ({age/60:.0f}m old)")
-                continue
-            for i, interval in enumerate(_RECHECK_INTERVALS):
-                done_key = f"done_{i}"
-                if not meta.get(done_key) and age >= interval:
-                    meta[done_key] = True
-                    log.info(
-                        f"Recheck #{i+1} for {meta['token'][:10]}… "
-                        f"({age/60:.0f}m after detection)"
-                    )
-                    asyncio.create_task(
-                        on_pair_found(meta["token"], meta["base"], pair_addr)
-                    )
+    args = context.args or []
+
+    # /blacklist (no args) — show current list
+    if not args:
+        bl = blacklist.get_all()
+        if not bl:
+            await update.message.reply_text("📋 Чёрный список деплоеров пуст.")
+            return
+        lines = []
+        for addr, info in bl.items():
+            short = addr[:6] + "…" + addr[-4:]
+            reason = info.get("reason") or "—"
+            hits = info.get("hits", 1)
+            lines.append(f"`{short}` | {hits}x | {reason}")
+        text = f"🚫 *Чёрный список деплоеров* ({len(bl)}):\n\n" + "\n".join(lines)
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    action = args[0].lower()
+
+    # /blacklist add 0x...
+    if action == "add" and len(args) >= 2:
+        addr = args[1].strip()
+        if not Web3.is_address(addr):
+            await update.message.reply_text("❌ Некорректный адрес.")
+            return
+        reason = " ".join(args[2:]) if len(args) > 2 else "добавлен вручную"
+        was_new = blacklist.add(addr, reason=reason)
+        status = "✅ Добавлен" if was_new else "⚠️ Уже в списке (счётчик обновлён)"
+        await update.message.reply_text(
+            f"{status}: `{addr[:10]}…`\nПричина: {reason}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # /blacklist remove 0x...
+    if action in ("remove", "del", "rm") and len(args) >= 2:
+        addr = args[1].strip()
+        removed = blacklist.remove(addr)
+        if removed:
+            await update.message.reply_text(f"✅ Удалён из чёрного списка: `{addr[:10]}…`", parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text("❌ Адрес не найден в чёрном списке.")
+        return
+
+    await update.message.reply_text(
+        "❓ Использование:\n"
+        "`/blacklist` — показать список\n"
+        "`/blacklist add 0x…` — добавить\n"
+        "`/blacklist remove 0x…` — удалить",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 # ── Background: remove expired pending alerts ────────────────────────────────
@@ -1614,6 +1631,7 @@ async def _lock_refresher(app):
 async def main():
     _load_history()
     _load_settings()
+    blacklist.load()
     log.info("Sniper Bot starting...")
 
     app = Application.builder().token(config.BOT_TOKEN).build()
@@ -1632,6 +1650,7 @@ async def main():
     app.add_handler(CommandHandler("history",   cmd_history))
     app.add_handler(CommandHandler("set",       cmd_set))
     app.add_handler(CommandHandler("analyze",   cmd_analyze))
+    app.add_handler(CommandHandler("blacklist", cmd_blacklist))
     app.add_handler(CallbackQueryHandler(handle_callback))
     # Handle plain token addresses sent as messages (0x... 42 chars)
     app.add_handler(MessageHandler(
@@ -1646,7 +1665,6 @@ async def main():
     asyncio.create_task(pos_manager.monitor())
     asyncio.create_task(watch_pairs(config.BSC_WS_RPC, on_pair_found))
     asyncio.create_task(_cleanup_pending())
-    asyncio.create_task(_recheck_worker())
     asyncio.create_task(_daily_report())
     asyncio.create_task(_lock_refresher(app))
 

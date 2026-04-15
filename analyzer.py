@@ -5,6 +5,7 @@ import time
 import aiohttp
 from web3 import Web3
 
+import blacklist
 from config import WBNB, BUSD, USDT, PANCAKE_FACTORY_V2, PANCAKE_ROUTER_V2, TOP_HOLDER_MAX_PCT
 
 log = logging.getLogger(__name__)
@@ -112,6 +113,24 @@ FACTORY_ABI = [
         "type": "function",
     }
 ]
+
+LP_ABI = [
+    {"inputs": [],                                                    "name": "totalSupply", "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "owner", "type": "address"}],               "name": "balanceOf",   "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
+]
+
+# keccak256("Transfer(address,address,uint256)") — standard ERC-20 Transfer topic
+_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+_ZERO_TOPIC     = "0x0000000000000000000000000000000000000000000000000000000000000000"
+
+# Known LP locker contract addresses on BSC (lowercase) — safe to hold large LP %
+_SAFE_LP_HOLDERS = {
+    "0x000000000000000000000000000000000000dead",   # burn
+    "0xc765bddb93b0d1c1a88282ba0fa6b2d00e3e0c83",   # Unicrypt BSC
+    "0x407993575c91ce7643a4d4ccacc9a98c36ee1bb",   # PinkSale
+    "0xe2fe530c047f2d85298b07d9333c05737f1435fb",   # Team Finance
+    "0xa5e0829caced8ffdd4de3c43696c57f7d7a678ff",   # DxLock
+}
 
 # ── On-chain helpers ──────────────────────────────────────────────────────────
 
@@ -255,6 +274,77 @@ def _simulate_buy_sync(w3: Web3, token_address: str, wallet_address: str) -> dic
         return {"ok": True}
 
 
+def _check_lp_onchain_sync(
+    w3: Web3, pair_address: str, lp_holder_max_pct: float
+) -> dict:
+    """
+    On-chain LP holder concentration check — works without GoPlus.
+
+    Method:
+      1. Get LP totalSupply (pair contract = LP token)
+      2. Scan Transfer-from-zero (mint) events in the last 1000 blocks
+         to find who received LP tokens initially
+      3. Check each recipient's current LP balance
+      4. Reject if any non-safe address holds > lp_holder_max_pct% of supply
+
+    For freshly created pairs this is highly accurate:
+    - Unlocker LP stays with the deployer → caught immediately
+    - Locked LP is in a locker contract → in _SAFE_LP_HOLDERS or balance < threshold
+
+    Returns {"ok": True} or {"ok": False, "reason": "..."}
+    Fails open on any RPC error to avoid blocking good tokens.
+    """
+    try:
+        pair_cs  = Web3.to_checksum_address(pair_address)
+        lp       = w3.eth.contract(address=pair_cs, abi=LP_ABI)
+        total    = lp.functions.totalSupply().call()
+
+        if total == 0:
+            return {"ok": True}  # liquidity not added yet — nothing to judge
+
+        current_block = w3.eth.block_number
+        from_block    = max(0, current_block - 1000)  # ~50 min of blocks
+
+        logs = w3.eth.get_logs({
+            "address":   pair_cs,
+            "topics":    [_TRANSFER_TOPIC, _ZERO_TOPIC],  # mint = Transfer from 0x0
+            "fromBlock": from_block,
+            "toBlock":   current_block,
+        })
+
+        seen: set[str] = set()
+        for log_entry in logs:
+            topics = log_entry.get("topics", [])
+            if len(topics) < 3:
+                continue
+            to_raw = topics[2]
+            holder = Web3.to_checksum_address("0x" + to_raw.hex()[-40:])
+            addr_l = holder.lower()
+
+            if addr_l in seen or addr_l in _SAFE_LP_HOLDERS:
+                continue
+            seen.add(addr_l)
+
+            balance = lp.functions.balanceOf(holder).call()
+            pct     = balance / total * 100
+
+            if pct > lp_holder_max_pct:
+                short = holder[:6] + "…" + holder[-4:]
+                return {
+                    "ok":     False,
+                    "reason": (
+                        f"Rug риск: {pct:.0f}% LP в одном кошельке ({short}) — "
+                        f"ликвидность не заблокирована"
+                    ),
+                }
+
+        return {"ok": True}
+
+    except Exception as e:
+        log.debug(f"LP on-chain check failed for {pair_address}: {e}")
+        return {"ok": True}  # fail-open — don't block on RPC errors
+
+
 # ── GoPlus fetch with short timeout ──────────────────────────────────────────
 
 async def _honeypot_is_check(
@@ -359,6 +449,17 @@ async def _check_deployer_bscscan(
             deployer = body["result"][0].get("contractCreator", "").lower()
             if not deployer:
                 return {"ok": True, "deployer": None}
+
+            # ── Blacklist check (instant, no extra API call) ──────────────────
+            if blacklist.is_blacklisted(deployer):
+                entry = blacklist.get_all().get(deployer, {})
+                reason = entry.get("reason") or "ранее помечен как скам"
+                hits   = entry.get("hits", 1)
+                return {
+                    "ok":      False,
+                    "reason":  f"Деплоер в чёрном списке ({hits}x): {reason}",
+                    "deployer": deployer,
+                }
 
             # ── Step 2: scan deployer tx history ─────────────────────────────
             cutoff = int(time.time()) - 30 * 86400
@@ -677,7 +778,6 @@ async def check_token(
     max_buy_tax:          float,
     max_sell_tax:         float,
     wallet_address:       str   = "0x0000000000000000000000000000000000000001",
-    require_goplus:       bool  = False,    # True = skip token if GoPlus is down (auto mode)
     lp_holder_max_pct:    float = 30.0,    # reject if any unlocked wallet holds >X% of LP
     min_market_cap_usd:   float = 30_000,
     min_fdv_usd:          float = 200_000,
@@ -685,7 +785,7 @@ async def check_token(
     max_top10_holder_pct: float = 30.0,   # top-10 non-DEX/locked holders combined
     min_volume_5m_usd:    float = 1_000,   # skip if DexScreener 5-min volume below this
     max_token_age_days:   int   = 30,      # skip if pair is older than this
-    min_holder_count:     int   = 50,      # min number of token holders (GoPlus)
+    min_holder_count:     int   = 25,      # min number of token holders (GoPlus)
     bscscan_api_key:      str   = "",      # BSCScan API key for deployer history check
     max_deployer_tokens_30d: int = 3,     # reject if deployer created >N contracts in 30 days
 ) -> dict:
@@ -706,42 +806,52 @@ async def check_token(
     If both pass         → merge results.
     """
 
-    # ── Run all checks in parallel ────────────────────────────────────────────
-    sim_buy_task      = asyncio.to_thread(_simulate_buy_sync,  w3, token_address, wallet_address)
-    sim_sell_task     = asyncio.to_thread(_simulate_sell_sync, w3, token_address, pair_address)
-    goplus_task       = _goplus_fetch(token_address)
-    honeypot_task     = _honeypot_is_check(token_address, max_buy_tax, max_sell_tax)
-    dexscreen_task    = _dexscreener_fetch(pair_address)
-    deployer_task     = _check_deployer_bscscan(token_address, bscscan_api_key, max_deployer_tokens_30d)
+    # ── All checks run in parallel ────────────────────────────────────────────
+    # GoPlus is included but NON-BLOCKING: if it times out or returns None,
+    # analysis continues using on-chain simulation + honeypot.is + LP on-chain.
+    # This lets us buy in the FIRST SECONDS of listing without waiting for GoPlus
+    # (GoPlus indexes new tokens only after 15-30 min).
+    sim_buy_task   = asyncio.to_thread(_simulate_buy_sync,    w3, token_address, wallet_address)
+    sim_sell_task  = asyncio.to_thread(_simulate_sell_sync,   w3, token_address, pair_address)
+    lp_onchain_task= asyncio.to_thread(_check_lp_onchain_sync, w3, pair_address, lp_holder_max_pct)
+    goplus_task    = _goplus_fetch(token_address)
+    honeypot_task  = _honeypot_is_check(token_address, max_buy_tax, max_sell_tax)
+    dexscreen_task = _dexscreener_fetch(pair_address)
+    deployer_task  = _check_deployer_bscscan(token_address, bscscan_api_key, max_deployer_tokens_30d)
 
-    sim_result, sell_sim, goplus_data, hp_result, dex, deployer_result = await asyncio.gather(
-        sim_buy_task, sim_sell_task, goplus_task, honeypot_task, dexscreen_task, deployer_task
+    (sim_result, sell_sim, lp_result,
+     goplus_data, hp_result, dex, deployer_result) = await asyncio.gather(
+        sim_buy_task, sim_sell_task, lp_onchain_task,
+        goplus_task, honeypot_task, dexscreen_task, deployer_task
     )
 
-    # ── Require GoPlus in auto mode ───────────────────────────────────────────
-    # Without GoPlus we can't check LP lock, taxes, or owner flags — too risky.
-    if require_goplus and goplus_data is None:
-        return {"ok": False, "reason": "GoPlus недоступен — пропуск в авто-режиме (LP-проверка невозможна)"}
+    # ── Fast blockers (instant, no GoPlus needed) ─────────────────────────────
 
-    # ── Track A: buy simulation ───────────────────────────────────────────────
+    # Buy simulation — catches: trading not enabled, honeypot on entry
     if not sim_result["ok"]:
         return {"ok": False, "reason": sim_result["reason"]}
 
-    # ── Track B: sell simulation (pair-based) ─────────────────────────────────
+    # Sell simulation (from pair) — catches: sell-blocking honeypots (FSOLon, SEDGon)
     if not sell_sim["ok"]:
         return {"ok": False, "reason": sell_sim["reason"]}
 
-    # ── Track C: honeypot.is + tax simulation ─────────────────────────────────
-    # honeypot.is simulates real buy+sell transactions and reports actual taxes.
-    # This check fires BEFORE GoPlus — it works on brand-new tokens immediately.
+    # honeypot.is — catches: honeypot + enforces buy/sell tax thresholds immediately
     if not hp_result["ok"]:
         return {"ok": False, "reason": hp_result["reason"]}
 
-    # ── Track D: deployer history ─────────────────────────────────────────────
+    # Deployer blacklist + serial deployer check (via BSCScan)
     if not deployer_result["ok"]:
         return {"ok": False, "reason": deployer_result["reason"]}
 
-    # ── Track B: GoPlus critical flags ────────────────────────────────────────
+    # On-chain LP holder check — replaces GoPlus LP lock check
+    # Works immediately for brand-new pairs, no external API needed
+    if not lp_result["ok"]:
+        return {"ok": False, "reason": lp_result["reason"]}
+
+    # ── GoPlus — supplementary, non-blocking ──────────────────────────────────
+    # GoPlus typically responds within 3s for indexed tokens.
+    # For brand-new tokens it returns None — we proceed anyway using on-chain data.
+    # When GoPlus IS available, we use it as an extra layer of validation.
     buy_tax  = 0.0
     sell_tax = 0.0
     warnings_from_goplus = []
@@ -766,11 +876,11 @@ async def check_token(
         buy_tax  = float(goplus_data.get("buy_tax")  or 0)
         sell_tax = float(goplus_data.get("sell_tax") or 0)
         if buy_tax > max_buy_tax:
-            return {"ok": False, "reason": f"Buy tax: {buy_tax:.1f}%"}
+            return {"ok": False, "reason": f"Buy tax (GoPlus): {buy_tax:.1f}%"}
         if sell_tax > max_sell_tax:
-            return {"ok": False, "reason": f"Sell tax: {sell_tax:.1f}%"}
+            return {"ok": False, "reason": f"Sell tax (GoPlus): {sell_tax:.1f}%"}
 
-        # Minimum holder count — filters out insider/bot-only tokens
+        # Minimum holder count
         raw_holders = goplus_data.get("holder_count")
         if raw_holders is not None:
             try:
@@ -781,46 +891,25 @@ async def check_token(
                         "reason": f"Холдеров слишком мало: {holder_count_int} < {min_holder_count}",
                     }
             except (ValueError, TypeError):
-                pass  # can't parse — don't block
+                pass
 
-        # Top-10 combined holder concentration (excluding DEX pools, burned, locked)
+        # Top-10 combined holder concentration
         combined_top10 = 0.0
         for h in (goplus_data.get("holders") or [])[:10]:
-            pct      = float(h.get("percent", 0)) * 100
-            tag      = (h.get("tag") or "").lower()
-            is_safe  = h.get("is_locked", 0) == 1 or any(s in tag for s in SAFE_HOLDER_TAGS)
+            pct     = float(h.get("percent", 0)) * 100
+            tag     = (h.get("tag") or "").lower()
+            is_safe = h.get("is_locked", 0) == 1 or any(s in tag for s in SAFE_HOLDER_TAGS)
             if not is_safe:
                 combined_top10 += pct
         if combined_top10 > max_top10_holder_pct:
             return {"ok": False, "reason": f"Топ-10 холдеров держат {combined_top10:.1f}% — риск скоординированного дампа"}
-
-        # LP holder lock check — detect rug pull potential
-        # If any single unlocked wallet holds >lp_holder_max_pct% of LP, devs can rug instantly.
-        lp_holders = goplus_data.get("lp_holders") or []
-        if lp_holders:
-            for lph in lp_holders[:10]:
-                lp_pct    = float(lph.get("percent", 0)) * 100
-                is_locked = lph.get("is_locked", 0) == 1
-                tag       = (lph.get("tag") or "").lower()
-                is_safe   = is_locked or any(s in tag for s in SAFE_HOLDER_TAGS)
-                if not is_safe and lp_pct > lp_holder_max_pct:
-                    return {
-                        "ok":     False,
-                        "reason": f"Rug риск: {lp_pct:.0f}% LP не заблокирован — девы могут слить ликвидность",
-                    }
-        else:
-            # LP data empty → GoPlus hasn't indexed it yet
-            if require_goplus:
-                return {"ok": False, "reason": "LP-холдеры не проиндексированы — rug-риск неизвестен, пропуск"}
-            warnings_from_goplus.append("⚠️ LP-холдеры не проиндексированы — rug-риск неизвестен")
 
         # Non-critical warnings
         if goplus_data.get("is_mintable")   == "1": warnings_from_goplus.append("⚠️ Mintable")
         if goplus_data.get("hidden_owner")  == "1": warnings_from_goplus.append("⚠️ Hidden owner")
         if goplus_data.get("is_proxy")      == "1": warnings_from_goplus.append("⚠️ Proxy контракт")
         if goplus_data.get("external_call") == "1": warnings_from_goplus.append("⚠️ External call")
-    else:
-        warnings_from_goplus.append("⚠️ GoPlus недоступен — только симуляция")
+    # GoPlus None = not yet indexed — perfectly normal for brand-new tokens, not a problem
 
     # ── Liquidity check ───────────────────────────────────────────────────────
     bnb_price = await get_bnb_price(w3)
@@ -872,19 +961,21 @@ async def check_token(
         holder_count = "?"
 
     info = {
-        "name":          name,
-        "symbol":        symbol,
-        "buy_tax":       buy_tax,
-        "sell_tax":      sell_tax,
-        "liquidity_usd": liquidity_usd,
-        "fdv_usd":       fdv_usd,
-        "bnb_price":     bnb_price,
-        "holder_count":  holder_count,
-        "is_mintable":   bool(goplus_data and goplus_data.get("is_mintable")   == "1"),
-        "hidden_owner":  bool(goplus_data and goplus_data.get("hidden_owner")  == "1"),
-        "is_proxy":      bool(goplus_data and goplus_data.get("is_proxy")      == "1"),
-        "external_call": bool(goplus_data and goplus_data.get("external_call") == "1"),
-        "goplus_ok":     goplus_data is not None,
+        "name":           name,
+        "symbol":         symbol,
+        "buy_tax":        buy_tax,
+        "sell_tax":       sell_tax,
+        "liquidity_usd":  liquidity_usd,
+        "fdv_usd":        fdv_usd,
+        "bnb_price":      bnb_price,
+        "holder_count":   holder_count,
+        "is_mintable":    bool(goplus_data and goplus_data.get("is_mintable")   == "1"),
+        "hidden_owner":   bool(goplus_data and goplus_data.get("hidden_owner")  == "1"),
+        "is_proxy":       bool(goplus_data and goplus_data.get("is_proxy")      == "1"),
+        "external_call":  bool(goplus_data and goplus_data.get("external_call") == "1"),
+        "goplus_ok":      goplus_data is not None,
         "extra_warnings": warnings_from_goplus,
+        # Deployer info — used by bot.py to auto-blacklist on honeypot
+        "deployer":       deployer_result.get("deployer"),
     }
     return {"ok": True, "info": info}

@@ -80,6 +80,9 @@ TX_DEADLINE_SEC   = int(os.getenv("TX_DEADLINE_SEC",     "30"))    # short deadl
 BSCSCAN_API_KEY          = os.getenv("BSCSCAN_API_KEY", "")
 MAX_DEPLOYER_TOKENS_30D  = int(os.getenv("MAX_DEPLOYER_TOKENS_30D", "3"))  # >N contracts/30d = serial scammer
 
+# ── Position monitoring ──────────────────────────────────────────────────────
+MONITOR_INTERVAL_SEC = float(os.getenv("MONITOR_INTERVAL_SEC", "1"))  # price check frequency (was 5s, now 1s for memecoins)
+
 # ── Bot behaviour ─────────────────────────────────────────────────────────────
 MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS",     "3"))    # manual mode cap
 PENDING_TTL       = int(os.getenv("PENDING_TTL",       "60"))   # seconds before alert expires

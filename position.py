@@ -5,6 +5,8 @@ import os
 import time
 from dataclasses import asdict, dataclass, field
 
+import config
+
 log = logging.getLogger(__name__)
 
 _DATA_DIR      = os.getenv("DATA_DIR", "/data")
@@ -31,6 +33,7 @@ class Position:
     sell_tax:         float = field(default=0.0)
     opened_at:        float = field(default_factory=time.time)
     moon_bag_tokens:  int   = field(default=0)    # tokens excluded from auto-sell (moon bag)
+    deployer_address: str   = field(default="")  # deployer wallet — auto-blacklisted on honeypot
     # Runtime state
     tp1_done:         bool  = field(default=False)
     peak_price:       float = field(default=0.0)
@@ -115,7 +118,7 @@ class PositionManager:
             • drop from peak >= TRAILING_STOP_PCT → full sell (lock remaining gains)
         """
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(config.MONITOR_INTERVAL_SEC)
             for token_addr in list(self.positions):
                 pos = self.positions.get(token_addr)
                 if not pos:
