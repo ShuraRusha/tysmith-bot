@@ -737,6 +737,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Анализ токенов*\n"
         "/analyze 0x... — полный анализ токена по адресу\n"
         "_(или просто пришли адрес контракта — бот проанализирует автоматически)_\n\n"
+        "*Чёрный список деплоеров*\n"
+        "/blacklist — список заблокированных деплоеров\n"
+        "/blacklist add 0x... — добавить деплоера вручную\n"
+        "/blacklist remove 0x... — удалить из списка\n\n"
         "*Статистика*\n"
         "/stats — полная статистика (win rate, PnL, breakdown)\n"
         "/stats today — только сегодня\n"
@@ -1692,9 +1696,11 @@ async def main():
     stuck_count  = sum(1 for p in pos_manager.get_all() if p.stuck)
 
     log.info(f"Ready. Wallet: {trader.wallet}")
+    bl_count    = blacklist.count()
+    bl_note     = f" | 🚫 Blacklist: {bl_count}" if bl_count else ""
     startup_msg = (
         "🚀 *Sniper Bot запущен*\n"
-        "Слежу за новыми парами на PancakeSwap V2 (BSC)...\n\n"
+        f"Слежу за новыми парами на PancakeSwap V2 (BSC)...{bl_note}\n\n"
         "/help — все команды"
     )
     if active_count:
