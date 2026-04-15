@@ -141,7 +141,7 @@ trade_history: list[dict] = []
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 7
+SETTINGS_VERSION = 8
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -165,8 +165,12 @@ def _save_settings():
         data["__is_auto"]   = is_auto
         data["__is_paused"] = is_paused
         data["__version"]   = SETTINGS_VERSION
-        with open(SETTINGS_FILE, "w") as f:
+        tmp_path = SETTINGS_FILE + ".tmp"
+        with open(tmp_path, "w") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, SETTINGS_FILE)
     except Exception as e:
         log.error(f"Failed to save settings: {e}")
 
@@ -235,6 +239,23 @@ def _load_settings():
             config.MAX_DEPLOYER_TOKENS_30D = 3
             log.info("Settings migration v6→v7: MAX_DEPLOYER_TOKENS_30D = 3")
 
+        # Migration v7 → v8: loosen entry filters for more trade volume
+        #   MIN_LIQUIDITY_USD   30k → 20k  (safe for small trades, +50% more pairs)
+        #   MIN_FDV_USD         300k → 150k (catch earlier-stage tokens)
+        #   MIN_MARKET_CAP_USD  50k → 20k   (more opportunities)
+        #   MIN_VOLUME_5M_USD   3k → 1k     (new tokens have low initial volume)
+        #   MIN_HOLDER_COUNT    25 → 10      (new tokens accumulate holders slowly)
+        if saved_version < 8:
+            config.MIN_LIQUIDITY_USD = 20_000.0
+            config.MIN_FDV_USD       = 150_000.0
+            config.MIN_MARKET_CAP_USD = 20_000.0
+            config.MIN_VOLUME_5M_USD = 1_000.0
+            config.MIN_HOLDER_COUNT  = 10
+            log.info(
+                "Settings migration v7→v8: loosened entry filters "
+                "(liq=20k, fdv=150k, mcap=20k, vol5m=1k, holders=10)"
+            )
+
         # Restore bot mode
         if "__is_auto" in data:
             is_auto = bool(data["__is_auto"])
@@ -264,10 +285,34 @@ def _load_history():
 
 def _save_history():
     try:
-        with open(TRADE_LOG_FILE, "w") as f:
+        # Atomic write: write to temp file first, then rename.
+        # Prevents corrupted reads if the process is killed mid-write (Railway deploy).
+        tmp_path = TRADE_LOG_FILE + ".tmp"
+        with open(tmp_path, "w") as f:
             json.dump(trade_history[-500:], f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, TRADE_LOG_FILE)
     except Exception as e:
         log.error(f"Failed to save trade history: {e}")
+
+
+def _ensure_history_loaded():
+    """Reload trade history from disk if in-memory list is empty.
+    Handles the case where a Railway redeploy starts a new instance before
+    the old one's in-memory data was available."""
+    global trade_history
+    if trade_history:
+        return
+    try:
+        if os.path.exists(TRADE_LOG_FILE):
+            with open(TRADE_LOG_FILE) as f:
+                data = json.load(f)
+            if data:
+                trade_history = data
+                log.info(f"History hot-reloaded from disk: {len(data)} entries")
+    except Exception as e:
+        log.warning(f"History hot-reload failed: {e}")
 
 
 def _record_buy(pos: Position, tx_hash: str):
@@ -925,6 +970,7 @@ def _build_stats_report(trades: list[dict], bnb_price: float, title: str = "Ст
 
 @owner_only
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _ensure_history_loaded()
     # Stats only count closed trades
     closed = [t for t in trade_history if t.get("status") == "closed" or "pnl_pct" in t]
     open_  = [t for t in trade_history if t.get("status") == "open"]
@@ -966,6 +1012,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _ensure_history_loaded()
     if not trade_history:
         await update.message.reply_text("📜 История пустая — покупок ещё не было.")
         return
@@ -1491,18 +1538,48 @@ async def _cleanup_pending():
 
 # ── Background: daily report at 23:00 MSK ────────────────────────────────────
 
+DAILY_REPORT_SENTINEL = os.path.join(DATA_DIR, "tysmith_last_report_date.txt")
+
+
+def _daily_report_already_sent(today: str) -> bool:
+    """Check sentinel file to prevent duplicate reports during Railway redeploys."""
+    try:
+        if os.path.exists(DAILY_REPORT_SENTINEL):
+            with open(DAILY_REPORT_SENTINEL) as f:
+                return f.read().strip() == today
+    except Exception:
+        pass
+    return False
+
+
+def _mark_daily_report_sent(today: str):
+    try:
+        with open(DAILY_REPORT_SENTINEL, "w") as f:
+            f.write(today)
+    except Exception as e:
+        log.warning(f"Failed to write daily report sentinel: {e}")
+
+
 async def _daily_report():
     """Send trading summary every day at 23:00 Moscow time."""
     while True:
         now_msk   = datetime.now(MOSCOW_TZ)
         target    = now_msk.replace(hour=23, minute=0, second=0, microsecond=0)
         if now_msk >= target:
-            target = target.replace(day=target.day + 1)
+            from datetime import timedelta
+            target = target + timedelta(days=1)
         wait_sec  = (target - now_msk).total_seconds()
         log.info(f"Daily report scheduled in {wait_sec/3600:.1f}h")
         await asyncio.sleep(wait_sec)
 
         today  = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
+
+        # Prevent duplicate reports when two instances overlap during deploy
+        if _daily_report_already_sent(today):
+            log.info(f"Daily report for {today} already sent — skipping")
+            continue
+
+        _ensure_history_loaded()
         trades = [t for t in trade_history if t.get("closed_at", "").startswith(today)]
 
         try:
@@ -1512,7 +1589,6 @@ async def _daily_report():
             if trades:
                 report = _build_stats_report(trades, bnb_price,
                                              f"Итоги дня {today}")
-                pnl_bnb = sum(t["pnl_bnb"] for t in trades)
                 await tg_send(
                     f"{report}\n\n"
                     f"💼 Баланс кошелька: *{balance:.4f} BNB* (~${balance * bnb_price:.0f})\n"
@@ -1525,6 +1601,8 @@ async def _daily_report():
                     f"💼 Баланс: *{balance:.4f} BNB* (~${balance * bnb_price:.0f})\n"
                     f"Открытых позиций: *{len(pos_manager.positions)}*"
                 )
+
+            _mark_daily_report_sent(today)
         except Exception as e:
             log.error(f"Daily report error: {e}")
 

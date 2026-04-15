@@ -45,7 +45,7 @@ BUY_MIN_BNB        = float(os.getenv("BUY_MIN_BNB",        "0.02")) # skip trade
 BUY_MAX_BNB        = float(os.getenv("BUY_MAX_BNB",        "0.5"))  # hard cap per trade
 GAS_RESERVE_BNB    = float(os.getenv("GAS_RESERVE_BNB",    "0.015"))# always keep in wallet
 
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "30000"))  # raised: pool liquidity floor
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "20000"))  # pool liquidity floor ($20k — safe for 0.04 BNB trades)
 MAX_BUY_TAX       = float(os.getenv("MAX_BUY_TAX",       "5"))
 MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "5"))
 
@@ -81,7 +81,20 @@ BSCSCAN_API_KEY          = os.getenv("BSCSCAN_API_KEY", "")
 MAX_DEPLOYER_TOKENS_30D  = int(os.getenv("MAX_DEPLOYER_TOKENS_30D", "3"))  # >N contracts/30d = serial scammer
 
 # ── Position monitoring ──────────────────────────────────────────────────────
-MONITOR_INTERVAL_SEC = float(os.getenv("MONITOR_INTERVAL_SEC", "1"))  # price check frequency (was 5s, now 1s for memecoins)
+MONITOR_INTERVAL_SEC    = float(os.getenv("MONITOR_INTERVAL_SEC",    "1"))   # price check frequency (was 5s, now 1s for memecoins)
+
+# ── Gas escalation on sell (RBF — Replace-By-Fee) ────────────────────────────
+# If a sell tx is stuck in the mempool, the bot resends it with the same nonce
+# but a higher gas price every GAS_SELL_ESCALATION_SEC seconds.
+# Schedule: gas*1.5 → gas*3.0 → GAS_SELL_MAX_GWEI (3 attempts total).
+GAS_SELL_MAX_GWEI       = float(os.getenv("GAS_SELL_MAX_GWEI",      "30"))   # gwei ceiling for 3rd escalation attempt
+GAS_SELL_ESCALATION_SEC = float(os.getenv("GAS_SELL_ESCALATION_SEC", "15"))  # seconds between escalation attempts
+
+# ── Mempool monitoring ────────────────────────────────────────────────────────
+# Subscribe to newPendingTransactions to detect createPair() calls before
+# they are mined. Pre-analysis caches results so on_pair_found has 0 delay.
+# Disabled by default — requires a node with full mempool access (e.g. NodeReal).
+MEMPOOL_ENABLED = os.getenv("MEMPOOL_ENABLED", "false").lower() == "true"
 
 # ── Bot behaviour ─────────────────────────────────────────────────────────────
 MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS",     "3"))    # manual mode cap
@@ -96,13 +109,13 @@ MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "0"))  # 0 = auto formu
 TOP_HOLDER_MAX_PCT   = float(os.getenv("TOP_HOLDER_MAX_PCT",   "30"))  # reject if single wallet > X%
 MAX_TOP10_HOLDER_PCT = float(os.getenv("MAX_TOP10_HOLDER_PCT", "30"))  # top-10 combined (excl. DEX/locked) > X% → reject
 LP_HOLDER_MAX_PCT    = float(os.getenv("LP_HOLDER_MAX_PCT",    "30"))  # reject if any unlocked wallet holds >X% of LP
-MIN_HOLDER_COUNT     = int(os.getenv("MIN_HOLDER_COUNT",       "25"))  # min token holder count (GoPlus)
+MIN_HOLDER_COUNT     = int(os.getenv("MIN_HOLDER_COUNT",       "10"))  # min token holder count (lowered — new tokens accumulate holders slowly)
 
 # ── Token quality filters ─────────────────────────────────────────────────────
-MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD",   "50000"))    # min market cap at buy time
-MIN_FDV_USD        = float(os.getenv("MIN_FDV_USD",          "300000"))   # min fully-diluted value
+MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD",   "20000"))    # min market cap at buy time
+MIN_FDV_USD        = float(os.getenv("MIN_FDV_USD",          "150000"))   # min fully-diluted value
 MAX_FDV_USD        = float(os.getenv("MAX_FDV_USD",          "10000000")) # max FDV (avoid huge caps)
-MIN_VOLUME_5M_USD  = float(os.getenv("MIN_VOLUME_5M_USD",    "3000"))     # DexScreener 5-min volume
+MIN_VOLUME_5M_USD  = float(os.getenv("MIN_VOLUME_5M_USD",    "1000"))     # DexScreener 5-min volume (lowered for fresh tokens)
 MAX_TOKEN_AGE_DAYS = int(os.getenv("MAX_TOKEN_AGE_DAYS",     "7"))        # reject tokens older than this
 
 # ── Moon bag ──────────────────────────────────────────────────────────────────
