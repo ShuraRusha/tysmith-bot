@@ -73,6 +73,13 @@ GAS_LIMIT_SELL     = int(os.getenv("GAS_LIMIT_SELL",   "350000"))  # gas limit f
 GAS_LIMIT_APPROVE  = int(os.getenv("GAS_LIMIT_APPROVE","80000"))   # gas limit for approve txs
 TX_DEADLINE_SEC   = int(os.getenv("TX_DEADLINE_SEC",     "30"))    # short deadline — reject stale
 
+# ── External APIs ────────────────────────────────────────────────────────────
+# BSCScan API key — used for deployer history check (serial scam deployer detection)
+# Free tier at bscscan.com/myapikey — 5 req/s, enough for this bot
+# If not set, deployer check is skipped (fail-open).
+BSCSCAN_API_KEY          = os.getenv("BSCSCAN_API_KEY", "")
+MAX_DEPLOYER_TOKENS_30D  = int(os.getenv("MAX_DEPLOYER_TOKENS_30D", "3"))  # >N contracts/30d = serial scammer
+
 # ── Bot behaviour ─────────────────────────────────────────────────────────────
 MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS",     "3"))    # manual mode cap
 PENDING_TTL       = int(os.getenv("PENDING_TTL",       "60"))   # seconds before alert expires

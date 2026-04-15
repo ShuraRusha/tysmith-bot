@@ -148,7 +148,7 @@ trade_history: list[dict] = []
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 6
+SETTINGS_VERSION = 7
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -161,6 +161,8 @@ _PERSISTENT_SETTINGS = [
     "MOON_BAG_MIN_USD", "MOON_BAG_PCT",
     # Added in v5:
     "LP_HOLDER_MAX_PCT", "MIN_HOLDER_COUNT",
+    # Added in v7:
+    "MAX_DEPLOYER_TOKENS_30D",
 ]
 
 
@@ -234,6 +236,11 @@ def _load_settings():
         if saved_version < 6:
             config.MIN_HOLDER_COUNT = 25
             log.info("Settings migration v5→v6: MIN_HOLDER_COUNT 50 → 25")
+
+        # Migration v6 → v7: MAX_DEPLOYER_TOKENS_30D added (deployer history check)
+        if saved_version < 7:
+            config.MAX_DEPLOYER_TOKENS_30D = 3
+            log.info("Settings migration v6→v7: MAX_DEPLOYER_TOKENS_30D = 3")
 
         # Restore bot mode
         if "__is_auto" in data:
@@ -380,6 +387,8 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
         lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
         min_holder_count=config.MIN_HOLDER_COUNT,
+        bscscan_api_key=config.BSCSCAN_API_KEY,
+        max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
     )
 
     if not result["ok"]:
@@ -1171,7 +1180,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Холдеры: {config.MIN_HOLDER_COUNT} мин\n"
         f"Топ-10 холдеры: {config.MAX_TOP10_HOLDER_PCT:.0f}% макс\n"
         f"LP незаблокирован: {config.LP_HOLDER_MAX_PCT:.0f}% макс на кошелёк\n"
-        f"Max tax: {config.MAX_BUY_TAX}% buy / {config.MAX_SELL_TAX}% sell\n\n"
+        f"Max tax: {config.MAX_BUY_TAX}% buy / {config.MAX_SELL_TAX}% sell\n"
+        f"Деплоер: макс {config.MAX_DEPLOYER_TOKENS_30D} контракт(ов) за 30 дн. "
+        f"{'✅ BSCScan OK' if config.BSCSCAN_API_KEY else '⚠️ BSCScan API ключ не задан'}\n\n"
         f"*Исполнение:*\n"
         f"Gas buy: {gas_mode}\n"
         f"Slip buy/sell: {config.SLIPPAGE_BUY}%/{config.SLIPPAGE_SELL}%\n"
@@ -1209,13 +1220,16 @@ async def _do_analyze(update, raw_address: str):
         return
 
     token_address = Web3.to_checksum_address(raw_address)
+    api_sources = "GoPlus + Honeypot.is + DexScreener + on-chain"
+    if config.BSCSCAN_API_KEY:
+        api_sources += " + BSCScan деплоер"
     wait_msg = await update.message.reply_text(
-        "🔍 *Анализирую токен...*\n_(GoPlus + Honeypot.is + DexScreener + on-chain)_",
+        f"🔍 *Анализирую токен...*\n_({api_sources})_",
         parse_mode=ParseMode.MARKDOWN,
     )
 
     try:
-        data = await analyze_token(token_address, w3, trader.wallet)
+        data = await analyze_token(token_address, w3, trader.wallet, bscscan_api_key=config.BSCSCAN_API_KEY)
     except Exception as e:
         log.error(f"analyze_token error: {e}")
         await wait_msg.edit_text(f"❌ Ошибка анализа: {e}")
@@ -1257,9 +1271,19 @@ async def _do_analyze(update, raw_address: str):
         vol_str  = "нет данных"
         vol_icon = "❓"
 
-    # Tax lines
-    tax_buy_ok  = data["buy_tax"]  <= config.MAX_BUY_TAX
-    tax_sell_ok = data["sell_tax"] <= config.MAX_SELL_TAX
+    # Tax lines — prefer GoPlus data; fall back to honeypot.is simulation
+    gp_buy_tax   = data["buy_tax"]
+    gp_sell_tax  = data["sell_tax"]
+    hp_buy_tax   = data.get("hp_buy_tax")
+    hp_sell_tax  = data.get("hp_sell_tax")
+
+    # Use GoPlus if indexed, else honeypot.is simulation (works at listing time)
+    eff_buy_tax  = gp_buy_tax  if data["goplus_ok"] and gp_buy_tax  > 0 else (hp_buy_tax  or 0.0)
+    eff_sell_tax = gp_sell_tax if data["goplus_ok"] and gp_sell_tax > 0 else (hp_sell_tax or 0.0)
+    tax_source   = "(GoPlus)" if data["goplus_ok"] else ("(honeypot.is симуляция)" if hp_buy_tax is not None else "(нет данных)")
+
+    tax_buy_ok  = eff_buy_tax  <= config.MAX_BUY_TAX
+    tax_sell_ok = eff_sell_tax <= config.MAX_SELL_TAX
     tax_buy_icon  = "✅" if tax_buy_ok  else "❌"
     tax_sell_icon = "✅" if tax_sell_ok else "❌"
 
@@ -1314,13 +1338,15 @@ async def _do_analyze(update, raw_address: str):
     if vol_icon == "❌":
         red_flags.append(f"объём за 5м слишком низкий ({vol_str})")
     if not tax_buy_ok:
-        red_flags.append(f"buy tax {data['buy_tax']:.1f}% > {config.MAX_BUY_TAX}%")
+        red_flags.append(f"buy tax {eff_buy_tax:.1f}% > {config.MAX_BUY_TAX}% {tax_source}")
     if not tax_sell_ok:
-        red_flags.append(f"sell tax {data['sell_tax']:.1f}% > {config.MAX_SELL_TAX}%")
+        red_flags.append(f"sell tax {eff_sell_tax:.1f}% > {config.MAX_SELL_TAX}% {tax_source}")
     if not top10_ok:
         red_flags.append(f"топ-10 холдеры {top10:.1f}% > {config.MAX_TOP10_HOLDER_PCT}%")
     if lp_locked is False:
         red_flags.append("ликвидность не заблокирована")
+    if not data.get("deployer_ok", True):
+        red_flags.append(data.get("deployer_reason", "серийный деплоер"))
 
     caution_flags = list(data["warnings"])
     if lp_locked is None:
@@ -1345,6 +1371,24 @@ async def _do_analyze(update, raw_address: str):
         "BUSD" if data["base_token"].lower() == config.BUSD.lower() else "USDT"
     )
 
+    # Deployer block
+    deployer_addr = data.get("deployer")
+    deploy_count  = data.get("deploy_count_30d")
+    if deployer_addr:
+        deployer_short = deployer_addr[:6] + "…" + deployer_addr[-4:]
+        if deploy_count is not None:
+            deploy_icon = "❌" if not data.get("deployer_ok", True) else ("⚠️" if deploy_count >= 2 else "✅")
+            deployer_line = (
+                f"{deploy_icon} Деплоер: `{deployer_short}` "
+                f"| {deploy_count} контракт(ов) за 30 дн."
+            )
+        else:
+            deployer_line = f"✅ Деплоер: `{deployer_short}`"
+    elif config.BSCSCAN_API_KEY:
+        deployer_line = "❓ Деплоер: не найден в BSCScan"
+    else:
+        deployer_line = "➖ Деплоер: BSCScan API ключ не задан"
+
     text = (
         f"🔍 *Анализ токена*\n\n"
         f"🪙 *{name}* (`{sym}`)\n"
@@ -1356,9 +1400,9 @@ async def _do_analyze(update, raw_address: str):
         f"{age_icon} Возраст пары: *{age_str}* (макс {config.MAX_TOKEN_AGE_DAYS} дн.)\n"
         f"{vol_icon} Объём 5м: *{vol_str}* (мин ${config.MIN_VOLUME_5M_USD:,.0f})\n"
         f"👥 Холдеры: *{data['holder_count']}*\n\n"
-        f"*💸 Налоги:*\n"
-        f"{tax_buy_icon} Buy tax: *{data['buy_tax']:.1f}%* (макс {config.MAX_BUY_TAX}%)\n"
-        f"{tax_sell_icon} Sell tax: *{data['sell_tax']:.1f}%* (макс {config.MAX_SELL_TAX}%)\n\n"
+        f"*💸 Налоги* {tax_source}:\n"
+        f"{tax_buy_icon} Buy tax: *{eff_buy_tax:.1f}%* (макс {config.MAX_BUY_TAX}%)\n"
+        f"{tax_sell_icon} Sell tax: *{eff_sell_tax:.1f}%* (макс {config.MAX_SELL_TAX}%)\n\n"
         f"*🧑‍🤝‍🧑 Концентрация:*\n"
         f"{top10_icon} Топ-10 холдеры: *{top10:.1f}%* (макс {config.MAX_TOP10_HOLDER_PCT}%)\n"
         f"🔒 LP: {lp_str}\n\n"
@@ -1366,7 +1410,8 @@ async def _do_analyze(update, raw_address: str):
         f"{buy_sim_icon} Buy-симуляция: {'OK' if data['sim_buy_ok'] else data['sim_buy_reason']}\n"
         f"{sell_sim_icon} Sell-симуляция: {'OK' if data['sim_sell_ok'] else data['sim_sell_reason']}\n"
         f"{hp_icon} Honeypot.is: {'OK' if data['hp_is_ok'] else data['hp_is_reason']}\n"
-        f"{gp_icon} GoPlus: {'доступен' if data['goplus_ok'] else 'недоступен'}\n\n"
+        f"{gp_icon} GoPlus: {'доступен' if data['goplus_ok'] else 'недоступен'}\n"
+        f"{deployer_line}\n\n"
         f"*🚩 GoPlus флаги:*\n{flags_block}\n\n"
         f"*⚠️ Предупреждения:*\n{warn_block}\n\n"
         f"━━━━━━━━━━━━━━\n"

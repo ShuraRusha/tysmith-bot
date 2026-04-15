@@ -257,13 +257,21 @@ def _simulate_buy_sync(w3: Web3, token_address: str, wallet_address: str) -> dic
 
 # ── GoPlus fetch with short timeout ──────────────────────────────────────────
 
-async def _honeypot_is_check(token_address: str) -> dict:
+async def _honeypot_is_check(
+    token_address: str,
+    max_buy_tax: float = 999.0,
+    max_sell_tax: float = 999.0,
+) -> dict:
     """
     Check honeypot.is — simulates BOTH buy and sell transactions on-chain.
-    This is the most reliable sell-honeypot detector available for free.
+    This is the most reliable sell-honeypot + tax detector for brand-new tokens.
 
-    Returns {"ok": False, "reason": "..."} if honeypot detected.
-    Returns {"ok": True} if safe OR if API is unavailable (fail-open).
+    When max_buy_tax / max_sell_tax are passed, the function also enforces tax
+    thresholds using the simulation result — works BEFORE GoPlus indexes the token.
+
+    Returns {"ok": False, "reason": "..."}   if honeypot or tax too high.
+    Returns {"ok": True, "buy_tax": float, "sell_tax": float}  if safe.
+    Returns {"ok": True, "buy_tax": None, "sell_tax": None}    if API unavailable (fail-open).
     """
     try:
         async with aiohttp.ClientSession() as session:
@@ -273,7 +281,7 @@ async def _honeypot_is_check(token_address: str) -> dict:
                 timeout=aiohttp.ClientTimeout(total=HONEYPOT_TIMEOUT),
             ) as resp:
                 if resp.status != 200:
-                    return {"ok": True}
+                    return {"ok": True, "buy_tax": None, "sell_tax": None}
                 body = await resp.json(content_type=None)
 
         hp = body.get("honeypotResult", {}) or {}
@@ -282,18 +290,124 @@ async def _honeypot_is_check(token_address: str) -> dict:
             return {"ok": False, "reason": f"Honeypot обнаружен: {reason}"}
 
         sim = body.get("simulationResult", {}) or {}
+        buy_tax  = float(sim.get("buyTax",  0) or 0)
         sell_tax = float(sim.get("sellTax", 0) or 0)
+
+        # Hard honeypot threshold (very high tax = sell is effectively blocked)
         if sell_tax > 49:
             return {"ok": False, "reason": f"Sell tax {sell_tax:.0f}% — фактически honeypot"}
 
-        return {"ok": True}
+        # Enforce normal tax thresholds from simulation (works instantly, no GoPlus needed)
+        if buy_tax > max_buy_tax:
+            return {"ok": False, "reason": f"Buy tax {buy_tax:.1f}% (симуляция honeypot.is) > {max_buy_tax:.0f}%"}
+        if sell_tax > max_sell_tax:
+            return {"ok": False, "reason": f"Sell tax {sell_tax:.1f}% (симуляция honeypot.is) > {max_sell_tax:.0f}%"}
+
+        return {"ok": True, "buy_tax": buy_tax, "sell_tax": sell_tax}
 
     except asyncio.TimeoutError:
         log.info(f"honeypot.is timeout for {token_address} — proceeding")
-        return {"ok": True}
+        return {"ok": True, "buy_tax": None, "sell_tax": None}
     except Exception as e:
         log.warning(f"honeypot.is error: {e}")
-        return {"ok": True}
+        return {"ok": True, "buy_tax": None, "sell_tax": None}
+
+
+BSCSCAN_API_URL = "https://api.bscscan.com/api"
+BSCSCAN_TIMEOUT = 5.0
+
+
+async def _check_deployer_bscscan(
+    token_address: str,
+    api_key: str,
+    max_deploy_count_30d: int = 3,
+) -> dict:
+    """
+    Check token deployer history via BSCScan API.
+
+    Steps:
+      1. Resolve token deployer via getcontractcreation
+      2. Scan deployer's last 100 transactions for contract deployments in 30 days
+      3. Reject if deployer has created too many contracts recently (serial scammer pattern)
+
+    Returns:
+      {"ok": True,  "deployer": addr, "deploy_count_30d": n} — safe or unknown
+      {"ok": False, "reason": "..."}                         — serial deployer detected
+      {"ok": True,  "deployer": None}                        — API key missing or error (fail-open)
+    """
+    if not api_key:
+        return {"ok": True, "deployer": None}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # ── Step 1: get contract creator ──────────────────────────────────
+            async with session.get(
+                BSCSCAN_API_URL,
+                params={
+                    "module":            "contract",
+                    "action":            "getcontractcreation",
+                    "contractaddresses": token_address,
+                    "apikey":            api_key,
+                },
+                timeout=aiohttp.ClientTimeout(total=BSCSCAN_TIMEOUT),
+            ) as resp:
+                body = await resp.json(content_type=None)
+
+            if body.get("status") != "1" or not body.get("result"):
+                return {"ok": True, "deployer": None}
+
+            deployer = body["result"][0].get("contractCreator", "").lower()
+            if not deployer:
+                return {"ok": True, "deployer": None}
+
+            # ── Step 2: scan deployer tx history ─────────────────────────────
+            cutoff = int(time.time()) - 30 * 86400
+            async with session.get(
+                BSCSCAN_API_URL,
+                params={
+                    "module":  "account",
+                    "action":  "txlist",
+                    "address": deployer,
+                    "sort":    "desc",
+                    "page":    "1",
+                    "offset":  "100",
+                    "apikey":  api_key,
+                },
+                timeout=aiohttp.ClientTimeout(total=BSCSCAN_TIMEOUT),
+            ) as resp:
+                body2 = await resp.json(content_type=None)
+
+        txs = body2.get("result") or []
+        if isinstance(txs, str):  # BSCScan error string
+            return {"ok": True, "deployer": deployer}
+
+        # Count contract deployments (to == "") in the last 30 days
+        deploy_count_30d = sum(
+            1 for tx in txs
+            if tx.get("to", "") == "" and int(tx.get("timeStamp", 0)) >= cutoff
+        )
+
+        result_info: dict = {
+            "ok":               True,
+            "deployer":         deployer,
+            "deploy_count_30d": deploy_count_30d,
+        }
+
+        if deploy_count_30d > max_deploy_count_30d:
+            result_info["ok"]     = False
+            result_info["reason"] = (
+                f"Серийный деплоер: {deploy_count_30d} контрактов за 30 дней — "
+                f"высокий риск скама"
+            )
+
+        return result_info
+
+    except asyncio.TimeoutError:
+        log.info(f"BSCScan timeout for {token_address} — skipping deployer check")
+        return {"ok": True, "deployer": None}
+    except Exception as e:
+        log.warning(f"BSCScan deployer check error: {e}")
+        return {"ok": True, "deployer": None}
 
 
 async def _dexscreener_fetch(pair_address: str) -> dict | None:
@@ -394,8 +508,12 @@ def _find_pair_sync(w3: Web3, token_address: str) -> tuple[str, str] | None:
     return None
 
 
-async def analyze_token(token_address: str, w3: Web3,
-                        wallet_address: str = "0x0000000000000000000000000000000000000001") -> dict:
+async def analyze_token(
+    token_address: str,
+    w3: Web3,
+    wallet_address: str = "0x0000000000000000000000000000000000000001",
+    bscscan_api_key: str = "",
+) -> dict:
     """
     Full non-rejecting analysis of a token — collects all available metrics
     without early return on failure. Used by the /analyze command.
@@ -410,15 +528,17 @@ async def analyze_token(token_address: str, w3: Web3,
     pair_address, base_token = pair_info
 
     # ── Run all checks in parallel ─────────────────────────────────────────────
-    sim_buy_task   = asyncio.to_thread(_simulate_buy_sync,  w3, token_address, wallet_address)
-    sim_sell_task  = asyncio.to_thread(_simulate_sell_sync, w3, token_address, pair_address)
-    goplus_task    = _goplus_fetch(token_address)
-    honeypot_task  = _honeypot_is_check(token_address)
-    dexscreen_task = _dexscreener_fetch(pair_address)
-    bnb_price_task = asyncio.to_thread(_get_bnb_price_sync, w3)
+    sim_buy_task      = asyncio.to_thread(_simulate_buy_sync,  w3, token_address, wallet_address)
+    sim_sell_task     = asyncio.to_thread(_simulate_sell_sync, w3, token_address, pair_address)
+    goplus_task       = _goplus_fetch(token_address)
+    honeypot_task     = _honeypot_is_check(token_address)
+    dexscreen_task    = _dexscreener_fetch(pair_address)
+    bnb_price_task    = asyncio.to_thread(_get_bnb_price_sync, w3)
+    deployer_task     = _check_deployer_bscscan(token_address, bscscan_api_key)
 
-    sim_result, sell_sim, goplus_data, hp_result, dex, bnb_price = await asyncio.gather(
-        sim_buy_task, sim_sell_task, goplus_task, honeypot_task, dexscreen_task, bnb_price_task
+    sim_result, sell_sim, goplus_data, hp_result, dex, bnb_price, deployer_result = await asyncio.gather(
+        sim_buy_task, sim_sell_task, goplus_task, honeypot_task, dexscreen_task,
+        bnb_price_task, deployer_task
     )
 
     # ── On-chain metrics ──────────────────────────────────────────────────────
@@ -437,6 +557,10 @@ async def analyze_token(token_address: str, w3: Web3,
         name         = token_meta["name"]
         symbol       = token_meta["symbol"]
         holder_count = "?"
+
+    # ── honeypot.is taxes (works before GoPlus indexes the token) ────────────
+    hp_buy_tax  = hp_result.get("buy_tax")   # None if API unavailable
+    hp_sell_tax = hp_result.get("sell_tax")
 
     # ── GoPlus flags ──────────────────────────────────────────────────────────
     CRITICAL_FLAGS = {
@@ -505,31 +629,40 @@ async def analyze_token(token_address: str, w3: Web3,
             vol_5m = float(vol_5m_raw)
 
     return {
-        "found":           True,
-        "token_address":   token_address,
-        "pair_address":    pair_address,
-        "base_token":      base_token,
-        "name":            name,
-        "symbol":          symbol,
-        "holder_count":    holder_count,
-        "bnb_price":       bnb_price,
-        "liquidity_usd":   liquidity_usd,
-        "fdv_usd":         fdv_usd,
-        "buy_tax":         buy_tax,
-        "sell_tax":        sell_tax,
-        "sim_buy_ok":      sim_result["ok"],
-        "sim_buy_reason":  sim_result.get("reason", ""),
-        "sim_sell_ok":     sell_sim["ok"],
-        "sim_sell_reason": sell_sim.get("reason", ""),
-        "hp_is_ok":        hp_result["ok"],
-        "hp_is_reason":    hp_result.get("reason", ""),
-        "goplus_ok":       goplus_data is not None,
-        "critical_flags":  critical_flags,
-        "warnings":        warnings,
-        "top10_pct":       top10_pct,
-        "lp_locked":       lp_locked,
-        "age_days":        age_days,
-        "vol_5m":          vol_5m,
+        "found":              True,
+        "token_address":      token_address,
+        "pair_address":       pair_address,
+        "base_token":         base_token,
+        "name":               name,
+        "symbol":             symbol,
+        "holder_count":       holder_count,
+        "bnb_price":          bnb_price,
+        "liquidity_usd":      liquidity_usd,
+        "fdv_usd":            fdv_usd,
+        # GoPlus taxes (available after ~15-30 min of listing)
+        "buy_tax":            buy_tax,
+        "sell_tax":           sell_tax,
+        # honeypot.is simulation taxes (available immediately at listing)
+        "hp_buy_tax":         hp_buy_tax,
+        "hp_sell_tax":        hp_sell_tax,
+        "sim_buy_ok":         sim_result["ok"],
+        "sim_buy_reason":     sim_result.get("reason", ""),
+        "sim_sell_ok":        sell_sim["ok"],
+        "sim_sell_reason":    sell_sim.get("reason", ""),
+        "hp_is_ok":           hp_result["ok"],
+        "hp_is_reason":       hp_result.get("reason", ""),
+        "goplus_ok":          goplus_data is not None,
+        "critical_flags":     critical_flags,
+        "warnings":           warnings,
+        "top10_pct":          top10_pct,
+        "lp_locked":          lp_locked,
+        "age_days":           age_days,
+        "vol_5m":             vol_5m,
+        # Deployer history (requires BSCSCAN_API_KEY)
+        "deployer":           deployer_result.get("deployer"),
+        "deploy_count_30d":   deployer_result.get("deploy_count_30d"),
+        "deployer_ok":        deployer_result["ok"],
+        "deployer_reason":    deployer_result.get("reason", ""),
     }
 
 
@@ -540,19 +673,21 @@ async def check_token(
     pair_address:  str,
     base_token:    str,
     w3:            Web3,
-    min_liquidity_usd:   float,
-    max_buy_tax:         float,
-    max_sell_tax:        float,
-    wallet_address:      str   = "0x0000000000000000000000000000000000000001",
-    require_goplus:      bool  = False,    # True = skip token if GoPlus is down (auto mode)
-    lp_holder_max_pct:   float = 30.0,    # reject if any unlocked wallet holds >X% of LP
-    min_market_cap_usd:  float = 30_000,
-    min_fdv_usd:         float = 200_000,
-    max_fdv_usd:         float = 10_000_000,
+    min_liquidity_usd:    float,
+    max_buy_tax:          float,
+    max_sell_tax:         float,
+    wallet_address:       str   = "0x0000000000000000000000000000000000000001",
+    require_goplus:       bool  = False,    # True = skip token if GoPlus is down (auto mode)
+    lp_holder_max_pct:    float = 30.0,    # reject if any unlocked wallet holds >X% of LP
+    min_market_cap_usd:   float = 30_000,
+    min_fdv_usd:          float = 200_000,
+    max_fdv_usd:          float = 10_000_000,
     max_top10_holder_pct: float = 30.0,   # top-10 non-DEX/locked holders combined
-    min_volume_5m_usd:   float = 1_000,   # skip if DexScreener 5-min volume below this
-    max_token_age_days:  int   = 30,      # skip if pair is older than this
-    min_holder_count:    int   = 50,      # min number of token holders (GoPlus)
+    min_volume_5m_usd:    float = 1_000,   # skip if DexScreener 5-min volume below this
+    max_token_age_days:   int   = 30,      # skip if pair is older than this
+    min_holder_count:     int   = 50,      # min number of token holders (GoPlus)
+    bscscan_api_key:      str   = "",      # BSCScan API key for deployer history check
+    max_deployer_tokens_30d: int = 3,     # reject if deployer created >N contracts in 30 days
 ) -> dict:
     """
     Two-track security check running in parallel:
@@ -572,14 +707,15 @@ async def check_token(
     """
 
     # ── Run all checks in parallel ────────────────────────────────────────────
-    sim_buy_task   = asyncio.to_thread(_simulate_buy_sync,  w3, token_address, wallet_address)
-    sim_sell_task  = asyncio.to_thread(_simulate_sell_sync, w3, token_address, pair_address)
-    goplus_task    = _goplus_fetch(token_address)
-    honeypot_task  = _honeypot_is_check(token_address)
-    dexscreen_task = _dexscreener_fetch(pair_address)
+    sim_buy_task      = asyncio.to_thread(_simulate_buy_sync,  w3, token_address, wallet_address)
+    sim_sell_task     = asyncio.to_thread(_simulate_sell_sync, w3, token_address, pair_address)
+    goplus_task       = _goplus_fetch(token_address)
+    honeypot_task     = _honeypot_is_check(token_address, max_buy_tax, max_sell_tax)
+    dexscreen_task    = _dexscreener_fetch(pair_address)
+    deployer_task     = _check_deployer_bscscan(token_address, bscscan_api_key, max_deployer_tokens_30d)
 
-    sim_result, sell_sim, goplus_data, hp_result, dex = await asyncio.gather(
-        sim_buy_task, sim_sell_task, goplus_task, honeypot_task, dexscreen_task
+    sim_result, sell_sim, goplus_data, hp_result, dex, deployer_result = await asyncio.gather(
+        sim_buy_task, sim_sell_task, goplus_task, honeypot_task, dexscreen_task, deployer_task
     )
 
     # ── Require GoPlus in auto mode ───────────────────────────────────────────
@@ -595,9 +731,15 @@ async def check_token(
     if not sell_sim["ok"]:
         return {"ok": False, "reason": sell_sim["reason"]}
 
-    # ── Track C: honeypot.is ──────────────────────────────────────────────────
+    # ── Track C: honeypot.is + tax simulation ─────────────────────────────────
+    # honeypot.is simulates real buy+sell transactions and reports actual taxes.
+    # This check fires BEFORE GoPlus — it works on brand-new tokens immediately.
     if not hp_result["ok"]:
         return {"ok": False, "reason": hp_result["reason"]}
+
+    # ── Track D: deployer history ─────────────────────────────────────────────
+    if not deployer_result["ok"]:
+        return {"ok": False, "reason": deployer_result["reason"]}
 
     # ── Track B: GoPlus critical flags ────────────────────────────────────────
     buy_tax  = 0.0
