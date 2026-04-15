@@ -68,6 +68,9 @@ trader = Trader(w3, config.PRIVATE_KEY, config.GAS_MULTIPLIER)
 # cleaned up after user action (buy or skip)
 pending: dict[str, dict] = {}
 
+# Tokens currently being bought (prevents concurrent buy of the same token)
+_buying_tokens: set[str] = {}
+
 # ── Dynamic position sizing ───────────────────────────────────────────────────
 
 def calculate_max_positions(balance_bnb: float) -> int:
@@ -534,73 +537,82 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         if token_address in pos_manager.positions:
             return
 
-        await tg_send(
-            f"⚡ *Авто-покупка* — {info['name']} (`{info['symbol']}`)\n"
-            f"💰 {buy_amount} BNB (~${buy_amount * bnb_price:.0f}) | "
-            f"Ликвидность: ${info['liquidity_usd']:,.0f}\n"
-            f"{warn_block}"
-        )
-
-        # Run approve + price fetch in parallel to save ~200ms
-        approve_task     = asyncio.to_thread(trader.approve_token, token_address)
-        price_task       = asyncio.to_thread(trader.get_price, token_address, base_token)
-        approve_result, price_before = await asyncio.gather(approve_task, price_task)
-
-        if not approve_result["ok"]:
-            await tg_send(
-                f"❌ Авто: не удалось одобрить *{info['symbol']}*\n"
-                f"`{approve_result['reason']}`"
-            )
+        # Prevent concurrent buy of the same token (race between await points)
+        if token_address in _buying_tokens:
+            log.info(f"Auto: {info['symbol']} already being bought, skipping")
             return
+        _buying_tokens.add(token_address)
 
-        result = await asyncio.to_thread(trader.buy, token_address, buy_amount)
-
-        if result["ok"]:
-            entry_price = price_before if price_before > 0 else (
-                buy_amount / (result["tokens_received"] / 10 ** result["decimals"])
-            )
-            moon_bag = _calc_moon_bag(result["tokens_received"], buy_amount, bnb_price)
-            tradeable = result["tokens_received"] - moon_bag
-            pos = Position(
-                token_address     = token_address,
-                symbol            = info["symbol"],
-                name              = info["name"],
-                pair_address      = pair_address,
-                buy_price_bnb     = entry_price,
-                tokens_amount     = tradeable,
-                decimals          = result["decimals"],
-                buy_bnb           = buy_amount,
-                take_profit_1     = config.TAKE_PROFIT_1,
-                take_profit_1_pct = config.TAKE_PROFIT_1_PCT,
-                trailing_stop_pct = config.TRAILING_STOP_PCT,
-                stop_loss         = config.STOP_LOSS,
-                liquidity_usd     = info["liquidity_usd"],
-                buy_tax           = info["buy_tax"],
-                sell_tax          = info["sell_tax"],
-                moon_bag_tokens   = moon_bag,
-                deployer_address  = info.get("deployer") or "",
-            )
-            pos_manager.add(pos)
-            _record_buy(pos, result["tx_hash"])
-            amount_fmt = result["tokens_received"] / 10 ** result["decimals"]
-            fdv_str = f" | FDV: ${info['fdv_usd']:,.0f}" if info.get("fdv_usd") else ""
-            moon_str = (
-                f"\n🌙 Moon bag: *{moon_bag / 10**result['decimals']:.2f} {info['symbol']}* "
-                f"({config.MOON_BAG_PCT:.0f}%) — не продаётся авто"
-            ) if moon_bag > 0 else ""
+        try:
             await tg_send(
-                f"✅ *Куплено авто* — {info['symbol']}\n\n"
-                f"Получено: {amount_fmt:.4f} {info['symbol']}\n"
-                f"Цена входа: {entry_price:.8f} BNB\n"
-                f"Tx: `{result['tx_hash']}`\n\n"
-                f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}%  "
-                f"| Trailing: -{config.TRAILING_STOP_PCT}%  "
-                f"| SL: -{config.STOP_LOSS}%{fdv_str}"
-                f"{moon_str}\n"
-                f"Позиций открыто: {len(pos_manager.positions)}/{max_pos}"
+                f"⚡ *Авто-покупка* — {info['name']} (`{info['symbol']}`)\n"
+                f"💰 {buy_amount} BNB (~${buy_amount * bnb_price:.0f}) | "
+                f"Ликвидность: ${info['liquidity_usd']:,.0f}\n"
+                f"{warn_block}"
             )
-        else:
-            await tg_send(f"❌ Авто: ошибка покупки *{info['symbol']}*: {result['reason']}")
+
+            # Run approve + price fetch in parallel to save ~200ms
+            approve_task     = asyncio.to_thread(trader.approve_token, token_address)
+            price_task       = asyncio.to_thread(trader.get_price, token_address, base_token)
+            approve_result, price_before = await asyncio.gather(approve_task, price_task)
+
+            if not approve_result["ok"]:
+                await tg_send(
+                    f"❌ Авто: не удалось одобрить *{info['symbol']}*\n"
+                    f"`{approve_result['reason']}`"
+                )
+                return
+
+            result = await asyncio.to_thread(trader.buy, token_address, buy_amount)
+
+            if result["ok"]:
+                entry_price = price_before if price_before > 0 else (
+                    buy_amount / (result["tokens_received"] / 10 ** result["decimals"])
+                )
+                moon_bag = _calc_moon_bag(result["tokens_received"], buy_amount, bnb_price)
+                tradeable = result["tokens_received"] - moon_bag
+                pos = Position(
+                    token_address     = token_address,
+                    symbol            = info["symbol"],
+                    name              = info["name"],
+                    pair_address      = pair_address,
+                    buy_price_bnb     = entry_price,
+                    tokens_amount     = tradeable,
+                    decimals          = result["decimals"],
+                    buy_bnb           = buy_amount,
+                    take_profit_1     = config.TAKE_PROFIT_1,
+                    take_profit_1_pct = config.TAKE_PROFIT_1_PCT,
+                    trailing_stop_pct = config.TRAILING_STOP_PCT,
+                    stop_loss         = config.STOP_LOSS,
+                    liquidity_usd     = info["liquidity_usd"],
+                    buy_tax           = info["buy_tax"],
+                    sell_tax          = info["sell_tax"],
+                    moon_bag_tokens   = moon_bag,
+                    deployer_address  = info.get("deployer") or "",
+                )
+                pos_manager.add(pos)
+                _record_buy(pos, result["tx_hash"])
+                amount_fmt = result["tokens_received"] / 10 ** result["decimals"]
+                fdv_str = f" | FDV: ${info['fdv_usd']:,.0f}" if info.get("fdv_usd") else ""
+                moon_str = (
+                    f"\n🌙 Moon bag: *{moon_bag / 10**result['decimals']:.2f} {info['symbol']}* "
+                    f"({config.MOON_BAG_PCT:.0f}%) — не продаётся авто"
+                ) if moon_bag > 0 else ""
+                await tg_send(
+                    f"✅ *Куплено авто* — {info['symbol']}\n\n"
+                    f"Получено: {amount_fmt:.4f} {info['symbol']}\n"
+                    f"Цена входа: {entry_price:.8f} BNB\n"
+                    f"Tx: `{result['tx_hash']}`\n\n"
+                    f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}%  "
+                    f"| Trailing: -{config.TRAILING_STOP_PCT}%  "
+                    f"| SL: -{config.STOP_LOSS}%{fdv_str}"
+                    f"{moon_str}\n"
+                    f"Позиций открыто: {len(pos_manager.positions)}/{max_pos}"
+                )
+            else:
+                await tg_send(f"❌ Авто: ошибка покупки *{info['symbol']}*: {result['reason']}")
+        finally:
+            _buying_tokens.discard(token_address)
         return
 
     # ── MANUAL MODE: send notification with buttons ───────────────────────────
@@ -756,7 +768,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ Продаю *{pos.symbol}*...", parse_mode=ParseMode.MARKDOWN
         )
         result = await asyncio.to_thread(
-            trader.sell, token_address, pos.tokens_amount
+            trader.sell_escalating, token_address, pos.tokens_amount
         )
 
         if result["ok"]:
@@ -1574,15 +1586,25 @@ async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Background: remove expired pending alerts ────────────────────────────────
 
 async def _cleanup_pending():
-    """Remove pending tokens older than PENDING_TTL every 60 seconds."""
+    """Remove expired pending alerts and stale mempool cache entries every 60 seconds."""
     while True:
         await asyncio.sleep(60)
-        now     = time.time()
+        now = time.time()
+
+        # Clean up expired pending token alerts (manual mode buttons)
         expired = [k for k, v in pending.items() if now - v["ts"] > config.PENDING_TTL]
         for k in expired:
             pending.pop(k, None)
         if expired:
             log.info(f"Cleaned up {len(expired)} expired pending token(s)")
+
+        # Clean up stale mempool pre-analysis cache entries
+        stale = [k for k, v in _mempool_cache.items()
+                 if now - v.get("ts", 0) > _MEMPOOL_CACHE_TTL]
+        for k in stale:
+            _mempool_cache.pop(k, None)
+        if stale:
+            log.info(f"Cleaned up {len(stale)} stale mempool cache entries")
 
 
 # ── Background: daily report at 23:00 MSK ────────────────────────────────────
