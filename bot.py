@@ -139,6 +139,14 @@ is_paused: bool = False
 is_auto:   bool = config.AUTO_BUY
 trade_history: list[dict] = []
 
+# Activity tracking — visibility into what the bot is seeing
+_stats_seen    = 0          # total pairs detected since start
+_stats_rejected = 0         # rejected by any filter
+_last_seen_ts:  float = 0.0 # timestamp of last detected pair
+_last_reject:   str   = ""  # reason of last rejection
+_reject_log: list[dict] = []  # last 20 rejections with token + reason
+_MAX_REJECT_LOG = 20
+
 
 # ── Settings persistence ──────────────────────────────────────────────────────
 
@@ -461,9 +469,14 @@ async def on_pending_pair_found(token_address: str, base_token: str, pair_addres
 # ── New pair handler ──────────────────────────────────────────────────────────
 
 async def on_pair_found(token_address: str, base_token: str, pair_address: str):
+    global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject
+
     if is_paused:
         log.info(f"Bot paused — skipping {token_address}")
         return
+
+    _stats_seen  += 1
+    _last_seen_ts = time.time()
 
     # Check mempool pre-analysis cache first
     key = token_address.lower()
@@ -490,7 +503,34 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         )
 
     if not result["ok"]:
-        log.info(f"Rejected {token_address}: {result['reason']}")
+        _stats_rejected += 1
+        _last_reject     = result["reason"]
+        # Log rejection with symbol if available
+        sym = (result.get("info") or {}).get("symbol") or token_address[:10]
+        entry = {
+            "ts":      datetime.now(MOSCOW_TZ).strftime("%H:%M:%S"),
+            "token":   token_address,
+            "symbol":  sym,
+            "reason":  result["reason"],
+        }
+        _reject_log.append(entry)
+        if len(_reject_log) > _MAX_REJECT_LOG:
+            _reject_log.pop(0)
+        log.info(f"Rejected {sym} ({token_address[:10]}…): {result['reason']}")
+
+        # Near-miss alert: passed all safety checks but blocked by a threshold filter
+        # Helps the user see activity and understand which filters are too strict
+        _THRESHOLD_REASONS = (
+            "Ликвидность:", "FDV:", "Market cap:", "Объём за 5 мин:",
+            "Токен слишком старый", "Холдеров слишком мало",
+        )
+        if any(result["reason"].startswith(r) for r in _THRESHOLD_REASONS):
+            info = result.get("info") or {}
+            await tg_send(
+                f"🔍 *Близко, но не прошёл фильтр*\n"
+                f"`{token_address}`\n"
+                f"❌ {result['reason']}"
+            )
         return
 
     info      = result["info"]
@@ -847,6 +887,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/blacklist — список заблокированных деплоеров\n"
         "/blacklist add 0x... — добавить деплоера вручную\n"
         "/blacklist remove 0x... — удалить из списка\n\n"
+        "*Диагностика*\n"
+        "/rejects — последние 10 отклонённых токенов с причиной\n\n"
         "*Статистика*\n"
         "/stats — полная статистика (win rate, PnL, breakdown)\n"
         "/stats today — только сегодня\n"
@@ -1252,6 +1294,25 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Moon bag: {config.MOON_BAG_PCT:.0f}% при сделке ≥${config.MOON_BAG_MIN_USD:.0f}"
     )
 
+    # ── Activity summary ──────────────────────────────────────────────────────
+    if _last_seen_ts:
+        last_seen_ago = int(time.time() - _last_seen_ts)
+        if last_seen_ago < 60:
+            last_seen_str = f"{last_seen_ago}с назад"
+        elif last_seen_ago < 3600:
+            last_seen_str = f"{last_seen_ago // 60}м назад"
+        else:
+            last_seen_str = f"{last_seen_ago // 3600}ч назад"
+        activity_str = (
+            f"*Активность (с запуска):*\n"
+            f"Пар замечено: {_stats_seen} | Отклонено: {_stats_rejected}\n"
+            f"Последняя пара: {last_seen_str}\n"
+        )
+        if _last_reject:
+            activity_str += f"Последний отказ: _{_last_reject}_\n"
+    else:
+        activity_str = "*Активность:* пар ещё не замечено\n"
+
     await update.message.reply_text(
         f"*Статус Sniper Bot* — {status_icon}\n\n"
         f"RPC: {'✅' if connected else '❌'} {rpc_label} | WS endpoints: {ws_count}\n"
@@ -1259,6 +1320,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Баланс: *{balance:.4f} BNB* (~${balance * bnb_price:.0f})\n"
         f"Позиций открыто: {len(pos_manager.positions)}/{calculate_max_positions(balance) if is_auto else config.MAX_POSITIONS}\n"
         f"Сделок в истории: {len(trade_history)}\n\n"
+        f"{activity_str}\n"
         f"*Размер позиции:*\n"
         f"Режим: {size_mode}\n"
         f"Следующая сделка: *{buy_amount} BNB* (~${buy_amount * bnb_price:.0f})\n"
@@ -1520,6 +1582,26 @@ async def _do_analyze(update, raw_address: str):
 
 
 # ── Deployer blacklist commands ──────────────────────────────────────────────
+
+@owner_only
+async def cmd_rejects(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show last rejected tokens with reason."""
+    if not _reject_log:
+        await update.message.reply_text(
+            "✅ Отклонённых токенов нет — или бот только запустился.\n"
+            f"Пар замечено с запуска: {_stats_seen}"
+        )
+        return
+
+    lines = [f"🚫 *Последние отклонения* (всего: {_stats_rejected})\n"]
+    for e in _reject_log[-10:][::-1]:
+        lines.append(f"`{e['ts']}` *{e['symbol']}* — {e['reason']}")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
 
 @owner_only
 async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1803,6 +1885,7 @@ async def main():
     app.add_handler(CommandHandler("history",   cmd_history))
     app.add_handler(CommandHandler("set",       cmd_set))
     app.add_handler(CommandHandler("analyze",   cmd_analyze))
+    app.add_handler(CommandHandler("rejects",   cmd_rejects))
     app.add_handler(CommandHandler("blacklist", cmd_blacklist))
     app.add_handler(CallbackQueryHandler(handle_callback))
     # Handle plain token addresses sent as messages (0x... 42 chars)
