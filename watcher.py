@@ -13,30 +13,43 @@ log = logging.getLogger(__name__)
 PAIR_CREATED_TOPIC = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
 
 # ── CREATE2 pair address prediction ──────────────────────────────────────────
-# PancakeSwap V2 Factory INIT_CODE_HASH (deterministic pair address computation)
-_INIT_CODE_HASH = bytes.fromhex(
+# createPair(address,address) selector (same on all Uniswap V2 forks)
+_CREATE_PAIR_SIG = "0xc9c65396"
+
+# PancakeSwap V2 INIT_CODE_HASH
+_PANCAKE_INIT_CODE_HASH = bytes.fromhex(
     "00fb7f630766e6a796048ea87d01acd3068e8ff67d078148a3fa3f4a84f69bd5"
 )
-# createPair(address,address) selector
-_CREATE_PAIR_SIG = "0xc9c65396"
-_FACTORY_LOWER   = PANCAKE_FACTORY_V2.lower()
+# Uniswap V2 on Base INIT_CODE_HASH
+_UNISWAP_V2_BASE_INIT_CODE_HASH = bytes.fromhex(
+    "96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f"
+)
 
 
-def compute_pair_address(token_a: str, token_b: str) -> str:
+def compute_pair_address(
+    token_a: str,
+    token_b: str,
+    factory_address: str = None,
+    init_code_hash: bytes = None,
+) -> str:
     """Predict CREATE2 pair address without an on-chain call."""
+    factory = factory_address or PANCAKE_FACTORY_V2
+    hash_   = init_code_hash  or _PANCAKE_INIT_CODE_HASH
     a, b = token_a.lower(), token_b.lower()
     t0, t1 = (a, b) if a < b else (b, a)
     salt = Web3.solidity_keccak(
         ["address", "address"],
         [Web3.to_checksum_address(t0), Web3.to_checksum_address(t1)],
     )
-    factory_bytes = bytes.fromhex(PANCAKE_FACTORY_V2[2:])
-    raw = Web3.keccak(b"\xff" + factory_bytes + salt + _INIT_CODE_HASH)
+    factory_bytes = bytes.fromhex(factory[2:])
+    raw = Web3.keccak(b"\xff" + factory_bytes + salt + hash_)
     return Web3.to_checksum_address("0x" + raw.hex()[-40:])
 
 
-async def _watch_single(ws_url: str, callback):
+async def _watch_single(ws_url: str, callback, factory_address: str = None, base_tokens: set = None):
     """Connect to one WS endpoint and stream PairCreated events."""
+    factory = factory_address or PANCAKE_FACTORY_V2
+    tokens  = base_tokens or BASE_TOKENS
     backoff = 2
     while True:
         try:
@@ -54,7 +67,7 @@ async def _watch_single(ws_url: str, callback):
                     "params": [
                         "logs",
                         {
-                            "address": PANCAKE_FACTORY_V2,
+                            "address": factory,
                             "topics":  [PAIR_CREATED_TOPIC],
                         },
                     ],
@@ -89,9 +102,9 @@ async def _watch_single(ws_url: str, callback):
                         t0 = token0.lower()
                         t1 = token1.lower()
 
-                        if t0 in BASE_TOKENS and t1 not in BASE_TOKENS:
+                        if t0 in tokens and t1 not in tokens:
                             new_token, base_token = token1, token0
-                        elif t1 in BASE_TOKENS and t0 not in BASE_TOKENS:
+                        elif t1 in tokens and t0 not in tokens:
                             new_token, base_token = token0, token1
                         else:
                             continue
@@ -128,45 +141,56 @@ async def _dedup_callback(callback, new_token, base_token, pair):
     await callback(new_token, base_token, pair)
 
 
-async def watch_pairs(ws_url: str, callback):
+async def watch_pairs(
+    ws_url: str,
+    callback,
+    factory_address: str = None,
+    base_tokens: set = None,
+    ws_rpcs: list = None,
+):
     """
-    Subscribe to PancakeSwap V2 PairCreated events.
+    Subscribe to Uniswap V2 / PancakeSwap V2 PairCreated events.
 
-    If multiple WS endpoints are configured (BSC_WS_RPCS), connects to all
-    of them in parallel for redundancy — first event wins (deduped).
-    Falls back to single ws_url if BSC_WS_RPCS has only one entry.
+    If multiple WS endpoints are configured, connects to all in parallel
+    for redundancy — first event wins (deduped).
     """
-    urls = BSC_WS_RPCS if len(BSC_WS_RPCS) > 1 else [ws_url]
+    urls = ws_rpcs if ws_rpcs and len(ws_rpcs) > 1 else (
+        BSC_WS_RPCS if len(BSC_WS_RPCS) > 1 else [ws_url]
+    )
 
     if len(urls) == 1:
-        # Single connection — no dedup overhead
-        await _watch_single(urls[0], callback)
+        await _watch_single(urls[0], callback, factory_address, base_tokens)
     else:
         log.info(f"Multi-WS mode: {len(urls)} endpoints for redundancy")
 
         async def dedup_cb(new_token, base_token, pair):
             await _dedup_callback(callback, new_token, base_token, pair)
 
-        tasks = [asyncio.create_task(_watch_single(u, dedup_cb)) for u in urls]
+        tasks = [
+            asyncio.create_task(_watch_single(u, dedup_cb, factory_address, base_tokens))
+            for u in urls
+        ]
         await asyncio.gather(*tasks)
 
 
 # ── Mempool watcher (pending createPair transactions) ────────────────────────
 
-async def watch_pending_pairs(ws_url: str, callback):
+async def watch_pending_pairs(
+    ws_url: str,
+    callback,
+    factory_address: str = None,
+    init_code_hash: bytes = None,
+    base_tokens: set = None,
+):
     """
     Subscribe to newPendingTransactions and detect createPair() calls before
-    they are mined. For each detected pair creation:
-      1. Decode tokenA/tokenB from calldata
-      2. Compute the pair address via CREATE2 (no on-chain call)
-      3. Fire callback(new_token, base_token, predicted_pair)
-
-    The callback should start pre-analysis so results are cached by the time
-    PairCreated event fires.
+    they are mined.
 
     Requires a node that exposes the full mempool (e.g. NodeReal premium).
     Public nodes typically don't support newPendingTransactions.
     """
+    factory_lower = (factory_address or PANCAKE_FACTORY_V2).lower()
+    tokens        = base_tokens or BASE_TOKENS
     backoff = 2
     while True:
         try:
@@ -234,7 +258,7 @@ async def watch_pending_pairs(ws_url: str, callback):
                         tx_data = result.get("input") or ""
 
                         # Filter: only factory createPair calls
-                        if tx_to != _FACTORY_LOWER:
+                        if tx_to != factory_lower:
                             continue
                         if not tx_data.startswith(_CREATE_PAIR_SIG):
                             continue
@@ -248,14 +272,17 @@ async def watch_pending_pairs(ws_url: str, callback):
                         ta = token_a.lower()
                         tb = token_b.lower()
 
-                        if ta in BASE_TOKENS and tb not in BASE_TOKENS:
+                        if ta in tokens and tb not in tokens:
                             new_token, base_token = token_b, token_a
-                        elif tb in BASE_TOKENS and ta not in BASE_TOKENS:
+                        elif tb in tokens and ta not in tokens:
                             new_token, base_token = token_a, token_b
                         else:
                             continue
 
-                        pair = compute_pair_address(new_token, base_token)
+                        pair = compute_pair_address(
+                            new_token, base_token,
+                            factory_address, init_code_hash,
+                        )
                         log.info(
                             f"Mempool: pending createPair detected! "
                             f"{new_token[:10]}… / {base_token[:10]}… → pair {pair[:10]}…"

@@ -9,9 +9,6 @@ from config import PANCAKE_ROUTER_V2, WBNB, SLIPPAGE_BUY, SLIPPAGE_SELL, TX_DEAD
 
 log = logging.getLogger(__name__)
 
-ROUTER_ADDRESS = Web3.to_checksum_address(PANCAKE_ROUTER_V2)
-WBNB_ADDRESS   = Web3.to_checksum_address(WBNB)
-
 ROUTER_ABI = [
     {
         "name": "swapExactETHForTokensSupportingFeeOnTransferTokens",
@@ -89,11 +86,22 @@ ERC20_ABI = [
 
 
 class Trader:
-    def __init__(self, w3: Web3, private_key: str, gas_multiplier: float):
+    def __init__(
+        self,
+        w3: Web3,
+        private_key: str,
+        gas_multiplier: float,
+        chain_id: int = 56,
+        router_address: str = None,
+        native_token: str = None,
+    ):
         self.w3             = w3
+        self.chain_id       = chain_id
+        self.router_address = Web3.to_checksum_address(router_address or PANCAKE_ROUTER_V2)
+        self.native_token   = Web3.to_checksum_address(native_token or WBNB)
         self.account        = w3.eth.account.from_key(private_key)
         self.wallet         = self.account.address
-        self.router         = w3.eth.contract(address=ROUTER_ADDRESS, abi=ROUTER_ABI)
+        self.router         = w3.eth.contract(address=self.router_address, abi=ROUTER_ABI)
         self.gas_multiplier = gas_multiplier
         self._nonce_lock    = threading.Lock()
         self._nonce_val     = None   # cached nonce, None = fetch fresh on first use
@@ -137,9 +145,9 @@ class Trader:
     # ── Price ─────────────────────────────────────────────────────────────────
 
     def get_price(self, token_address: str, base: str = None) -> float:
-        """Return price of 1 token in BNB. Synchronous — use asyncio.to_thread."""
+        """Return price of 1 token in native token (BNB/ETH). Synchronous — use asyncio.to_thread."""
         if base is None:
-            base = WBNB_ADDRESS
+            base = self.native_token
         try:
             token    = self.w3.eth.contract(
                 address=Web3.to_checksum_address(token_address), abi=ERC20_ABI
@@ -151,7 +159,7 @@ class Trader:
             ).call()
             return amounts[1] / 1e18
         except Exception as e:
-            log.error(f"get_price({token_address}): {e}")
+            log.debug(f"get_price({token_address}): {e}")
             return 0.0
 
     # ── Balance check ─────────────────────────────────────────────────────────
@@ -164,23 +172,23 @@ class Trader:
 
     def approve_token(self, token_address: str) -> dict:
         """
-        Approve PancakeSwap router to spend this token. Synchronous.
+        Approve router to spend this token. Synchronous.
         Returns {"ok": True} or {"ok": False, "reason": "..."}
         """
         try:
             token_address = Web3.to_checksum_address(token_address)
             token     = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
-            allowance = token.functions.allowance(self.wallet, ROUTER_ADDRESS).call()
+            allowance = token.functions.allowance(self.wallet, self.router_address).call()
             if allowance > 0:
                 return {"ok": True}
             approve_tx = token.functions.approve(
-                ROUTER_ADDRESS, 2 ** 256 - 1
+                self.router_address, 2 ** 256 - 1
             ).build_transaction({
                 "from":     self.wallet,
                 "gas":      config.GAS_LIMIT_APPROVE,
                 "gasPrice": self._gas_price_buy(),
                 "nonce":    self._nonce(),
-                "chainId":  56,
+                "chainId":  self.chain_id,
             })
             signed  = self.account.sign_transaction(approve_tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
@@ -205,18 +213,18 @@ class Trader:
             amount_wei    = Web3.to_wei(amount_bnb, "ether")
 
             amounts  = self.router.functions.getAmountsOut(
-                amount_wei, [WBNB_ADDRESS, token_address]
+                amount_wei, [self.native_token, token_address]
             ).call()
             min_out  = int(amounts[1] * (1 - SLIPPAGE_BUY / 100))
 
             gas_price = self._gas_price_buy()
-            log.info(f"Buy {token_address}: {amount_bnb} BNB, "
+            log.info(f"Buy {token_address}: {amount_bnb} native, "
                      f"gasPrice={gas_price / 1e9:.1f} gwei, "
                      f"slippage={SLIPPAGE_BUY}%")
 
             tx = self.router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
                 min_out,
-                [WBNB_ADDRESS, token_address],
+                [self.native_token, token_address],
                 self.wallet,
                 self._deadline(),
             ).build_transaction({
@@ -225,7 +233,7 @@ class Trader:
                 "gas":      config.GAS_LIMIT_BUY,
                 "gasPrice": gas_price,
                 "nonce":    self._nonce(),
-                "chainId":  56,
+                "chainId":  self.chain_id,
             })
 
             signed  = self.account.sign_transaction(tx)
@@ -273,16 +281,16 @@ class Trader:
 
             token = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
 
-            allowance = token.functions.allowance(self.wallet, ROUTER_ADDRESS).call()
+            allowance = token.functions.allowance(self.wallet, self.router_address).call()
             if allowance < amount_tokens:
                 approve_tx = token.functions.approve(
-                    ROUTER_ADDRESS, 2 ** 256 - 1
+                    self.router_address, 2 ** 256 - 1
                 ).build_transaction({
                     "from":     self.wallet,
                     "gas":      config.GAS_LIMIT_APPROVE,
                     "gasPrice": self._gas_price_normal(),
                     "nonce":    self._nonce(),
-                    "chainId":  56,
+                    "chainId":  self.chain_id,
                 })
                 signed  = self.account.sign_transaction(approve_tx)
                 tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
@@ -290,14 +298,14 @@ class Trader:
                 log.info(f"Approved {token_address}")
 
             amounts = self.router.functions.getAmountsOut(
-                amount_tokens, [token_address, WBNB_ADDRESS]
+                amount_tokens, [token_address, self.native_token]
             ).call()
             min_out = int(amounts[1] * (1 - slippage_pct / 100))
 
             tx = self.router.functions.swapExactTokensForETHSupportingFeeOnTransferTokens(
                 amount_tokens,
                 min_out,
-                [token_address, WBNB_ADDRESS],
+                [token_address, self.native_token],
                 self.wallet,
                 self._deadline(),
             ).build_transaction({
@@ -305,7 +313,7 @@ class Trader:
                 "gas":      config.GAS_LIMIT_SELL,
                 "gasPrice": self._gas_price_normal(),
                 "nonce":    self._nonce(),
-                "chainId":  56,
+                "chainId":  self.chain_id,
             })
 
             signed  = self.account.sign_transaction(tx)
@@ -352,16 +360,16 @@ class Trader:
             token = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
 
             # Ensure approval first (uses its own nonce)
-            allowance = token.functions.allowance(self.wallet, ROUTER_ADDRESS).call()
+            allowance = token.functions.allowance(self.wallet, self.router_address).call()
             if allowance < amount_tokens:
                 approve_tx = token.functions.approve(
-                    ROUTER_ADDRESS, 2 ** 256 - 1
+                    self.router_address, 2 ** 256 - 1
                 ).build_transaction({
                     "from":     self.wallet,
                     "gas":      config.GAS_LIMIT_APPROVE,
                     "gasPrice": self._gas_price_buy(),
                     "nonce":    self._nonce(),
-                    "chainId":  56,
+                    "chainId":  self.chain_id,
                 })
                 signed  = self.account.sign_transaction(approve_tx)
                 tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
@@ -388,7 +396,7 @@ class Trader:
             for attempt, (gas_price, slippage) in enumerate(schedule):
                 try:
                     amounts = self.router.functions.getAmountsOut(
-                        amount_tokens, [token_address, WBNB_ADDRESS]
+                        amount_tokens, [token_address, self.native_token]
                     ).call()
                     min_out = int(amounts[1] * (1 - slippage / 100))
 
@@ -396,7 +404,7 @@ class Trader:
                         .swapExactTokensForETHSupportingFeeOnTransferTokens(
                             amount_tokens,
                             min_out,
-                            [token_address, WBNB_ADDRESS],
+                            [token_address, self.native_token],
                             self.wallet,
                             self._deadline(),
                         ).build_transaction({
@@ -404,7 +412,7 @@ class Trader:
                             "gas":      config.GAS_LIMIT_SELL,
                             "gasPrice": gas_price,
                             "nonce":    sell_nonce,
-                            "chainId":  56,
+                            "chainId":  self.chain_id,
                         })
 
                     signed = self.account.sign_transaction(tx)

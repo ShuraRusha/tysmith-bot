@@ -25,7 +25,7 @@ from web3.middleware import geth_poa_middleware
 import blacklist
 import config
 from analyzer import analyze_token, check_token, get_bnb_price
-from position import Position, PositionManager
+from position import Position, PositionManager, POSITIONS_FILE_BASE
 from trader import Trader
 from watcher import watch_pairs, watch_pending_pairs
 
@@ -63,6 +63,31 @@ if w3 is None:
     w3 = _make_w3(config.BSC_HTTP_RPC)
 
 trader = Trader(w3, config.PRIVATE_KEY, config.GAS_MULTIPLIER)
+
+# ── Base chain setup (optional) ───────────────────────────────────────────────
+w3_base     = None
+trader_base = None
+if config.BASE_CHAIN_ENABLED:
+    for rpc_url in config.BASE_HTTP_RPCS:
+        _wb = _make_w3(rpc_url)
+        if _wb.is_connected():
+            w3_base = _wb
+            log.info(f"Base chain connected: {rpc_url[:50]}...")
+            break
+        log.warning(f"Base RPC unavailable: {rpc_url[:50]}...")
+    if w3_base is None:
+        log.error("All Base RPCs failed — Base chain disabled")
+        config.BASE_CHAIN_ENABLED = False
+    else:
+        trader_base = Trader(
+            w3_base,
+            config.PRIVATE_KEY,
+            config.GAS_MULTIPLIER,
+            chain_id=config.BASE_CHAIN_ID,
+            router_address=config.UNISWAP_V2_ROUTER_BASE,
+            native_token=config.WETH_BASE,
+        )
+        log.info(f"Base chain trader ready. Wallet: {trader_base.wallet}")
 
 # callback_id (first 10 chars of token address) → token info
 # cleaned up after user action (buy or skip)
@@ -428,6 +453,14 @@ async def tg_send(text: str, reply_markup=None):
 pos_manager = PositionManager(trader, tg_send)
 pos_manager.on_close = _record_trade
 
+pos_manager_base = None
+if config.BASE_CHAIN_ENABLED and trader_base:
+    pos_manager_base = PositionManager(
+        trader_base, tg_send,
+        positions_file=POSITIONS_FILE_BASE,
+    )
+    pos_manager_base.on_close = _record_trade
+
 
 # ── Owner-only guard ──────────────────────────────────────────────────────────
 
@@ -687,6 +720,176 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_{cb_id}"),
     ]])
     await tg_send(text, reply_markup=keyboard)
+
+
+# ── Base chain pair handler ───────────────────────────────────────────────────
+
+async def on_base_pair_found(token_address: str, base_token: str, pair_address: str):
+    """Mirror of on_pair_found but for Base chain (Uniswap V2)."""
+    global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject
+
+    if is_paused or not trader_base or not pos_manager_base:
+        return
+
+    _stats_seen  += 1
+    _last_seen_ts = time.time()
+
+    log.info(f"[Base] Analyzing: {token_address}")
+    result = await check_token(
+        token_address, pair_address, base_token, w3_base,
+        config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
+        wallet_address=trader_base.wallet,
+        min_market_cap_usd=config.MIN_MARKET_CAP_USD,
+        min_fdv_usd=config.MIN_FDV_USD,
+        max_fdv_usd=config.MAX_FDV_USD,
+        max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
+        min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
+        max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
+        lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
+        min_holder_count=config.MIN_HOLDER_COUNT,
+        bscscan_api_key="",  # no BSCScan for Base; Basescan key optional
+        max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
+        chain_id=config.BASE_CHAIN_ID,
+        router_address=config.UNISWAP_V2_ROUTER_BASE,
+        native_token=config.WETH_BASE,
+        stable_token=config.USDC_BASE,
+        dex_chain="base",
+    )
+
+    if not result["ok"]:
+        _stats_rejected += 1
+        _last_reject     = result["reason"]
+        sym = (result.get("info") or {}).get("symbol") or token_address[:10]
+        entry = {
+            "ts":     datetime.now(MOSCOW_TZ).strftime("%H:%M:%S"),
+            "token":  token_address,
+            "symbol": f"[Base] {sym}",
+            "reason": result["reason"],
+        }
+        _reject_log.append(entry)
+        if len(_reject_log) > _MAX_REJECT_LOG:
+            _reject_log.pop(0)
+        log.info(f"[Base] Rejected {sym}: {result['reason']}")
+
+        _THRESHOLD_REASONS = (
+            "Ликвидность:", "FDV:", "Market cap:", "Объём за 5 мин:",
+            "Токен слишком старый", "Холдеров слишком мало",
+        )
+        if any(result["reason"].startswith(r) for r in _THRESHOLD_REASONS):
+            await tg_send(
+                f"🔵 *[Base] Близко, не прошёл фильтр*\n"
+                f"`{token_address}`\n"
+                f"❌ {result['reason']}"
+            )
+        return
+
+    info       = result["info"]
+    eth_price  = info["bnb_price"]
+    balance    = w3_base.eth.get_balance(trader_base.wallet) / 1e18
+    buy_amount = calculate_buy_amount(balance)
+
+    if buy_amount == 0.0:
+        log.info(f"[Base] Skipping {token_address}: balance too low")
+        return
+
+    warnings = info.get("extra_warnings", [])
+    if info["is_mintable"]:   warnings.append("⚠️ Mintable")
+    if info["hidden_owner"]:  warnings.append("⚠️ Hidden owner")
+    warn_block = "\n".join(warnings) if warnings else "✅ Дополнительных угроз нет"
+
+    fdv_str = f" | FDV: ${info['fdv_usd']:,.0f}" if info.get("fdv_usd") else ""
+    text = (
+        f"🔵 *[Base] Новый токен прошёл все проверки*\n\n"
+        f"🪙 *{info['name']}* (`{info['symbol']}`)\n"
+        f"📄 `{token_address}`\n\n"
+        f"💧 Ликвидность: *${info['liquidity_usd']:,.0f}*{fdv_str}\n"
+        f"💸 Buy tax: *{info['buy_tax']:.1f}%*  |  Sell tax: *{info['sell_tax']:.1f}%*\n"
+        f"👥 Холдеры: {info['holder_count']}\n\n"
+        f"{warn_block}\n\n"
+        f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
+        f"| Trailing: -{config.TRAILING_STOP_PCT}%  | SL: -{config.STOP_LOSS}%\n"
+        f"💰 Покупка: *{buy_amount} ETH* (~${buy_amount * eth_price:.0f}) "
+        f"| Баланс: {balance:.3f} ETH"
+    )
+
+    if is_auto:
+        max_pos = calculate_max_positions(balance)
+        if len(pos_manager_base.positions) >= max_pos:
+            return
+        if token_address in pos_manager_base.positions:
+            return
+        if token_address in _buying_tokens:
+            return
+        _buying_tokens.add(token_address)
+
+        try:
+            await tg_send(
+                f"🔵⚡ *[Base] Авто-покупка* — {info['name']} (`{info['symbol']}`)\n"
+                f"💰 {buy_amount} ETH (~${buy_amount * eth_price:.0f}) | "
+                f"Ликвидность: ${info['liquidity_usd']:,.0f}\n"
+                f"{warn_block}"
+            )
+
+            approve_task    = asyncio.to_thread(trader_base.approve_token, token_address)
+            price_task      = asyncio.to_thread(trader_base.get_price, token_address, base_token)
+            approve_result, price_before = await asyncio.gather(approve_task, price_task)
+
+            if not approve_result["ok"]:
+                await tg_send(
+                    f"❌ [Base] Авто: не удалось одобрить *{info['symbol']}*\n"
+                    f"`{approve_result['reason']}`"
+                )
+                return
+
+            buy_result = await asyncio.to_thread(trader_base.buy, token_address, buy_amount)
+
+            if buy_result["ok"]:
+                entry_price = price_before if price_before > 0 else (
+                    buy_amount / (buy_result["tokens_received"] / 10 ** buy_result["decimals"])
+                )
+                moon_bag = _calc_moon_bag(buy_result["tokens_received"], buy_amount, eth_price)
+                tradeable = buy_result["tokens_received"] - moon_bag
+                pos = Position(
+                    token_address     = token_address,
+                    symbol            = info["symbol"],
+                    name              = info["name"],
+                    pair_address      = pair_address,
+                    buy_price_bnb     = entry_price,
+                    tokens_amount     = tradeable,
+                    decimals          = buy_result["decimals"],
+                    buy_bnb           = buy_amount,
+                    take_profit_1     = config.TAKE_PROFIT_1,
+                    take_profit_1_pct = config.TAKE_PROFIT_1_PCT,
+                    trailing_stop_pct = config.TRAILING_STOP_PCT,
+                    stop_loss         = config.STOP_LOSS,
+                    liquidity_usd     = info["liquidity_usd"],
+                    buy_tax           = info["buy_tax"],
+                    sell_tax          = info["sell_tax"],
+                    moon_bag_tokens   = moon_bag,
+                    deployer_address  = info.get("deployer") or "",
+                    chain             = "base",
+                )
+                pos_manager_base.add(pos)
+                _record_buy(pos, buy_result["tx_hash"])
+                amount_fmt = buy_result["tokens_received"] / 10 ** buy_result["decimals"]
+                await tg_send(
+                    f"🔵✅ *[Base] Куплено авто* — {info['symbol']}\n\n"
+                    f"Получено: {amount_fmt:.4f} {info['symbol']}\n"
+                    f"Цена входа: {entry_price:.8f} ETH\n"
+                    f"Tx: `{buy_result['tx_hash']}`\n\n"
+                    f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}%  "
+                    f"| SL: -{config.STOP_LOSS}%"
+                )
+            else:
+                await tg_send(
+                    f"❌ [Base] Авто: ошибка покупки *{info['symbol']}*: {buy_result['reason']}"
+                )
+        finally:
+            _buying_tokens.discard(token_address)
+        return
+
+    # Manual mode: send notification (no inline buy button for Base in this version)
+    await tg_send(text)
 
 
 # ── Callback handler ──────────────────────────────────────────────────────────
@@ -1923,10 +2126,24 @@ async def main():
     if config.MEMPOOL_ENABLED:
         asyncio.create_task(watch_pending_pairs(config.BSC_WS_RPC, on_pending_pair_found))
         log.info("Mempool monitoring enabled — pre-analyzing pending createPair txs")
+
+    if config.BASE_CHAIN_ENABLED and pos_manager_base:
+        asyncio.create_task(pos_manager_base.monitor())
+        asyncio.create_task(watch_pairs(
+            config.BASE_WS_RPC,
+            on_base_pair_found,
+            factory_address=config.UNISWAP_V2_FACTORY_BASE,
+            base_tokens=config.BASE_TOKENS_BASE,
+            ws_rpcs=config.BASE_WS_RPCS,
+        ))
+        log.info(f"Base chain watcher started (Uniswap V2, factory={config.UNISWAP_V2_FACTORY_BASE[:10]}…)")
+
     asyncio.create_task(_lock_refresher(app))
 
     # Restore open positions from disk (survive restarts/redeploys)
     restored = pos_manager.load()
+    if pos_manager_base:
+        pos_manager_base.load()
 
     # Clean up only true "zombie" positions on startup:
     # buy_price_bnb == 0 or tokens_amount == 0 → unmonitorable, can never trigger SL/TP.
@@ -1951,9 +2168,12 @@ async def main():
     log.info(f"Ready. Wallet: {trader.wallet}")
     bl_count    = blacklist.count()
     bl_note     = f" | 🚫 Blacklist: {bl_count}" if bl_count else ""
+    chains_str  = "PancakeSwap V2 (BSC)"
+    if config.BASE_CHAIN_ENABLED and pos_manager_base:
+        chains_str += " + Uniswap V2 (Base)"
     startup_msg = (
         "🚀 *Sniper Bot запущен*\n"
-        f"Слежу за новыми парами на PancakeSwap V2 (BSC)...{bl_note}\n\n"
+        f"Слежу за новыми парами на {chains_str}...{bl_note}\n\n"
         "/help — все команды"
     )
     if active_count:

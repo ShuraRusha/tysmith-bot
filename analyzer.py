@@ -10,8 +10,8 @@ from config import WBNB, BUSD, USDT, PANCAKE_FACTORY_V2, PANCAKE_ROUTER_V2, TOP_
 
 log = logging.getLogger(__name__)
 
-GOPLUS_URL   = "https://api.gopluslabs.io/api/v1/token_security/56"
-GOPLUS_TIMEOUT = 3.0   # increased from 1.5s — new tokens need more time to index
+GOPLUS_BASE_URL  = "https://api.gopluslabs.io/api/v1/token_security"
+GOPLUS_TIMEOUT   = 3.0   # increased from 1.5s — new tokens need more time to index
 
 HONEYPOT_IS_URL  = "https://api.honeypot.is/v2/IsHoneypot"
 HONEYPOT_TIMEOUT = 3.0
@@ -98,8 +98,8 @@ ERC20_ABI = [
     {"inputs": [], "name": "totalSupply", "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
 ]
 
-DEXSCREENER_URL     = "https://api.dexscreener.com/latest/dex/pairs/bsc"
-DEXSCREENER_TIMEOUT = 3.0
+DEXSCREENER_BASE_URL = "https://api.dexscreener.com/latest/dex/pairs"
+DEXSCREENER_TIMEOUT  = 3.0
 
 FACTORY_ABI = [
     {
@@ -134,22 +134,43 @@ _SAFE_LP_HOLDERS = {
 
 # ── On-chain helpers ──────────────────────────────────────────────────────────
 
-def _get_bnb_price_sync(w3: Web3) -> float:
+def _get_bnb_price_sync(
+    w3: Web3,
+    router_address: str = None,
+    native_token: str = None,
+    stable_token: str = None,
+) -> float:
+    router_addr  = router_address or PANCAKE_ROUTER_V2
+    native_addr  = native_token   or WBNB
+    stable_addr  = stable_token   or BUSD
     try:
-        router  = w3.eth.contract(address=Web3.to_checksum_address(PANCAKE_ROUTER_V2), abi=ROUTER_ABI_PRICE)
+        router  = w3.eth.contract(address=Web3.to_checksum_address(router_addr), abi=ROUTER_ABI_PRICE)
         amounts = router.functions.getAmountsOut(
             Web3.to_wei(1, "ether"),
-            [Web3.to_checksum_address(WBNB), Web3.to_checksum_address(BUSD)],
+            [Web3.to_checksum_address(native_addr), Web3.to_checksum_address(stable_addr)],
         ).call()
-        return amounts[1] / 1e18
+        # USDC/USDT use 6 decimals, BUSD uses 18
+        decimals = 6 if stable_addr.lower() in (
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC Base
+            "0x55d398326f99059ff775485246999027b3197955",  # USDT BSC
+        ) else 18
+        return amounts[1] / 10 ** decimals
     except Exception as e:
-        log.warning(f"BNB price fetch failed: {e}")
+        log.warning(f"Native price fetch failed: {e}")
         return 0.0
 
 
+_NATIVE_TOKENS = {
+    WBNB.lower(),
+    "0x4200000000000000000000000000000000000006",  # WETH Base
+}
+
+
 def _get_liquidity_usd_sync(
-    w3: Web3, pair_address: str, base_token: str, bnb_price: float
+    w3: Web3, pair_address: str, base_token: str, native_price: float,
+    native_token: str = None,
 ) -> float:
+    native_lower = (native_token or WBNB).lower()
     try:
         pair     = w3.eth.contract(address=Web3.to_checksum_address(pair_address), abi=PAIR_ABI)
         reserves = pair.functions.getReserves().call()
@@ -158,7 +179,13 @@ def _get_liquidity_usd_sync(
         base_reserve = reserves[0] if token0.lower() == base_token.lower() else reserves[1]
         base_norm    = base_reserve / 1e18
 
-        return base_norm * bnb_price * 2 if base_token.lower() == WBNB.lower() else base_norm * 2
+        # If paired with native token (BNB/ETH): use price oracle; stablecoin pairs = 1:1 USD
+        if base_token.lower() == native_lower or base_token.lower() in _NATIVE_TOKENS:
+            return base_norm * native_price * 2
+        # Stablecoin (BUSD/USDT use 18 dec, USDC uses 6)
+        if base_token.lower() == "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913":
+            return (base_reserve / 1e6) * 2   # USDC on Base (6 decimals)
+        return base_norm * 2   # BUSD/USDT (18 decimals)
     except Exception as e:
         log.error(f"Liquidity check error {pair_address}: {e}")
         return 0.0
@@ -215,7 +242,13 @@ def _simulate_sell_sync(w3: Web3, token_address: str, pair_address: str) -> dict
         return {"ok": True}
 
 
-def _simulate_buy_sync(w3: Web3, token_address: str, wallet_address: str) -> dict:
+def _simulate_buy_sync(
+    w3: Web3,
+    token_address: str,
+    wallet_address: str,
+    router_address: str = None,
+    native_token: str = None,
+) -> dict:
     """
     Simulate a buy via eth_call — no real transaction, no gas spent.
 
@@ -230,9 +263,9 @@ def _simulate_buy_sync(w3: Web3, token_address: str, wallet_address: str) -> dic
     """
     try:
         token_cs  = Web3.to_checksum_address(token_address)
-        wbnb_cs   = Web3.to_checksum_address(WBNB)
-        router_cs = Web3.to_checksum_address(PANCAKE_ROUTER_V2)
-        sim_wei   = Web3.to_wei(0.005, "ether")   # 0.005 BNB test amount
+        wbnb_cs   = Web3.to_checksum_address(native_token or WBNB)
+        router_cs = Web3.to_checksum_address(router_address or PANCAKE_ROUTER_V2)
+        sim_wei   = Web3.to_wei(0.005, "ether")
         deadline  = int(time.time()) + 60
 
         router_price = w3.eth.contract(address=router_cs, abi=ROUTER_ABI_PRICE)
@@ -249,8 +282,6 @@ def _simulate_buy_sync(w3: Web3, token_address: str, wallet_address: str) -> dic
             return {"ok": False, "reason": f"Симуляция: нет ликвидности ({e})"}
 
         # ── Step 2: simulate actual swap ──────────────────────────────────────
-        # eth_call doesn't execute on-chain; nodes don't enforce sender balance.
-        # A revert here = contract actively blocks this buy (honeypot / not started).
         try:
             router_swap.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
                 0,
@@ -351,6 +382,7 @@ async def _honeypot_is_check(
     token_address: str,
     max_buy_tax: float = 999.0,
     max_sell_tax: float = 999.0,
+    chain_id: int = 56,
 ) -> dict:
     """
     Check honeypot.is — simulates BOTH buy and sell transactions on-chain.
@@ -367,7 +399,7 @@ async def _honeypot_is_check(
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 HONEYPOT_IS_URL,
-                params={"address": token_address, "chainID": "56"},
+                params={"address": token_address, "chainID": str(chain_id)},
                 timeout=aiohttp.ClientTimeout(total=HONEYPOT_TIMEOUT),
             ) as resp:
                 if resp.status != 200:
@@ -511,16 +543,17 @@ async def _check_deployer_bscscan(
         return {"ok": True, "deployer": None}
 
 
-async def _dexscreener_fetch(pair_address: str) -> dict | None:
+async def _dexscreener_fetch(pair_address: str, chain: str = "bsc") -> dict | None:
     """
     Fetch DexScreener data for a pair.
     Returns the pair dict or None if not indexed yet (brand-new pairs).
     Fields used: volume.m5, fdv, marketCap, pairCreatedAt, liquidity.usd
     """
     try:
+        url = f"{DEXSCREENER_BASE_URL}/{chain}/{pair_address}"
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                f"{DEXSCREENER_URL}/{pair_address}",
+                url,
                 timeout=aiohttp.ClientTimeout(total=DEXSCREENER_TIMEOUT),
             ) as resp:
                 if resp.status != 200:
@@ -533,40 +566,50 @@ async def _dexscreener_fetch(pair_address: str) -> dict | None:
         return None
 
 
-def _get_fdv_usd_sync(w3: Web3, token_address: str, bnb_price: float) -> float:
+def _get_fdv_usd_sync(
+    w3: Web3,
+    token_address: str,
+    native_price: float,
+    router_address: str = None,
+    native_token: str = None,
+) -> float:
     """
-    Calculate FDV (Fully Diluted Value) = totalSupply * pricePerToken_USD.
+    Calculate FDV = totalSupply * pricePerToken_USD.
     Uses on-chain totalSupply + router getAmountsOut for price.
-    Returns 0.0 on any error (fail-open — don't block on missing data).
+    Returns 0.0 on any error (fail-open).
     """
     try:
-        token_cs = Web3.to_checksum_address(token_address)
-        wbnb_cs  = Web3.to_checksum_address(WBNB)
-        token    = w3.eth.contract(address=token_cs, abi=ERC20_ABI)
+        token_cs  = Web3.to_checksum_address(token_address)
+        native_cs = Web3.to_checksum_address(native_token or WBNB)
+        token     = w3.eth.contract(address=token_cs, abi=ERC20_ABI)
 
         decimals         = token.functions.decimals().call()
         total_supply_raw = token.functions.totalSupply().call()
         total_supply     = total_supply_raw / (10 ** decimals)
 
-        router  = w3.eth.contract(address=Web3.to_checksum_address(PANCAKE_ROUTER_V2), abi=ROUTER_ABI_PRICE)
-        amounts = router.functions.getAmountsOut(10 ** decimals, [token_cs, wbnb_cs]).call()
-        price_bnb = amounts[1] / 1e18
+        router    = w3.eth.contract(
+            address=Web3.to_checksum_address(router_address or PANCAKE_ROUTER_V2),
+            abi=ROUTER_ABI_PRICE,
+        )
+        amounts   = router.functions.getAmountsOut(10 ** decimals, [token_cs, native_cs]).call()
+        price_native = amounts[1] / 1e18
 
-        return total_supply * price_bnb * bnb_price
+        return total_supply * price_native * native_price
     except Exception as e:
         log.debug(f"FDV calc failed for {token_address}: {e}")
         return 0.0
 
 
-async def _goplus_fetch(token_address: str) -> dict | None:
+async def _goplus_fetch(token_address: str, chain_id: int = 56) -> dict | None:
     """
-    Fetch GoPlus data with a 1.5s timeout.
+    Fetch GoPlus data for the given chain.
     Returns None if token not indexed yet or if request times out.
     """
     try:
+        url = f"{GOPLUS_BASE_URL}/{chain_id}"
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                GOPLUS_URL,
+                url,
                 params={"contract_addresses": token_address.lower()},
                 timeout=aiohttp.ClientTimeout(total=GOPLUS_TIMEOUT),
             ) as resp:
@@ -583,20 +626,34 @@ async def _goplus_fetch(token_address: str) -> dict | None:
 
 # ── Public async helpers ──────────────────────────────────────────────────────
 
-async def get_bnb_price(w3: Web3) -> float:
-    return await asyncio.to_thread(_get_bnb_price_sync, w3)
+async def get_bnb_price(
+    w3: Web3,
+    router_address: str = None,
+    native_token: str = None,
+    stable_token: str = None,
+) -> float:
+    return await asyncio.to_thread(
+        _get_bnb_price_sync, w3, router_address, native_token, stable_token
+    )
 
 
-def _find_pair_sync(w3: Web3, token_address: str) -> tuple[str, str] | None:
+def _find_pair_sync(
+    w3: Web3,
+    token_address: str,
+    factory_address: str = None,
+    base_tokens: list = None,
+) -> tuple[str, str] | None:
     """
-    Find the best PancakeSwap V2 pair for a token (tries WBNB, BUSD, USDT).
+    Find the best DEX V2 pair for a token.
     Returns (pair_address, base_token) or None if not found.
     """
     ZERO = "0x0000000000000000000000000000000000000000"
     factory = w3.eth.contract(
-        address=Web3.to_checksum_address(PANCAKE_FACTORY_V2), abi=FACTORY_ABI
+        address=Web3.to_checksum_address(factory_address or PANCAKE_FACTORY_V2),
+        abi=FACTORY_ABI,
     )
-    for base in [WBNB, BUSD, USDT]:
+    candidates = base_tokens if base_tokens else [WBNB, BUSD, USDT]
+    for base in candidates:
         try:
             pair = factory.functions.getPair(
                 Web3.to_checksum_address(token_address),
@@ -614,6 +671,13 @@ async def analyze_token(
     w3: Web3,
     wallet_address: str = "0x0000000000000000000000000000000000000001",
     bscscan_api_key: str = "",
+    chain_id: int = 56,
+    router_address: str = None,
+    factory_address: str = None,
+    native_token: str = None,
+    stable_token: str = None,
+    base_tokens: list = None,
+    dex_chain: str = "bsc",
 ) -> dict:
     """
     Full non-rejecting analysis of a token — collects all available metrics
@@ -622,31 +686,39 @@ async def analyze_token(
     Returns a dict with all metrics + per-check pass/fail flags.
     """
     # ── Find pair ─────────────────────────────────────────────────────────────
-    pair_info = await asyncio.to_thread(_find_pair_sync, w3, token_address)
+    pair_info = await asyncio.to_thread(
+        _find_pair_sync, w3, token_address, factory_address, base_tokens
+    )
     if not pair_info:
-        return {"found": False, "reason": "Пара не найдена на PancakeSwap V2"}
+        return {"found": False, "reason": "Пара не найдена на DEX"}
 
     pair_address, base_token = pair_info
 
     # ── Run all checks in parallel ─────────────────────────────────────────────
-    sim_buy_task      = asyncio.to_thread(_simulate_buy_sync,  w3, token_address, wallet_address)
-    sim_sell_task     = asyncio.to_thread(_simulate_sell_sync, w3, token_address, pair_address)
-    goplus_task       = _goplus_fetch(token_address)
-    honeypot_task     = _honeypot_is_check(token_address)
-    dexscreen_task    = _dexscreener_fetch(pair_address)
-    bnb_price_task    = asyncio.to_thread(_get_bnb_price_sync, w3)
-    deployer_task     = _check_deployer_bscscan(token_address, bscscan_api_key)
+    sim_buy_task   = asyncio.to_thread(
+        _simulate_buy_sync, w3, token_address, wallet_address, router_address, native_token
+    )
+    sim_sell_task  = asyncio.to_thread(_simulate_sell_sync, w3, token_address, pair_address)
+    goplus_task    = _goplus_fetch(token_address, chain_id)
+    honeypot_task  = _honeypot_is_check(token_address, chain_id=chain_id)
+    dexscreen_task = _dexscreener_fetch(pair_address, dex_chain)
+    price_task     = asyncio.to_thread(
+        _get_bnb_price_sync, w3, router_address, native_token, stable_token
+    )
+    deployer_task  = _check_deployer_bscscan(token_address, bscscan_api_key)
 
     sim_result, sell_sim, goplus_data, hp_result, dex, bnb_price, deployer_result = await asyncio.gather(
         sim_buy_task, sim_sell_task, goplus_task, honeypot_task, dexscreen_task,
-        bnb_price_task, deployer_task
+        price_task, deployer_task
     )
 
     # ── On-chain metrics ──────────────────────────────────────────────────────
     liquidity_usd = await asyncio.to_thread(
-        _get_liquidity_usd_sync, w3, pair_address, base_token, bnb_price
+        _get_liquidity_usd_sync, w3, pair_address, base_token, bnb_price, native_token
     )
-    fdv_usd = await asyncio.to_thread(_get_fdv_usd_sync, w3, token_address, bnb_price)
+    fdv_usd = await asyncio.to_thread(
+        _get_fdv_usd_sync, w3, token_address, bnb_price, router_address, native_token
+    )
 
     # ── Token identity ────────────────────────────────────────────────────────
     if goplus_data:
@@ -778,16 +850,22 @@ async def check_token(
     max_buy_tax:          float,
     max_sell_tax:         float,
     wallet_address:       str   = "0x0000000000000000000000000000000000000001",
-    lp_holder_max_pct:    float = 30.0,    # reject if any unlocked wallet holds >X% of LP
+    lp_holder_max_pct:    float = 30.0,
     min_market_cap_usd:   float = 30_000,
     min_fdv_usd:          float = 200_000,
     max_fdv_usd:          float = 10_000_000,
-    max_top10_holder_pct: float = 30.0,   # top-10 non-DEX/locked holders combined
-    min_volume_5m_usd:    float = 1_000,   # skip if DexScreener 5-min volume below this
-    max_token_age_days:   int   = 30,      # skip if pair is older than this
-    min_holder_count:     int   = 25,      # min number of token holders (GoPlus)
-    bscscan_api_key:      str   = "",      # BSCScan API key for deployer history check
-    max_deployer_tokens_30d: int = 3,     # reject if deployer created >N contracts in 30 days
+    max_top10_holder_pct: float = 30.0,
+    min_volume_5m_usd:    float = 1_000,
+    max_token_age_days:   int   = 30,
+    min_holder_count:     int   = 25,
+    bscscan_api_key:      str   = "",
+    max_deployer_tokens_30d: int = 3,
+    # ── Chain-specific params (defaults = BSC PancakeSwap V2) ─────────────────
+    chain_id:       int = 56,
+    router_address: str = None,
+    native_token:   str = None,
+    stable_token:   str = None,
+    dex_chain:      str = "bsc",
 ) -> dict:
     """
     Two-track security check running in parallel:
@@ -807,17 +885,15 @@ async def check_token(
     """
 
     # ── All checks run in parallel ────────────────────────────────────────────
-    # GoPlus is included but NON-BLOCKING: if it times out or returns None,
-    # analysis continues using on-chain simulation + honeypot.is + LP on-chain.
-    # This lets us buy in the FIRST SECONDS of listing without waiting for GoPlus
-    # (GoPlus indexes new tokens only after 15-30 min).
-    sim_buy_task   = asyncio.to_thread(_simulate_buy_sync,    w3, token_address, wallet_address)
-    sim_sell_task  = asyncio.to_thread(_simulate_sell_sync,   w3, token_address, pair_address)
-    lp_onchain_task= asyncio.to_thread(_check_lp_onchain_sync, w3, pair_address, lp_holder_max_pct)
-    goplus_task    = _goplus_fetch(token_address)
-    honeypot_task  = _honeypot_is_check(token_address, max_buy_tax, max_sell_tax)
-    dexscreen_task = _dexscreener_fetch(pair_address)
-    deployer_task  = _check_deployer_bscscan(token_address, bscscan_api_key, max_deployer_tokens_30d)
+    sim_buy_task    = asyncio.to_thread(
+        _simulate_buy_sync, w3, token_address, wallet_address, router_address, native_token
+    )
+    sim_sell_task   = asyncio.to_thread(_simulate_sell_sync,    w3, token_address, pair_address)
+    lp_onchain_task = asyncio.to_thread(_check_lp_onchain_sync, w3, pair_address, lp_holder_max_pct)
+    goplus_task     = _goplus_fetch(token_address, chain_id)
+    honeypot_task   = _honeypot_is_check(token_address, max_buy_tax, max_sell_tax, chain_id)
+    dexscreen_task  = _dexscreener_fetch(pair_address, dex_chain)
+    deployer_task   = _check_deployer_bscscan(token_address, bscscan_api_key, max_deployer_tokens_30d)
 
     (sim_result, sell_sim, lp_result,
      goplus_data, hp_result, dex, deployer_result) = await asyncio.gather(
@@ -912,18 +988,20 @@ async def check_token(
     # GoPlus None = not yet indexed — perfectly normal for brand-new tokens, not a problem
 
     # ── Liquidity check ───────────────────────────────────────────────────────
-    bnb_price = await get_bnb_price(w3)
-    if bnb_price == 0.0:
-        return {"ok": False, "reason": "Не удалось получить цену BNB"}
+    native_price = await get_bnb_price(w3, router_address, native_token, stable_token)
+    if native_price == 0.0:
+        return {"ok": False, "reason": "Не удалось получить цену нативного токена"}
 
     liquidity_usd = await asyncio.to_thread(
-        _get_liquidity_usd_sync, w3, pair_address, base_token, bnb_price
+        _get_liquidity_usd_sync, w3, pair_address, base_token, native_price, native_token
     )
     if liquidity_usd < min_liquidity_usd:
         return {"ok": False, "reason": f"Ликвидность: ${liquidity_usd:,.0f} < ${min_liquidity_usd:,.0f}"}
 
     # ── FDV / Market cap check (on-chain) ─────────────────────────────────────
-    fdv_usd = await asyncio.to_thread(_get_fdv_usd_sync, w3, token_address, bnb_price)
+    fdv_usd = await asyncio.to_thread(
+        _get_fdv_usd_sync, w3, token_address, native_price, router_address, native_token
+    )
     if fdv_usd > 0:
         if fdv_usd < min_market_cap_usd:
             return {"ok": False, "reason": f"Market cap: ${fdv_usd:,.0f} < ${min_market_cap_usd:,.0f}"}
@@ -967,7 +1045,7 @@ async def check_token(
         "sell_tax":       sell_tax,
         "liquidity_usd":  liquidity_usd,
         "fdv_usd":        fdv_usd,
-        "bnb_price":      bnb_price,
+        "bnb_price":      native_price,
         "holder_count":   holder_count,
         "is_mintable":    bool(goplus_data and goplus_data.get("is_mintable")   == "1"),
         "hidden_owner":   bool(goplus_data and goplus_data.get("hidden_owner")  == "1"),

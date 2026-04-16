@@ -134,3 +134,31 @@ PANCAKE_ROUTER_V2  = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
 
 # Tokens considered "base" — a new token must be paired with one of these
 BASE_TOKENS = {WBNB.lower(), BUSD.lower(), USDT.lower()}
+
+# ── Base chain (Uniswap V2) ───────────────────────────────────────────────────
+# Enable via BASE_CHAIN_ENABLED=true env var; requires BASE_WS_RPC (public or Alchemy)
+BASE_CHAIN_ENABLED = os.getenv("BASE_CHAIN_ENABLED", "false").lower() == "true"
+BASE_CHAIN_ID      = 8453
+
+# RPC endpoints for Base
+BASE_HTTP_RPC        = os.getenv("BASE_HTTP_RPC",        "https://mainnet.base.org")
+BASE_HTTP_RPC_BACKUP = os.getenv("BASE_HTTP_RPC_BACKUP", "https://base.publicnode.com")
+BASE_WS_RPC          = os.getenv("BASE_WS_RPC",          "wss://base.publicnode.com/websocket")
+
+BASE_HTTP_RPCS = list(dict.fromkeys(
+    [u for u in [BASE_HTTP_RPC, BASE_HTTP_RPC_BACKUP,
+                 "https://base-mainnet.g.alchemy.com/v2/demo"] if u]
+))
+BASE_WS_RPCS = [BASE_WS_RPC] if BASE_WS_RPC else []
+
+# Base native token + main stablecoin
+WETH_BASE = "0x4200000000000000000000000000000000000006"
+USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+
+# Uniswap V2 on Base (same interface as PancakeSwap V2)
+UNISWAP_V2_FACTORY_BASE       = "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6"
+UNISWAP_V2_ROUTER_BASE        = "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24"
+UNISWAP_V2_INIT_CODE_HASH_BASE = "96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f"
+
+# Base tokens paired against new tokens on Base
+BASE_TOKENS_BASE = {WETH_BASE.lower(), USDC_BASE.lower()}

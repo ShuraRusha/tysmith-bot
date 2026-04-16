@@ -9,8 +9,9 @@ import config
 
 log = logging.getLogger(__name__)
 
-_DATA_DIR      = os.getenv("DATA_DIR", "/data")
-POSITIONS_FILE = os.path.join(_DATA_DIR, "tysmith_positions.json")
+_DATA_DIR           = os.getenv("DATA_DIR", "/data")
+POSITIONS_FILE      = os.path.join(_DATA_DIR, "tysmith_positions.json")
+POSITIONS_FILE_BASE = os.path.join(_DATA_DIR, "tysmith_positions_base.json")
 
 
 @dataclass
@@ -34,6 +35,8 @@ class Position:
     opened_at:        float = field(default_factory=time.time)
     moon_bag_tokens:  int   = field(default=0)    # tokens excluded from auto-sell (moon bag)
     deployer_address: str   = field(default="")  # deployer wallet — auto-blacklisted on honeypot
+    # Chain identifier ("bsc" or "base")
+    chain:            str   = field(default="bsc")
     # Runtime state
     tp1_done:         bool  = field(default=False)
     peak_price:       float = field(default=0.0)
@@ -43,9 +46,10 @@ class Position:
 
 
 class PositionManager:
-    def __init__(self, trader, notify_fn):
-        self.trader    = trader
-        self.notify    = notify_fn
+    def __init__(self, trader, notify_fn, positions_file: str = None):
+        self.trader         = trader
+        self.notify         = notify_fn
+        self.positions_file = positions_file or POSITIONS_FILE
         self.positions: dict[str, Position] = {}
         self.on_close  = None  # optional callback(pos, pnl_pct, reason, sell_price)
 
@@ -55,7 +59,7 @@ class PositionManager:
         try:
             os.makedirs(_DATA_DIR, exist_ok=True)
             data = {addr: asdict(pos) for addr, pos in self.positions.items()}
-            with open(POSITIONS_FILE, "w") as f:
+            with open(self.positions_file, "w") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             log.error(f"Failed to save positions: {e}")
@@ -63,9 +67,9 @@ class PositionManager:
     def load(self) -> int:
         """Load positions from disk. Returns number of restored positions."""
         try:
-            if not os.path.exists(POSITIONS_FILE):
+            if not os.path.exists(self.positions_file):
                 return 0
-            with open(POSITIONS_FILE) as f:
+            with open(self.positions_file) as f:
                 data = json.load(f)
             for addr, d in data.items():
                 try:
