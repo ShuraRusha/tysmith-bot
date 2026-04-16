@@ -45,7 +45,7 @@ BUY_MIN_BNB        = float(os.getenv("BUY_MIN_BNB",        "0.02")) # skip trade
 BUY_MAX_BNB        = float(os.getenv("BUY_MAX_BNB",        "0.5"))  # hard cap per trade
 GAS_RESERVE_BNB    = float(os.getenv("GAS_RESERVE_BNB",    "0.015"))# always keep in wallet
 
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "20000"))  # pool liquidity floor ($20k — safe for 0.04 BNB trades)
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "15000"))  # pool liquidity floor ($15k — safe for 0.04 BNB trades)
 MAX_BUY_TAX       = float(os.getenv("MAX_BUY_TAX",       "5"))
 MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "5"))
 
@@ -109,13 +109,13 @@ MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "0"))  # 0 = auto formu
 TOP_HOLDER_MAX_PCT   = float(os.getenv("TOP_HOLDER_MAX_PCT",   "30"))  # reject if single wallet > X%
 MAX_TOP10_HOLDER_PCT = float(os.getenv("MAX_TOP10_HOLDER_PCT", "30"))  # top-10 combined (excl. DEX/locked) > X% → reject
 LP_HOLDER_MAX_PCT    = float(os.getenv("LP_HOLDER_MAX_PCT",    "30"))  # reject if any unlocked wallet holds >X% of LP
-MIN_HOLDER_COUNT     = int(os.getenv("MIN_HOLDER_COUNT",       "10"))  # min token holder count (lowered — new tokens accumulate holders slowly)
+MIN_HOLDER_COUNT     = int(os.getenv("MIN_HOLDER_COUNT",       "0"))   # 0 = disabled — sniper enters first, 1-3 holders is normal at launch
 
 # ── Token quality filters ─────────────────────────────────────────────────────
-MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD",   "20000"))    # min market cap at buy time
-MIN_FDV_USD        = float(os.getenv("MIN_FDV_USD",          "150000"))   # min fully-diluted value
+MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD",   "10000"))    # min market cap at buy time
+MIN_FDV_USD        = float(os.getenv("MIN_FDV_USD",          "50000"))    # min fully-diluted value (real safety = honeypot sim + LP check)
 MAX_FDV_USD        = float(os.getenv("MAX_FDV_USD",          "10000000")) # max FDV (avoid huge caps)
-MIN_VOLUME_5M_USD  = float(os.getenv("MIN_VOLUME_5M_USD",    "1000"))     # DexScreener 5-min volume (lowered for fresh tokens)
+MIN_VOLUME_5M_USD  = float(os.getenv("MIN_VOLUME_5M_USD",    "500"))      # DexScreener 5-min volume (low — fresh tokens haven't accumulated volume yet)
 MAX_TOKEN_AGE_DAYS = int(os.getenv("MAX_TOKEN_AGE_DAYS",     "7"))        # reject tokens older than this
 
 # ── Moon bag ──────────────────────────────────────────────────────────────────

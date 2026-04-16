@@ -152,7 +152,7 @@ _MAX_REJECT_LOG = 20
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 8
+SETTINGS_VERSION = 9
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -265,6 +265,23 @@ def _load_settings():
             log.info(
                 "Settings migration v7→v8: loosened entry filters "
                 "(liq=20k, fdv=150k, mcap=20k, vol5m=1k, holders=10)"
+            )
+
+        # Migration v8 → v9: fix filters that block ALL fresh listings
+        #   MIN_HOLDER_COUNT  10 → 0  (disabled: sniper enters first, 1-3 holders is normal)
+        #   MIN_FDV_USD      150k → 50k  (tokens at $63-70k FDV were blocked; real safety = sim)
+        #   MIN_MARKET_CAP_USD 20k → 10k (same reasoning)
+        #   MIN_LIQUIDITY_USD  20k → 15k ($18.5k pair was blocked by $1.4k)
+        #   MIN_VOLUME_5M_USD  1k → 500  (fresh tokens haven't had 5 min to accumulate volume)
+        if saved_version < 9:
+            config.MIN_HOLDER_COUNT   = 0
+            config.MIN_FDV_USD        = 50_000.0
+            config.MIN_MARKET_CAP_USD = 10_000.0
+            config.MIN_LIQUIDITY_USD  = 15_000.0
+            config.MIN_VOLUME_5M_USD  = 500.0
+            log.info(
+                "Settings migration v8→v9: tuned for fresh listing sniper "
+                "(holders=0, fdv=50k, mcap=10k, liq=15k, vol5m=500)"
             )
 
         # Restore bot mode
