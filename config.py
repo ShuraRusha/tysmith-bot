@@ -83,6 +83,8 @@ TX_DEADLINE_SEC   = int(os.getenv("TX_DEADLINE_SEC",     "30"))    # short deadl
 # Free tier at bscscan.com/myapikey — 5 req/s, enough for this bot
 # If not set, deployer check is skipped (fail-open).
 BSCSCAN_API_KEY          = os.getenv("BSCSCAN_API_KEY", "")
+# Basescan API key for Base chain deployer history (free at basescan.org/myapikey)
+BASESCAN_API_KEY         = os.getenv("BASESCAN_API_KEY", "")
 MAX_DEPLOYER_TOKENS_30D  = int(os.getenv("MAX_DEPLOYER_TOKENS_30D", "3"))  # >N contracts/30d = serial scammer
 
 # ── Position monitoring ──────────────────────────────────────────────────────

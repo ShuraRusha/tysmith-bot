@@ -435,17 +435,21 @@ async def _honeypot_is_check(
         return {"ok": True, "buy_tax": None, "sell_tax": None}
 
 
-BSCSCAN_API_URL = "https://api.bscscan.com/api"
-BSCSCAN_TIMEOUT = 5.0
+BSCSCAN_API_URL  = "https://api.bscscan.com/api"
+BASESCAN_API_URL = "https://api.basescan.org/api"
+EXPLORER_TIMEOUT = 5.0
+BSCSCAN_TIMEOUT  = EXPLORER_TIMEOUT   # backwards compat alias
 
 
 async def _check_deployer_bscscan(
     token_address: str,
     api_key: str,
     max_deploy_count_30d: int = 3,
+    explorer_url: str = None,
 ) -> dict:
     """
-    Check token deployer history via BSCScan API.
+    Check token deployer history via block explorer API (BSCScan or Basescan).
+    Identical API interface — just pass explorer_url=BASESCAN_API_URL for Base.
 
     Steps:
       1. Resolve token deployer via getcontractcreation
@@ -460,18 +464,20 @@ async def _check_deployer_bscscan(
     if not api_key:
         return {"ok": True, "deployer": None}
 
+    api_url = explorer_url or BSCSCAN_API_URL
+
     try:
         async with aiohttp.ClientSession() as session:
             # ── Step 1: get contract creator ──────────────────────────────────
             async with session.get(
-                BSCSCAN_API_URL,
+                api_url,
                 params={
                     "module":            "contract",
                     "action":            "getcontractcreation",
                     "contractaddresses": token_address,
                     "apikey":            api_key,
                 },
-                timeout=aiohttp.ClientTimeout(total=BSCSCAN_TIMEOUT),
+                timeout=aiohttp.ClientTimeout(total=EXPLORER_TIMEOUT),
             ) as resp:
                 body = await resp.json(content_type=None)
 
@@ -496,7 +502,7 @@ async def _check_deployer_bscscan(
             # ── Step 2: scan deployer tx history ─────────────────────────────
             cutoff = int(time.time()) - 30 * 86400
             async with session.get(
-                BSCSCAN_API_URL,
+                api_url,
                 params={
                     "module":  "account",
                     "action":  "txlist",
@@ -506,12 +512,12 @@ async def _check_deployer_bscscan(
                     "offset":  "100",
                     "apikey":  api_key,
                 },
-                timeout=aiohttp.ClientTimeout(total=BSCSCAN_TIMEOUT),
+                timeout=aiohttp.ClientTimeout(total=EXPLORER_TIMEOUT),
             ) as resp:
                 body2 = await resp.json(content_type=None)
 
         txs = body2.get("result") or []
-        if isinstance(txs, str):  # BSCScan error string
+        if isinstance(txs, str):  # explorer API error string
             return {"ok": True, "deployer": deployer}
 
         # Count contract deployments (to == "") in the last 30 days
@@ -678,6 +684,7 @@ async def analyze_token(
     stable_token: str = None,
     base_tokens: list = None,
     dex_chain: str = "bsc",
+    explorer_url: str = None,   # override block explorer (default = BSCScan)
 ) -> dict:
     """
     Full non-rejecting analysis of a token — collects all available metrics
@@ -705,7 +712,7 @@ async def analyze_token(
     price_task     = asyncio.to_thread(
         _get_bnb_price_sync, w3, router_address, native_token, stable_token
     )
-    deployer_task  = _check_deployer_bscscan(token_address, bscscan_api_key)
+    deployer_task  = _check_deployer_bscscan(token_address, bscscan_api_key, explorer_url=explorer_url)
 
     sim_result, sell_sim, goplus_data, hp_result, dex, bnb_price, deployer_result = await asyncio.gather(
         sim_buy_task, sim_sell_task, goplus_task, honeypot_task, dexscreen_task,
@@ -866,6 +873,7 @@ async def check_token(
     native_token:   str = None,
     stable_token:   str = None,
     dex_chain:      str = "bsc",
+    explorer_url:   str = None,   # override block explorer (default = BSCScan)
 ) -> dict:
     """
     Two-track security check running in parallel:
@@ -893,7 +901,7 @@ async def check_token(
     goplus_task     = _goplus_fetch(token_address, chain_id)
     honeypot_task   = _honeypot_is_check(token_address, max_buy_tax, max_sell_tax, chain_id)
     dexscreen_task  = _dexscreener_fetch(pair_address, dex_chain)
-    deployer_task   = _check_deployer_bscscan(token_address, bscscan_api_key, max_deployer_tokens_30d)
+    deployer_task   = _check_deployer_bscscan(token_address, bscscan_api_key, max_deployer_tokens_30d, explorer_url=explorer_url)
 
     (sim_result, sell_sim, lp_result,
      goplus_data, hp_result, dex, deployer_result) = await asyncio.gather(

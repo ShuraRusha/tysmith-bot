@@ -747,13 +747,14 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
         max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
         lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
         min_holder_count=config.MIN_HOLDER_COUNT,
-        bscscan_api_key="",  # no BSCScan for Base; Basescan key optional
+        bscscan_api_key=config.BASESCAN_API_KEY,
         max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
         chain_id=config.BASE_CHAIN_ID,
         router_address=config.UNISWAP_V2_ROUTER_BASE,
         native_token=config.WETH_BASE,
         stable_token=config.USDC_BASE,
         dex_chain="base",
+        explorer_url="https://api.basescan.org/api",
     )
 
     if not result["ok"]:
@@ -1561,7 +1562,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"LP незаблокирован: {config.LP_HOLDER_MAX_PCT:.0f}% макс на кошелёк\n"
         f"Max tax: {config.MAX_BUY_TAX}% buy / {config.MAX_SELL_TAX}% sell\n"
         f"Деплоер: макс {config.MAX_DEPLOYER_TOKENS_30D} контракт(ов) за 30 дн. "
-        f"{'✅ BSCScan OK' if config.BSCSCAN_API_KEY else '⚠️ BSCScan API ключ не задан'}\n\n"
+        f"{'✅ BSCScan OK' if config.BSCSCAN_API_KEY else '⚠️ BSCScan нет ключа'}"
+        f"{' | ✅ Basescan OK' if config.BASESCAN_API_KEY else ' | ⚠️ Basescan нет ключа'}\n\n"
         f"*Исполнение:*\n"
         f"Gas buy: {gas_mode}\n"
         f"Slip buy/sell: {config.SLIPPAGE_BUY}%/{config.SLIPPAGE_SELL}%\n"
