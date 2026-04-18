@@ -1980,6 +1980,40 @@ async def _daily_report():
             log.error(f"Daily report error: {e}")
 
 
+# ── WebSocket watchdog ────────────────────────────────────────────────────────
+
+_BOT_START_TIME = time.time()
+_WS_ALERT_INTERVAL = 30 * 60   # repeat alert every 30 min while broken
+
+
+async def _ws_watchdog():
+    """
+    Alert if no PairCreated events received for 15 minutes after startup.
+    BSC normally produces dozens of new pairs per hour — silence = broken WS.
+    """
+    global _last_seen_ts
+    await asyncio.sleep(15 * 60)   # give WS 15 min to connect and deliver first event
+    while True:
+        uptime = time.time() - _BOT_START_TIME
+        since_last = time.time() - _last_seen_ts if _last_seen_ts else uptime
+
+        if since_last > 15 * 60 and not is_paused:
+            log.error(f"WS watchdog: no pairs seen for {since_last/60:.0f} min — alerting")
+            try:
+                await tg_send(
+                    f"⚠️ *WebSocket не получает события!*\n\n"
+                    f"Пар замечено за последние *{since_last/60:.0f} мин*: *0*\n"
+                    f"На BSC обычно >10 пар/час — скорее всего WS-соединение оборвалось.\n\n"
+                    f"Бот пытается переподключиться автоматически.\n"
+                    f"Если проблема не исчезнет через 5 мин — перезапусти сервис на Railway."
+                )
+            except Exception as e:
+                log.error(f"WS watchdog alert failed: {e}")
+            await asyncio.sleep(_WS_ALERT_INTERVAL)
+        else:
+            await asyncio.sleep(5 * 60)   # check every 5 min when healthy
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 # Distributed lock on shared /data volume — prevents two Railway containers
@@ -2122,6 +2156,7 @@ async def main():
     asyncio.create_task(watch_pairs(config.BSC_WS_RPC, on_pair_found))
     asyncio.create_task(_cleanup_pending())
     asyncio.create_task(_daily_report())
+    asyncio.create_task(_ws_watchdog())
 
     if config.MEMPOOL_ENABLED:
         asyncio.create_task(watch_pending_pairs(config.BSC_WS_RPC, on_pending_pair_found))
