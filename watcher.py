@@ -99,6 +99,13 @@ async def _watch_single(ws_url: str, callback, factory_address: str = None, base
                         if len(topics) < 3:
                             continue
 
+                        # Verify the event is from the expected factory.
+                        # Some public BSC nodes ignore the address filter in eth_subscribe
+                        # and return ALL PairCreated events — this guard prevents cross-factory noise.
+                        event_addr = log_entry.get("address", "")
+                        if event_addr.lower() != factory.lower():
+                            continue
+
                         token0 = Web3.to_checksum_address("0x" + topics[1][-40:])
                         token1 = Web3.to_checksum_address("0x" + topics[2][-40:])
 

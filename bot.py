@@ -196,6 +196,35 @@ _last_reject:   str   = ""  # reason of last rejection
 _reject_log: list[dict] = []  # last 20 rejections with token + reason
 _MAX_REJECT_LOG = 20
 
+# ── Cross-DEX token deduplication ─────────────────────────────────────────────
+# Prevents the same token from being processed by multiple DEX watchers
+# simultaneously (e.g. PancakeSwap + BiSwap both list the same token).
+# Uses token address as key, not pair address (pairs differ per DEX).
+_seen_tokens_ts: dict[str, float] = {}
+_CROSS_DEX_TOKEN_TTL = 120  # seconds — window to consider a token "already handled"
+
+
+def _is_token_duplicate(token_address: str, dex_label: str = "") -> bool:
+    """
+    Returns True if this token was already seen by another DEX watcher recently.
+    Marks it as seen and returns False if this is the first time.
+    Thread-safe for asyncio (single-threaded event loop, no await inside).
+    """
+    key = token_address.lower()
+    now = time.time()
+    last_seen = _seen_tokens_ts.get(key, 0)
+    if now - last_seen < _CROSS_DEX_TOKEN_TTL:
+        log.info(f"{dex_label} skipping {key[:10]}… — already handled by another DEX watcher")
+        return True
+    _seen_tokens_ts[key] = now
+    # Prune old entries to avoid unbounded growth
+    if len(_seen_tokens_ts) > 2000:
+        cutoff = now - _CROSS_DEX_TOKEN_TTL
+        stale = [k for k, v in _seen_tokens_ts.items() if v < cutoff]
+        for k in stale:
+            del _seen_tokens_ts[k]
+    return False
+
 
 # ── Settings persistence ──────────────────────────────────────────────────────
 
@@ -585,6 +614,9 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         log.info(f"Bot paused — skipping {token_address}")
         return
 
+    if _is_token_duplicate(token_address, "[PancakeSwap]"):
+        return
+
     _stats_seen  += 1
     _last_seen_ts = time.time()
 
@@ -795,6 +827,9 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
     if is_paused or not trader_base or not pos_manager_base:
         return
 
+    if _is_token_duplicate(token_address, "[Base]"):
+        return
+
     _stats_seen  += 1
     _last_seen_ts = time.time()
 
@@ -966,6 +1001,9 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
     if is_paused or not trader_biswap or not pos_manager_biswap:
         return
 
+    if _is_token_duplicate(token_address, "[BiSwap]"):
+        return
+
     _stats_seen  += 1
     _last_seen_ts = time.time()
 
@@ -1118,6 +1156,9 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
     global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject
 
     if is_paused or not trader_baseswap or not pos_manager_baseswap:
+        return
+
+    if _is_token_duplicate(token_address, "[BaseSwap]"):
         return
 
     _stats_seen  += 1
