@@ -201,7 +201,7 @@ _MAX_REJECT_LOG = 20
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 9
+SETTINGS_VERSION = 10
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -333,17 +333,31 @@ def _load_settings():
                 "(holders=0, fdv=50k, mcap=10k, liq=15k, vol5m=500)"
             )
 
-        # Restore bot mode
-        if "__is_auto" in data:
+        # Migration v9 → v10: loosen tax filters + force auto mode on
+        #   MAX_BUY_TAX   5% → 10%  (too strict — normal tokens blocked, honeypot.is catches real ones)
+        #   MAX_SELL_TAX  5% → 10%  (same reasoning)
+        #   MIN_LIQUIDITY_USD 15k → 10k (more pairs qualify)
+        #   is_auto = True  (default was off — always start in auto mode now)
+        if saved_version < 10:
+            config.MAX_BUY_TAX        = 10.0
+            config.MAX_SELL_TAX       = 10.0
+            config.MIN_LIQUIDITY_USD  = 10_000.0
+            is_auto = True   # force auto mode on — that's the whole point of a sniper bot
+            log.info(
+                "Settings migration v9→v10: tax 5%→10%, liq 15k→10k, auto mode ON"
+            )
+
+        # Restore bot mode (after migrations so v10 override above takes effect)
+        if "__is_auto" in data and saved_version >= 10:
             is_auto = bool(data["__is_auto"])
         if "__is_paused" in data:
             is_paused = bool(data["__is_paused"])
 
-        # ENV var always wins: AUTO_BUY=true overrides whatever is in the settings file.
-        # Prevents the case where an old settings file (is_auto=false) overrides
-        # a freshly set Railway env var after a redeploy.
-        if config.AUTO_BUY:
-            is_auto = True
+        # ENV var AUTO_BUY=false explicitly disables auto mode (override everything)
+        # By default AUTO_BUY=true so this only fires when user explicitly sets =false
+        if not config.AUTO_BUY:
+            is_auto = False
+            log.info("AUTO_BUY=false env var → auto mode disabled")
 
         log.info(
             f"Loaded persisted settings (file v{saved_version}, current v{SETTINGS_VERSION}) | "
@@ -752,6 +766,10 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         return
 
     # ── MANUAL MODE: send notification with buttons ───────────────────────────
+    log.warning(
+        f"MANUAL mode for {info['symbol']} — is_auto={is_auto}. "
+        f"To enable auto: /auto on  OR set AUTO_BUY=true in Railway env vars"
+    )
     pending[cb_id] = {
         "token_address": token_address,
         "base_token":    base_token,

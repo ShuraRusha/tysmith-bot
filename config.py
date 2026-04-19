@@ -50,9 +50,9 @@ BUY_MIN_BNB        = float(os.getenv("BUY_MIN_BNB",        "0.02")) # skip trade
 BUY_MAX_BNB        = float(os.getenv("BUY_MAX_BNB",        "0.5"))  # hard cap per trade
 GAS_RESERVE_BNB    = float(os.getenv("GAS_RESERVE_BNB",    "0.015"))# always keep in wallet
 
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "15000"))  # pool liquidity floor ($15k — safe for 0.04 BNB trades)
-MAX_BUY_TAX       = float(os.getenv("MAX_BUY_TAX",       "5"))
-MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "5"))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "10000"))  # pool liquidity floor
+MAX_BUY_TAX       = float(os.getenv("MAX_BUY_TAX",       "10"))   # 10% — honeypot.is blocks anything above (real honeypots are 20-99%)
+MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "10"))   # 10% — GoPlus also checks; real honeypots won't pass sell simulation
 
 # ── Entry/Exit strategy ───────────────────────────────────────────────────────
 # Phase 1 — fixed TP: sell TAKE_PROFIT_1_PCT% at TAKE_PROFIT_1% gain
@@ -108,8 +108,9 @@ MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS",     "3"))    # manual mode ca
 PENDING_TTL       = int(os.getenv("PENDING_TTL",       "60"))   # seconds before alert expires
 
 # Auto-buy mode: bot buys immediately without user confirmation
+# DEFAULT=true — bot starts in auto mode; set AUTO_BUY=false to start in manual mode
 # MAX_AUTO_POSITIONS=0 → calculated automatically from balance tier (recommended)
-AUTO_BUY           = os.getenv("AUTO_BUY",           "false").lower() == "true"
+AUTO_BUY           = os.getenv("AUTO_BUY",           "true").lower() == "true"
 MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "0"))  # 0 = auto formula
 
 # ── Safety filters ────────────────────────────────────────────────────────────
