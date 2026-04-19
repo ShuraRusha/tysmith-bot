@@ -131,6 +131,22 @@ MAX_TOKEN_AGE_DAYS = int(os.getenv("MAX_TOKEN_AGE_DAYS",     "7"))        # reje
 MOON_BAG_MIN_USD = float(os.getenv("MOON_BAG_MIN_USD", "100"))  # activate when trade >= $100
 MOON_BAG_PCT     = float(os.getenv("MOON_BAG_PCT",     "5"))    # % of bought tokens to keep
 
+# ── BiSwap V2 (BSC) ──────────────────────────────────────────────────────────
+# Enable via BISWAP_ENABLED=true; runs in parallel with PancakeSwap
+BISWAP_ENABLED  = os.getenv("BISWAP_ENABLED", "false").lower() == "true"
+BISWAP_FACTORY  = "0x858E3312ed3A876947EA49d572A7C42DE08af7EE"
+BISWAP_ROUTER   = "0x3a6d8cA21D1CF76F653A67577FA0D27453350dD8"
+# BiSwap V2 INIT_CODE_HASH (used only by mempool watcher for CREATE2 prediction)
+BISWAP_INIT_CODE_HASH = "fea293c909d87cd4153593f077b76bb7e94340200f4ee84211ae8e4f9bd7ffdf"
+
+# ── BaseSwap V2 (Base) ────────────────────────────────────────────────────────
+# Enable via BASESWAP_ENABLED=true; requires BASE_CHAIN_ENABLED=true
+BASESWAP_ENABLED      = os.getenv("BASESWAP_ENABLED", "false").lower() == "true"
+BASESWAP_FACTORY_BASE = "0xFDa619b6d20975be80A10332cD39b9a4b0FAa8BB"
+BASESWAP_ROUTER_BASE  = "0x327Df1E6de05895d2ab08513aaDD9313Fe505d86"
+# BaseSwap init code hash (Uniswap V2 fork, different bytecode from UniswapV2)
+BASESWAP_INIT_CODE_HASH_BASE = "b618a2730fae167f5f8ac7bd659dd8436d571872655bcb6fd11f2158c8a64a3b"
+
 # ── BSC contract addresses ────────────────────────────────────────────────────
 WBNB  = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
 BUSD  = "0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56"

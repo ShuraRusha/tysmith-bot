@@ -24,6 +24,14 @@ _PANCAKE_INIT_CODE_HASH = bytes.fromhex(
 _UNISWAP_V2_BASE_INIT_CODE_HASH = bytes.fromhex(
     "96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f"
 )
+# BiSwap V2 INIT_CODE_HASH
+_BISWAP_INIT_CODE_HASH = bytes.fromhex(
+    "fea293c909d87cd4153593f077b76bb7e94340200f4ee84211ae8e4f9bd7ffdf"
+)
+# BaseSwap V2 INIT_CODE_HASH
+_BASESWAP_INIT_CODE_HASH = bytes.fromhex(
+    "b618a2730fae167f5f8ac7bd659dd8436d571872655bcb6fd11f2158c8a64a3b"
+)
 
 
 def compute_pair_address(

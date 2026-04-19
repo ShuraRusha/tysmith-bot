@@ -9,9 +9,11 @@ import config
 
 log = logging.getLogger(__name__)
 
-_DATA_DIR           = os.getenv("DATA_DIR", "/data")
-POSITIONS_FILE      = os.path.join(_DATA_DIR, "tysmith_positions.json")
-POSITIONS_FILE_BASE = os.path.join(_DATA_DIR, "tysmith_positions_base.json")
+_DATA_DIR               = os.getenv("DATA_DIR", "/data")
+POSITIONS_FILE          = os.path.join(_DATA_DIR, "tysmith_positions.json")
+POSITIONS_FILE_BASE     = os.path.join(_DATA_DIR, "tysmith_positions_base.json")
+POSITIONS_FILE_BISWAP   = os.path.join(_DATA_DIR, "tysmith_positions_biswap.json")
+POSITIONS_FILE_BASESWAP = os.path.join(_DATA_DIR, "tysmith_positions_baseswap.json")
 
 
 @dataclass
