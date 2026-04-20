@@ -2522,6 +2522,10 @@ DIST_LOCK_FILE   = os.path.join(DATA_DIR, "tysmith.lock")
 LOCK_EXPIRY_SEC  = 20   # lock considered stale if not refreshed within this time
 LOCK_REFRESH_SEC = 7    # how often the running instance refreshes its lock
 LOCK_WAIT_SEC    = 45   # how long new instance waits before force-taking the lock
+# After acquiring the lock, new instance waits this long before starting Telegram
+# polling to let the old instance (which may still be polling) fully stop.
+# Must be > LOCK_REFRESH_SEC so old instance has time to detect the lock change.
+LOCK_POLLING_GRACE_SEC = LOCK_REFRESH_SEC + 8  # 15 s
 
 
 def _read_lock() -> dict:
@@ -2544,27 +2548,33 @@ def _write_lock():
         log.warning(f"Lock write failed: {e}")
 
 
-def _acquire_distributed_lock():
+def _acquire_distributed_lock() -> bool:
     """
     Block until we own the distributed lock or give up after LOCK_WAIT_SEC.
     Railway starts a new container before stopping the old one, so we poll
     until the old instance's lock expires (old instance stopped refreshing it).
+
+    Returns True if we took the lock from ANOTHER host (need polling grace period).
+    Returns False if we already owned the lock (restart, no grace period needed).
     """
+    my_host  = socket.gethostname()
     deadline = time.time() + LOCK_WAIT_SEC
     while time.time() < deadline:
         data = _read_lock()
         age  = time.time() - data.get("ts", 0)
         host = data.get("host", "")
-        if age >= LOCK_EXPIRY_SEC or host == socket.gethostname():
+        if age >= LOCK_EXPIRY_SEC or host == my_host:
             # Lock is stale or belongs to us already → take it
+            took_from_other = bool(host and host != my_host and age < LOCK_EXPIRY_SEC)
             _write_lock()
             log.info(f"Distributed lock acquired (previous age={age:.0f}s, host={host})")
-            return
+            return took_from_other
         log.info(f"Waiting for previous instance to stop (lock age={age:.0f}s, host={host})…")
         time.sleep(3)
     # Timeout — take over anyway (better than not starting at all)
     log.warning("Lock wait timed out — taking over")
     _write_lock()
+    return True  # assume there's another instance that may still be polling
 
 
 def _release_distributed_lock():
@@ -2609,7 +2619,7 @@ async def _lock_refresher(app):
         _write_lock()
 
 
-async def main():
+async def main(need_polling_grace: bool = False):
     _load_history()
     _load_settings()
     blacklist.load()
@@ -2619,6 +2629,16 @@ async def main():
 
     # Drop any webhook that might be set — prevents conflict with polling.
     await app.bot.delete_webhook(drop_pending_updates=True)
+
+    # If we took the lock from another host, that instance may still be polling
+    # Telegram for up to LOCK_REFRESH_SEC seconds. Wait before we start polling
+    # to prevent HTTP 409 Conflict and NodeReal WS HTTP 429.
+    if need_polling_grace:
+        log.info(
+            f"Polling grace period: waiting {LOCK_POLLING_GRACE_SEC}s "
+            "for previous instance to stop polling..."
+        )
+        await asyncio.sleep(LOCK_POLLING_GRACE_SEC)
 
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_help))
@@ -2758,5 +2778,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    _acquire_distributed_lock()
-    asyncio.run(main())
+    _need_grace = _acquire_distributed_lock()
+    asyncio.run(main(need_polling_grace=_need_grace))
