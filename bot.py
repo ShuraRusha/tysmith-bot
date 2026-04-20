@@ -533,14 +533,40 @@ def _record_trade(pos: Position, pnl_pct: float, reason: str, sell_price: float 
 # ── Telegram helper ───────────────────────────────────────────────────────────
 
 async def tg_send(text: str, reply_markup=None):
-    bot = Bot(token=config.BOT_TOKEN)
-    await bot.send_message(
-        chat_id=config.CHAT_ID,
-        text=text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=reply_markup,
-        disable_web_page_preview=True,
-    )
+    for attempt in range(3):
+        try:
+            bot = Bot(token=config.BOT_TOKEN)
+            await bot.send_message(
+                chat_id=config.CHAT_ID,
+                text=text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception as e:
+            err = str(e)
+            # Bad Markdown → retry once without parse_mode (plain text)
+            if "can't parse" in err.lower() or "bad request" in err.lower():
+                try:
+                    bot2 = Bot(token=config.BOT_TOKEN)
+                    await bot2.send_message(
+                        chat_id=config.CHAT_ID,
+                        text=text,
+                        disable_web_page_preview=True,
+                    )
+                    return
+                except Exception as e2:
+                    log.error(f"tg_send fallback failed: {e2}")
+                    return
+            # Flood / rate limit → wait and retry
+            if "flood" in err.lower() or "retry" in err.lower():
+                await asyncio.sleep(5 * (attempt + 1))
+                continue
+            log.error(f"tg_send error (attempt {attempt+1}/3): {e}")
+            if attempt < 2:
+                await asyncio.sleep(2)
+    log.error("tg_send: all 3 attempts failed — message dropped")
 
 pos_manager = PositionManager(trader, tg_send)
 pos_manager.on_close = _record_trade
