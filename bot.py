@@ -230,7 +230,7 @@ def _is_token_duplicate(token_address: str, dex_label: str = "") -> bool:
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 11
+SETTINGS_VERSION = 12
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -370,16 +370,16 @@ def _load_settings():
         if saved_version < 10:
             config.MAX_BUY_TAX        = 10.0
             config.MAX_SELL_TAX       = 10.0
-            config.MIN_LIQUIDITY_USD  = 10_000.0
+            config.MIN_LIQUIDITY_USD  = 5_000.0   # was 10k in original migration — fixed
             is_auto = True   # force auto mode on — that's the whole point of a sniper bot
             log.info(
-                "Settings migration v9→v10: tax 5%→10%, liq 15k→10k, auto mode ON"
+                "Settings migration v9→v10: tax 5%→10%, liq→5k, auto mode ON"
             )
 
-        # Migration v10 → v11: lower liquidity threshold 10k → 5k
-        if saved_version < 11:
+        # Migration v10 → v11: ensure MIN_LIQUIDITY_USD = 5k regardless of what was saved
+        # (v9→v10 originally had 10k by mistake, this corrects any file that has that value)
+        if saved_version < 12:
             config.MIN_LIQUIDITY_USD = 5_000.0
-            log.info("Settings migration v10→v11: MIN_LIQUIDITY_USD 10000 → 5000")
 
         # Restore bot mode (after migrations so v10 override above takes effect)
         if "__is_auto" in data and saved_version >= 10:
