@@ -50,7 +50,7 @@ BUY_MIN_BNB        = float(os.getenv("BUY_MIN_BNB",        "0.02")) # skip trade
 BUY_MAX_BNB        = float(os.getenv("BUY_MAX_BNB",        "0.5"))  # hard cap per trade
 GAS_RESERVE_BNB    = float(os.getenv("GAS_RESERVE_BNB",    "0.015"))# always keep in wallet
 
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "10000"))  # pool liquidity floor
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))  # pool liquidity floor
 MAX_BUY_TAX       = float(os.getenv("MAX_BUY_TAX",       "10"))   # 10% — honeypot.is blocks anything above (real honeypots are 20-99%)
 MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "10"))   # 10% — GoPlus also checks; real honeypots won't pass sell simulation
 
