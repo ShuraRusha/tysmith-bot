@@ -230,7 +230,7 @@ def _is_token_duplicate(token_address: str, dex_label: str = "") -> bool:
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 12
+SETTINGS_VERSION = 13
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -380,6 +380,20 @@ def _load_settings():
         # (v9→v10 originally had 10k by mistake, this corrects any file that has that value)
         if saved_version < 12:
             config.MIN_LIQUIDITY_USD = 5_000.0
+
+        # Migration v12 → v13: loosen filters that were blocking most tokens
+        #   MAX_DEPLOYER_TOKENS_30D  3 → 8   (активный разработчик ≠ скамер)
+        #   MIN_FDV_USD          50k → 10k   (новые токены стартуют с малого FDV)
+        #   LP_HOLDER_MAX_PCT      30 → 50   (деплоер держит LP до блокировки)
+        #   is_anti_whale/trading_cooldown больше не блокируют — только предупреждение
+        if saved_version < 13:
+            config.MAX_DEPLOYER_TOKENS_30D = 8
+            config.MIN_FDV_USD             = 10_000.0
+            config.LP_HOLDER_MAX_PCT       = 50.0
+            log.info(
+                "Settings migration v12→v13: deployer_30d=8, fdv=10k, lp_holder=50%, "
+                "anti_whale/cooldown → предупреждение"
+            )
 
         # Restore bot mode (after migrations so v10 override above takes effect)
         if "__is_auto" in data and saved_version >= 10:
@@ -720,6 +734,13 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         max_pos = calculate_max_positions(balance)
         if len(pos_manager.positions) >= max_pos:
             log.info(f"Auto: max positions ({max_pos}) reached, skipping {info['symbol']}")
+            await tg_send(
+                f"📌 *{info['symbol']}* прошёл все фильтры, но слот занят\n"
+                f"Открыто позиций: *{len(pos_manager.positions)}/{max_pos}*\n"
+                f"💧 Ликвидность: ${info['liquidity_usd']:,.0f}{fdv_str}\n"
+                f"`{token_address}`\n"
+                f"_Закрой позицию чтобы освободить слот, или увеличь /set MAX\\_AUTO\\_POSITIONS_"
+            )
             return
         if token_address in pos_manager.positions:
             return
@@ -920,6 +941,13 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
     if is_auto:
         max_pos = calculate_max_positions(balance)
         if len(pos_manager_base.positions) >= max_pos:
+            log.info(f"[Base] Auto: max positions ({max_pos}) reached, skipping {info['symbol']}")
+            await tg_send(
+                f"🔵📌 *[Base] {info['symbol']}* прошёл все фильтры, но слот занят\n"
+                f"Открыто позиций: *{len(pos_manager_base.positions)}/{max_pos}*\n"
+                f"💧 Ликвидность: ${info['liquidity_usd']:,.0f}{fdv_str}\n"
+                f"`{token_address}`"
+            )
             return
         if token_address in pos_manager_base.positions:
             return
@@ -1078,6 +1106,13 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
     if is_auto:
         max_pos = calculate_max_positions(balance)
         if len(pos_manager_biswap.positions) >= max_pos:
+            log.info(f"[BiSwap] Auto: max positions ({max_pos}) reached, skipping {info['symbol']}")
+            await tg_send(
+                f"🟠📌 *[BiSwap] {info['symbol']}* прошёл все фильтры, но слот занят\n"
+                f"Открыто позиций: *{len(pos_manager_biswap.positions)}/{max_pos}*\n"
+                f"💧 Ликвидность: ${info['liquidity_usd']:,.0f}{fdv_str}\n"
+                f"`{token_address}`"
+            )
             return
         if token_address in pos_manager_biswap.positions:
             return
@@ -1239,6 +1274,13 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
     if is_auto:
         max_pos = calculate_max_positions(balance)
         if len(pos_manager_baseswap.positions) >= max_pos:
+            log.info(f"[BaseSwap] Auto: max positions ({max_pos}) reached, skipping {info['symbol']}")
+            await tg_send(
+                f"🔷📌 *[BaseSwap] {info['symbol']}* прошёл все фильтры, но слот занят\n"
+                f"Открыто позиций: *{len(pos_manager_baseswap.positions)}/{max_pos}*\n"
+                f"💧 Ликвидность: ${info['liquidity_usd']:,.0f}{fdv_str}\n"
+                f"`{token_address}`"
+            )
             return
         if token_address in pos_manager_baseswap.positions:
             return

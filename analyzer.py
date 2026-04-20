@@ -950,12 +950,16 @@ async def check_token(
             "is_blacklisted":          "Blacklist функция",
             "cannot_buy":              "Покупка заблокирована контрактом",
             "cannot_sell_all":         "Продажа всех токенов заблокирована",
-            "trading_cooldown":        "Trading cooldown (anti-bot)",
-            "is_anti_whale":           "Anti-whale: ограничение объёма продажи",
         }
         for flag, reason in CRITICAL.items():
             if goplus_data.get(flag) == "1":
                 return {"ok": False, "reason": reason}
+
+        # Anti-whale и trading cooldown — предупреждение, не блок:
+        # is_anti_whale ограничивает размер одной tx, не запрещает продажу
+        # trading_cooldown требует паузу между tx, продать можно (позже)
+        if goplus_data.get("is_anti_whale")   == "1": warnings_from_goplus.append("⚠️ Anti-whale: лимит объёма одной транзакции")
+        if goplus_data.get("trading_cooldown") == "1": warnings_from_goplus.append("⚠️ Trading cooldown: задержка между транзакциями")
 
         buy_tax  = float(goplus_data.get("buy_tax")  or 0)
         sell_tax = float(goplus_data.get("sell_tax") or 0)
