@@ -948,18 +948,17 @@ async def check_token(
             "is_blacklisted":       "Blacklist функция",
             "cannot_buy":           "Покупка заблокирована контрактом",
             "cannot_sell_all":      "Продажа всех токенов заблокирована",
+            "transfer_pausable":    "Переводы можно заморозить — rug risk",
         }
         for flag, reason in CRITICAL.items():
             if goplus_data.get(flag) == "1":
                 return {"ok": False, "reason": reason}
 
-        # Предупреждения — реальные риски, но не блокирующие для сниперинга:
-        # can_take_back_ownership: ~40% BSC токенов, владелец может вернуть права
-        # transfer_pausable: ~30% BSC токенов, можно заморозить переводы временно
+        # Предупреждения — риски есть, но для короткого сниперинга приемлемо:
+        # can_take_back_ownership: владелец может вернуть права (common, ~40% токенов)
         # is_anti_whale: лимит объёма одной транзакции
         # trading_cooldown: задержка между транзакциями
         if goplus_data.get("can_take_back_ownership") == "1": warnings_from_goplus.append("⚠️ Возврат ownership возможен")
-        if goplus_data.get("transfer_pausable")       == "1": warnings_from_goplus.append("⚠️ Переводы можно заморозить")
         if goplus_data.get("is_anti_whale")           == "1": warnings_from_goplus.append("⚠️ Anti-whale: лимит объёма одной транзакции")
         if goplus_data.get("trading_cooldown")        == "1": warnings_from_goplus.append("⚠️ Trading cooldown: задержка между транзакциями")
 
