@@ -230,7 +230,7 @@ def _is_token_duplicate(token_address: str, dex_label: str = "") -> bool:
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 13
+SETTINGS_VERSION = 14
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -393,6 +393,31 @@ def _load_settings():
             log.info(
                 "Settings migration v12→v13: deployer_30d=8, fdv=10k, lp_holder=50%, "
                 "anti_whale/cooldown → предупреждение"
+            )
+
+        # Migration v13 → v14: агрессивная настройка для максимального количества сделок
+        #   can_take_back_ownership / transfer_pausable → предупреждение (были блоком)
+        #   MIN_LIQUIDITY_USD     5k → 3k   (ранний вход в малоликвидные пары)
+        #   MIN_FDV_USD          10k → 5k   (ещё раньше при листинге)
+        #   MAX_TOP10_HOLDER_PCT  30 → 60   (новые токены = концентрированное распределение)
+        #   TOP_HOLDER_MAX_PCT    30 → 50   (один кошелёк может держать больше у старта)
+        #   LP_HOLDER_MAX_PCT     50 → 70   (деплоер не всегда успел залочить LP)
+        #   MIN_VOLUME_5M_USD    500 → 0    (снайпер входит в первые секунды — объёма нет)
+        #   MAX_DEPLOYER_TOKENS_30D 8 → 15  (активные разработчики запускают часто)
+        #   BUY_MIN_BNB         0.02 → 0.01 (меньший минимум — работает при малом балансе)
+        if saved_version < 14:
+            config.MIN_LIQUIDITY_USD       = 3_000.0
+            config.MIN_FDV_USD             = 5_000.0
+            config.MAX_TOP10_HOLDER_PCT    = 60.0
+            config.TOP_HOLDER_MAX_PCT      = 50.0
+            config.LP_HOLDER_MAX_PCT       = 70.0
+            config.MIN_VOLUME_5M_USD       = 0.0
+            config.MAX_DEPLOYER_TOKENS_30D = 15
+            config.BUY_MIN_BNB             = 0.01
+            log.info(
+                "Settings migration v13→v14: liq=3k, fdv=5k, top10=60%, lp=70%, "
+                "vol5m=0 (off), deployer=15, buy_min=0.01 BNB; "
+                "can_take_back_ownership + transfer_pausable → предупреждение"
             )
 
         # Restore bot mode (after migrations so v10 override above takes effect)

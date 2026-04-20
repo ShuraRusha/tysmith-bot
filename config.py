@@ -46,11 +46,11 @@ BSC_WS_RPCS   = list(dict.fromkeys(BSC_WS_RPCS))
 # Tiers (auto-applied):  balance ≤ 1 BNB → 5% | 1-5 BNB → 3% | >5 BNB → 2%
 # Trade is skipped if calculated amount < BUY_MIN_BNB (gas would eat too much profit)
 BUY_PCT_OF_BALANCE = float(os.getenv("BUY_PCT_OF_BALANCE", "0"))    # 0 = auto-tier
-BUY_MIN_BNB        = float(os.getenv("BUY_MIN_BNB",        "0.02")) # skip trade if below (газ BSC ~0.001-0.002 BNB, 0.02 = 10x газ)
+BUY_MIN_BNB        = float(os.getenv("BUY_MIN_BNB",        "0.01")) # skip trade if below (газ BSC ~0.001-0.002 BNB, 0.01 = 5x газ)
 BUY_MAX_BNB        = float(os.getenv("BUY_MAX_BNB",        "0.5"))  # hard cap per trade
 GAS_RESERVE_BNB    = float(os.getenv("GAS_RESERVE_BNB",    "0.015"))# always keep in wallet
 
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))  # pool liquidity floor
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "3000"))  # pool liquidity floor
 MAX_BUY_TAX       = float(os.getenv("MAX_BUY_TAX",       "10"))   # 10% — honeypot.is blocks anything above (real honeypots are 20-99%)
 MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "10"))   # 10% — GoPlus also checks; real honeypots won't pass sell simulation
 
@@ -85,7 +85,7 @@ TX_DEADLINE_SEC   = int(os.getenv("TX_DEADLINE_SEC",     "30"))    # short deadl
 BSCSCAN_API_KEY          = os.getenv("BSCSCAN_API_KEY", "")
 # Basescan API key for Base chain deployer history (free at basescan.org/myapikey)
 BASESCAN_API_KEY         = os.getenv("BASESCAN_API_KEY", "")
-MAX_DEPLOYER_TOKENS_30D  = int(os.getenv("MAX_DEPLOYER_TOKENS_30D", "8"))  # >N contracts/30d = serial scammer (was 3, raised to 8)
+MAX_DEPLOYER_TOKENS_30D  = int(os.getenv("MAX_DEPLOYER_TOKENS_30D", "15")) # >N contracts/30d = serial scammer (was 8)
 
 # ── Position monitoring ──────────────────────────────────────────────────────
 MONITOR_INTERVAL_SEC    = float(os.getenv("MONITOR_INTERVAL_SEC",    "1"))   # price check frequency (was 5s, now 1s for memecoins)
@@ -114,16 +114,16 @@ AUTO_BUY           = os.getenv("AUTO_BUY",           "true").lower() == "true"
 MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "0"))  # 0 = auto formula
 
 # ── Safety filters ────────────────────────────────────────────────────────────
-TOP_HOLDER_MAX_PCT   = float(os.getenv("TOP_HOLDER_MAX_PCT",   "30"))  # reject if single wallet > X%
-MAX_TOP10_HOLDER_PCT = float(os.getenv("MAX_TOP10_HOLDER_PCT", "30"))  # top-10 combined (excl. DEX/locked) > X% → reject
-LP_HOLDER_MAX_PCT    = float(os.getenv("LP_HOLDER_MAX_PCT",    "50"))  # reject if any unlocked wallet holds >X% of LP (was 30)
+TOP_HOLDER_MAX_PCT   = float(os.getenv("TOP_HOLDER_MAX_PCT",   "50"))  # reject if single wallet > X% (was 30)
+MAX_TOP10_HOLDER_PCT = float(os.getenv("MAX_TOP10_HOLDER_PCT", "60"))  # top-10 combined (excl. DEX/locked) > X% → reject (was 30)
+LP_HOLDER_MAX_PCT    = float(os.getenv("LP_HOLDER_MAX_PCT",    "70"))  # reject if any unlocked wallet holds >X% of LP (was 50)
 MIN_HOLDER_COUNT     = int(os.getenv("MIN_HOLDER_COUNT",       "0"))   # 0 = disabled — sniper enters first, 1-3 holders is normal at launch
 
 # ── Token quality filters ─────────────────────────────────────────────────────
 MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD",   "10000"))    # min market cap at buy time
-MIN_FDV_USD        = float(os.getenv("MIN_FDV_USD",          "10000"))    # min fully-diluted value (real safety = honeypot sim + LP check)
+MIN_FDV_USD        = float(os.getenv("MIN_FDV_USD",          "5000"))     # min fully-diluted value (real safety = honeypot sim + LP check)
 MAX_FDV_USD        = float(os.getenv("MAX_FDV_USD",          "10000000")) # max FDV (avoid huge caps)
-MIN_VOLUME_5M_USD  = float(os.getenv("MIN_VOLUME_5M_USD",    "500"))      # DexScreener 5-min volume (low — fresh tokens haven't accumulated volume yet)
+MIN_VOLUME_5M_USD  = float(os.getenv("MIN_VOLUME_5M_USD",    "0"))        # DexScreener 5-min volume — 0 = disabled (снайпер входит в первые секунды)
 MAX_TOKEN_AGE_DAYS = int(os.getenv("MAX_TOKEN_AGE_DAYS",     "7"))        # reject tokens older than this
 
 # ── Moon bag ──────────────────────────────────────────────────────────────────
