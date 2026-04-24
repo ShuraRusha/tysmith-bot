@@ -230,7 +230,7 @@ def _is_token_duplicate(token_address: str, dex_label: str = "") -> bool:
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 14
+SETTINGS_VERSION = 15
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -419,6 +419,12 @@ def _load_settings():
                 "vol5m=0 (off), deployer=15, buy_min=0.01 BNB; "
                 "can_take_back_ownership + transfer_pausable → предупреждение"
             )
+
+        # Migration v14 → v15: увеличен газ для более быстрого попадания в блок
+        #   GAS_BUY_GWEI  5 → 10  (конкурируем с другими ботами за место в блоке)
+        if saved_version < 15:
+            config.GAS_BUY_GWEI = 10.0
+            log.info("Settings migration v14→v15: GAS_BUY_GWEI 5 → 10")
 
         # Restore bot mode (after migrations so v10 override above takes effect)
         if "__is_auto" in data and saved_version >= 10:

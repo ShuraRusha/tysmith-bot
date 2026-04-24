@@ -72,7 +72,7 @@ STOP_LOSS         = float(os.getenv("STOP_LOSS",         "20"))
 SLIPPAGE_BUY      = float(os.getenv("SLIPPAGE_BUY",     "12"))    # % — aggressive for new tokens
 SLIPPAGE_SELL     = float(os.getenv("SLIPPAGE_SELL",     "15"))    # % — wider to survive hidden taxes
 GAS_MULTIPLIER    = float(os.getenv("GAS_MULTIPLIER",    "1.5"))   # outbid other buyers on gas
-GAS_BUY_GWEI      = float(os.getenv("GAS_BUY_GWEI",      "5"))    # fixed gwei for buys (5 = fast on BSC)
+GAS_BUY_GWEI      = float(os.getenv("GAS_BUY_GWEI",      "10"))   # fixed gwei for buys (10 = fast on BSC, was 5)
 GAS_LIMIT_BUY      = int(os.getenv("GAS_LIMIT_BUY",   "500000"))  # gas limit for buy txs
 GAS_LIMIT_SELL     = int(os.getenv("GAS_LIMIT_SELL",   "350000"))  # gas limit for sell txs
 GAS_LIMIT_APPROVE  = int(os.getenv("GAS_LIMIT_APPROVE","80000"))   # gas limit for approve txs
