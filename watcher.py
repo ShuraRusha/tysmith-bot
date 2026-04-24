@@ -59,6 +59,9 @@ async def _watch_single(ws_url: str, callback, factory_address: str = None, base
     factory = factory_address or PANCAKE_FACTORY_V2
     tokens  = base_tokens or BASE_TOKENS
     backoff = 2
+    # BSC produces pairs every few seconds — if nothing arrives in 3 min, the node is stale.
+    # Many free nodes accept subscriptions but silently stop delivering events.
+    _RECV_TIMEOUT = 3 * 60
     while True:
         try:
             log.info(f"WS connecting: {ws_url[:60]}...")
@@ -81,14 +84,23 @@ async def _watch_single(ws_url: str, callback, factory_address: str = None, base
                     ],
                 }))
 
-                resp = json.loads(await ws.recv())
+                resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
                 if "error" in resp:
                     raise RuntimeError(f"Subscribe error: {resp['error']}")
                 sub_id = resp.get("result")
                 log.info(f"WS subscribed ({ws_url[:40]}…) sub_id={sub_id}")
                 backoff = 2
 
-                async for raw in ws:
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=_RECV_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        log.warning(
+                            f"WS: no events for {_RECV_TIMEOUT}s ({ws_url[:40]}…) "
+                            "— node is stale, reconnecting"
+                        )
+                        break  # exit inner loop → reconnect
+
                     try:
                         msg = json.loads(raw)
                         if msg.get("method") != "eth_subscription":
@@ -130,6 +142,10 @@ async def _watch_single(ws_url: str, callback, factory_address: str = None, base
                     except Exception as e:
                         log.warning(f"Event parse error: {e}")
 
+        except asyncio.TimeoutError:
+            log.error(f"WS subscribe timeout ({ws_url[:40]}…). Reconnecting in {backoff}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 15)
         except Exception as e:
             log.error(f"WS error ({ws_url[:40]}…): {e}. Reconnecting in {backoff}s...")
             await asyncio.sleep(backoff)

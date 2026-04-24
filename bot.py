@@ -2701,20 +2701,26 @@ _last_polled_block: int = 0
 
 async def _poll_new_pairs():
     """
-    Fallback to eth_getLogs every 60 seconds to catch pairs missed by WebSocket.
+    Fallback to eth_getLogs every 15 seconds to catch pairs missed by WebSocket.
     Deduplication via _is_token_duplicate prevents reprocessing WS-seen tokens.
+    Primary path when WS nodes are stale; runs in parallel with WS watchers.
     """
     global _last_polled_block
-    LOOK_BACK_BLOCKS = 20   # ~60s on BSC (3s/block) — matches poll interval
+    POLL_INTERVAL    = 15   # seconds between polls
+    LOOK_BACK_BLOCKS = 6    # ~18s on BSC (3s/block) — slightly wider than interval
 
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(POLL_INTERVAL)
         if is_paused:
             continue
         try:
             latest = await asyncio.to_thread(lambda: w3.eth.block_number)
-            from_block = _last_polled_block + 1 if _last_polled_block > 0 else max(0, latest - LOOK_BACK_BLOCKS)
+            if _last_polled_block > 0:
+                from_block = _last_polled_block + 1
+            else:
+                from_block = max(0, latest - LOOK_BACK_BLOCKS)
             if from_block > latest:
+                _last_polled_block = latest
                 continue
 
             logs = await asyncio.to_thread(
