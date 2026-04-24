@@ -30,7 +30,7 @@ from position import (
     POSITIONS_FILE_BASE, POSITIONS_FILE_BISWAP, POSITIONS_FILE_BASESWAP,
 )
 from trader import Trader
-from watcher import watch_pairs, watch_pending_pairs
+from watcher import watch_pairs, watch_pending_pairs, PAIR_CREATED_TOPIC
 
 logging.basicConfig(
     level=logging.INFO,
@@ -711,21 +711,25 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         log.info(f"Using mempool pre-analysis cache for {token_address[:10]}…")
     else:
         log.info(f"Analyzing: {token_address}")
-        result = await check_token(
-            token_address, pair_address, base_token, w3,
-            config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
-            wallet_address=trader.wallet,
-            min_market_cap_usd=config.MIN_MARKET_CAP_USD,
-            min_fdv_usd=config.MIN_FDV_USD,
-            max_fdv_usd=config.MAX_FDV_USD,
-            max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
-            min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
-            max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
-            lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
-            min_holder_count=config.MIN_HOLDER_COUNT,
-            bscscan_api_key=config.BSCSCAN_API_KEY,
-            max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
-        )
+        try:
+            result = await check_token(
+                token_address, pair_address, base_token, w3,
+                config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
+                wallet_address=trader.wallet,
+                min_market_cap_usd=config.MIN_MARKET_CAP_USD,
+                min_fdv_usd=config.MIN_FDV_USD,
+                max_fdv_usd=config.MAX_FDV_USD,
+                max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
+                min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
+                max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
+                lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
+                min_holder_count=config.MIN_HOLDER_COUNT,
+                bscscan_api_key=config.BSCSCAN_API_KEY,
+                max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
+            )
+        except Exception as e:
+            log.error(f"[PancakeSwap] check_token error for {token_address[:10]}…: {e}")
+            return
 
     if not result["ok"]:
         _stats_rejected += 1
@@ -838,8 +842,9 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
             result = await asyncio.to_thread(trader.buy, token_address, buy_amount)
 
             if result["ok"]:
+                _qty        = result["tokens_received"] / 10 ** result["decimals"]
                 entry_price = price_before if price_before > 0 else (
-                    buy_amount / (result["tokens_received"] / 10 ** result["decimals"])
+                    buy_amount / _qty if _qty > 0 else buy_amount
                 )
                 moon_bag = _calc_moon_bag(result["tokens_received"], buy_amount, bnb_price)
                 tradeable = result["tokens_received"] - moon_bag
@@ -924,27 +929,31 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
     _last_seen_ts = time.time()
 
     log.info(f"[Base] Analyzing: {token_address}")
-    result = await check_token(
-        token_address, pair_address, base_token, w3_base,
-        config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
-        wallet_address=trader_base.wallet,
-        min_market_cap_usd=config.MIN_MARKET_CAP_USD,
-        min_fdv_usd=config.MIN_FDV_USD,
-        max_fdv_usd=config.MAX_FDV_USD,
-        max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
-        min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
-        max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
-        lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
-        min_holder_count=config.MIN_HOLDER_COUNT,
-        bscscan_api_key=config.BASESCAN_API_KEY,
-        max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
-        chain_id=config.BASE_CHAIN_ID,
-        router_address=config.UNISWAP_V2_ROUTER_BASE,
-        native_token=config.WETH_BASE,
-        stable_token=config.USDC_BASE,
-        dex_chain="base",
-        explorer_url="https://api.basescan.org/api",
-    )
+    try:
+        result = await check_token(
+            token_address, pair_address, base_token, w3_base,
+            config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
+            wallet_address=trader_base.wallet,
+            min_market_cap_usd=config.MIN_MARKET_CAP_USD,
+            min_fdv_usd=config.MIN_FDV_USD,
+            max_fdv_usd=config.MAX_FDV_USD,
+            max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
+            min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
+            max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
+            lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
+            min_holder_count=config.MIN_HOLDER_COUNT,
+            bscscan_api_key=config.BASESCAN_API_KEY,
+            max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
+            chain_id=config.BASE_CHAIN_ID,
+            router_address=config.UNISWAP_V2_ROUTER_BASE,
+            native_token=config.WETH_BASE,
+            stable_token=config.USDC_BASE,
+            dex_chain="base",
+            explorer_url="https://api.basescan.org/api",
+        )
+    except Exception as e:
+        log.error(f"[Base] check_token error for {token_address[:10]}…: {e}")
+        return
 
     if not result["ok"]:
         _stats_rejected += 1
@@ -1041,8 +1050,9 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
             buy_result = await asyncio.to_thread(trader_base.buy, token_address, buy_amount)
 
             if buy_result["ok"]:
+                _qty        = buy_result["tokens_received"] / 10 ** buy_result["decimals"]
                 entry_price = price_before if price_before > 0 else (
-                    buy_amount / (buy_result["tokens_received"] / 10 ** buy_result["decimals"])
+                    buy_amount / _qty if _qty > 0 else buy_amount
                 )
                 moon_bag = _calc_moon_bag(buy_result["tokens_received"], buy_amount, eth_price)
                 tradeable = buy_result["tokens_received"] - moon_bag
@@ -1105,23 +1115,27 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
     _last_seen_ts = time.time()
 
     log.info(f"[BiSwap] Analyzing: {token_address}")
-    result = await check_token(
-        token_address, pair_address, base_token, w3,
-        config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
-        wallet_address=trader_biswap.wallet,
-        min_market_cap_usd=config.MIN_MARKET_CAP_USD,
-        min_fdv_usd=config.MIN_FDV_USD,
-        max_fdv_usd=config.MAX_FDV_USD,
-        max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
-        min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
-        max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
-        lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
-        min_holder_count=config.MIN_HOLDER_COUNT,
-        bscscan_api_key=config.BSCSCAN_API_KEY,
-        max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
-        router_address=config.BISWAP_ROUTER,
-        native_token=config.WBNB,
-    )
+    try:
+        result = await check_token(
+            token_address, pair_address, base_token, w3,
+            config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
+            wallet_address=trader_biswap.wallet,
+            min_market_cap_usd=config.MIN_MARKET_CAP_USD,
+            min_fdv_usd=config.MIN_FDV_USD,
+            max_fdv_usd=config.MAX_FDV_USD,
+            max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
+            min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
+            max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
+            lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
+            min_holder_count=config.MIN_HOLDER_COUNT,
+            bscscan_api_key=config.BSCSCAN_API_KEY,
+            max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
+            router_address=config.BISWAP_ROUTER,
+            native_token=config.WBNB,
+        )
+    except Exception as e:
+        log.error(f"[BiSwap] check_token error for {token_address[:10]}…: {e}")
+        return
 
     if not result["ok"]:
         _stats_rejected += 1
@@ -1206,8 +1220,9 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
             buy_result = await asyncio.to_thread(trader_biswap.buy, token_address, buy_amount)
 
             if buy_result["ok"]:
+                _qty        = buy_result["tokens_received"] / 10 ** buy_result["decimals"]
                 entry_price = price_before if price_before > 0 else (
-                    buy_amount / (buy_result["tokens_received"] / 10 ** buy_result["decimals"])
+                    buy_amount / _qty if _qty > 0 else buy_amount
                 )
                 moon_bag  = _calc_moon_bag(buy_result["tokens_received"], buy_amount, bnb_price)
                 tradeable = buy_result["tokens_received"] - moon_bag
@@ -1269,27 +1284,31 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
     _last_seen_ts = time.time()
 
     log.info(f"[BaseSwap] Analyzing: {token_address}")
-    result = await check_token(
-        token_address, pair_address, base_token, w3_base,
-        config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
-        wallet_address=trader_baseswap.wallet,
-        min_market_cap_usd=config.MIN_MARKET_CAP_USD,
-        min_fdv_usd=config.MIN_FDV_USD,
-        max_fdv_usd=config.MAX_FDV_USD,
-        max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
-        min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
-        max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
-        lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
-        min_holder_count=config.MIN_HOLDER_COUNT,
-        bscscan_api_key=config.BASESCAN_API_KEY,
-        max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
-        chain_id=config.BASE_CHAIN_ID,
-        router_address=config.BASESWAP_ROUTER_BASE,
-        native_token=config.WETH_BASE,
-        stable_token=config.USDC_BASE,
-        dex_chain="base",
-        explorer_url="https://api.basescan.org/api",
-    )
+    try:
+        result = await check_token(
+            token_address, pair_address, base_token, w3_base,
+            config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
+            wallet_address=trader_baseswap.wallet,
+            min_market_cap_usd=config.MIN_MARKET_CAP_USD,
+            min_fdv_usd=config.MIN_FDV_USD,
+            max_fdv_usd=config.MAX_FDV_USD,
+            max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
+            min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
+            max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
+            lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
+            min_holder_count=config.MIN_HOLDER_COUNT,
+            bscscan_api_key=config.BASESCAN_API_KEY,
+            max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
+            chain_id=config.BASE_CHAIN_ID,
+            router_address=config.BASESWAP_ROUTER_BASE,
+            native_token=config.WETH_BASE,
+            stable_token=config.USDC_BASE,
+            dex_chain="base",
+            explorer_url="https://api.basescan.org/api",
+        )
+    except Exception as e:
+        log.error(f"[BaseSwap] check_token error for {token_address[:10]}…: {e}")
+        return
 
     if not result["ok"]:
         _stats_rejected += 1
@@ -1374,8 +1393,9 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
             buy_result = await asyncio.to_thread(trader_baseswap.buy, token_address, buy_amount)
 
             if buy_result["ok"]:
+                _qty        = buy_result["tokens_received"] / 10 ** buy_result["decimals"]
                 entry_price = price_before if price_before > 0 else (
-                    buy_amount / (buy_result["tokens_received"] / 10 ** buy_result["decimals"])
+                    buy_amount / _qty if _qty > 0 else buy_amount
                 )
                 moon_bag  = _calc_moon_bag(buy_result["tokens_received"], buy_amount, eth_price)
                 tradeable = buy_result["tokens_received"] - moon_bag
@@ -1489,8 +1509,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if result["ok"]:
+            _qty        = result["tokens_received"] / 10 ** result["decimals"]
             entry_price = price_before if price_before > 0 else (
-                buy_amount / (result["tokens_received"] / 10 ** result["decimals"])
+                buy_amount / _qty if _qty > 0 else buy_amount
             )
             info_bnb_price = token_info["info"].get("bnb_price", 0) or 0
             moon_bag = _calc_moon_bag(result["tokens_received"], buy_amount, info_bnb_price)
@@ -2634,27 +2655,104 @@ async def _lock_refresher(app):
     my_host = socket.gethostname()
     while True:
         await asyncio.sleep(LOCK_REFRESH_SEC)
+        try:
+            data      = _read_lock()
+            lock_host = data.get("host", "")
+            lock_age  = time.time() - data.get("ts", 0)
 
-        data      = _read_lock()
-        lock_host = data.get("host", "")
-        lock_age  = time.time() - data.get("ts", 0)
+            if lock_host and lock_host != my_host and lock_age < LOCK_EXPIRY_SEC:
+                # A newer instance has taken the lock — we are the old one, must exit.
+                log.warning(
+                    f"Lock taken by new instance ({lock_host}) — "
+                    f"this instance ({my_host}) is shutting down to avoid duplication"
+                )
+                try:
+                    await app.updater.stop()
+                    await app.stop()
+                    await app.shutdown()
+                except Exception as e:
+                    log.error(f"Shutdown error: {e}")
+                finally:
+                    sys.exit(0)
 
-        if lock_host and lock_host != my_host and lock_age < LOCK_EXPIRY_SEC:
-            # A newer instance has taken the lock — we are the old one, must exit.
-            log.warning(
-                f"Lock taken by new instance ({lock_host}) — "
-                f"this instance ({my_host}) is shutting down to avoid duplication"
+            _write_lock()
+        except (asyncio.CancelledError, SystemExit):
+            raise
+        except Exception as e:
+            log.error(f"Lock refresher error (non-fatal): {e}")
+
+
+async def _resilient_task(coro_factory, name: str, restart_delay: float = 5.0):
+    """Run a coroutine factory in a loop, logging and restarting on any exception."""
+    while True:
+        try:
+            await coro_factory()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error(f"Task '{name}' crashed: {e}", exc_info=True)
+            await asyncio.sleep(restart_delay)
+
+
+# ── Backup polling: catch any pairs WebSocket might have missed ───────────────
+
+_last_polled_block: int = 0
+
+
+async def _poll_new_pairs():
+    """
+    Fallback to eth_getLogs every 60 seconds to catch pairs missed by WebSocket.
+    Deduplication via _is_token_duplicate prevents reprocessing WS-seen tokens.
+    """
+    global _last_polled_block
+    LOOK_BACK_BLOCKS = 20   # ~60s on BSC (3s/block) — matches poll interval
+
+    while True:
+        await asyncio.sleep(60)
+        if is_paused:
+            continue
+        try:
+            latest = await asyncio.to_thread(lambda: w3.eth.block_number)
+            from_block = _last_polled_block + 1 if _last_polled_block > 0 else max(0, latest - LOOK_BACK_BLOCKS)
+            if from_block > latest:
+                continue
+
+            logs = await asyncio.to_thread(
+                w3.eth.get_logs,
+                {
+                    "address":   Web3.to_checksum_address(config.PANCAKE_FACTORY_V2),
+                    "fromBlock": from_block,
+                    "toBlock":   latest,
+                    "topics":    [PAIR_CREATED_TOPIC],
+                },
             )
-            try:
-                await app.updater.stop()
-                await app.stop()
-                await app.shutdown()
-            except Exception as e:
-                log.error(f"Shutdown error: {e}")
-            finally:
-                sys.exit(0)
+            _last_polled_block = latest
 
-        _write_lock()
+            if logs:
+                log.info(f"Poll: {len(logs)} PairCreated events (blocks {from_block}–{latest})")
+
+            for log_entry in logs:
+                try:
+                    topics = log_entry.get("topics", [])
+                    if len(topics) < 3:
+                        continue
+                    token0 = Web3.to_checksum_address(log_entry["topics"][1][-20:])
+                    token1 = Web3.to_checksum_address(log_entry["topics"][2][-20:])
+                    pair   = Web3.to_checksum_address(log_entry["data"][12:32])
+
+                    t0, t1 = token0.lower(), token1.lower()
+                    if t0 in config.BASE_TOKENS and t1 not in config.BASE_TOKENS:
+                        new_token, base_token = token1, token0
+                    elif t1 in config.BASE_TOKENS and t0 not in config.BASE_TOKENS:
+                        new_token, base_token = token0, token1
+                    else:
+                        continue
+
+                    asyncio.create_task(on_pair_found(new_token, base_token, pair))
+                except Exception as e:
+                    log.warning(f"Poll: log parse error: {e}")
+        except Exception as e:
+            log.error(f"Poll new pairs error: {e}")
 
 
 async def main(need_polling_grace: bool = False):
@@ -2702,46 +2800,62 @@ async def main(need_polling_grace: bool = False):
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    asyncio.create_task(pos_manager.monitor())
-    asyncio.create_task(watch_pairs(config.BSC_WS_RPC, on_pair_found))
-    asyncio.create_task(_cleanup_pending())
-    asyncio.create_task(_daily_report())
-    asyncio.create_task(_ws_watchdog())
+    asyncio.create_task(_resilient_task(pos_manager.monitor, "pos_monitor"))
+    asyncio.create_task(_resilient_task(
+        lambda: watch_pairs(config.BSC_WS_RPC, on_pair_found, ws_rpcs=config.BSC_WS_RPCS),
+        "watch_pairs_bsc",
+    ))
+    asyncio.create_task(_resilient_task(_cleanup_pending, "cleanup_pending"))
+    asyncio.create_task(_resilient_task(_daily_report, "daily_report"))
+    asyncio.create_task(_resilient_task(_ws_watchdog, "ws_watchdog"))
+    asyncio.create_task(_resilient_task(_poll_new_pairs, "poll_new_pairs"))
 
     if config.MEMPOOL_ENABLED:
-        asyncio.create_task(watch_pending_pairs(config.BSC_WS_RPC, on_pending_pair_found))
+        asyncio.create_task(_resilient_task(
+            lambda: watch_pending_pairs(config.BSC_WS_RPC, on_pending_pair_found),
+            "mempool_watcher",
+        ))
         log.info("Mempool monitoring enabled — pre-analyzing pending createPair txs")
 
     if config.BASE_CHAIN_ENABLED and pos_manager_base:
-        asyncio.create_task(pos_manager_base.monitor())
-        asyncio.create_task(watch_pairs(
-            config.BASE_WS_RPC,
-            on_base_pair_found,
-            factory_address=config.UNISWAP_V2_FACTORY_BASE,
-            base_tokens=config.BASE_TOKENS_BASE,
-            ws_rpcs=config.BASE_WS_RPCS,
+        asyncio.create_task(_resilient_task(pos_manager_base.monitor, "pos_monitor_base"))
+        asyncio.create_task(_resilient_task(
+            lambda: watch_pairs(
+                config.BASE_WS_RPC,
+                on_base_pair_found,
+                factory_address=config.UNISWAP_V2_FACTORY_BASE,
+                base_tokens=config.BASE_TOKENS_BASE,
+                ws_rpcs=config.BASE_WS_RPCS,
+            ),
+            "watch_pairs_base",
         ))
         log.info(f"Base chain watcher started (Uniswap V2, factory={config.UNISWAP_V2_FACTORY_BASE[:10]}…)")
 
     if config.BISWAP_ENABLED and pos_manager_biswap:
-        asyncio.create_task(pos_manager_biswap.monitor())
-        asyncio.create_task(watch_pairs(
-            config.BSC_WS_RPC,
-            on_biswap_pair_found,
-            factory_address=config.BISWAP_FACTORY,
-            base_tokens=config.BASE_TOKENS,
-            ws_rpcs=config.BSC_WS_RPCS,
+        asyncio.create_task(_resilient_task(pos_manager_biswap.monitor, "pos_monitor_biswap"))
+        asyncio.create_task(_resilient_task(
+            lambda: watch_pairs(
+                config.BSC_WS_RPC,
+                on_biswap_pair_found,
+                factory_address=config.BISWAP_FACTORY,
+                base_tokens=config.BASE_TOKENS,
+                ws_rpcs=config.BSC_WS_RPCS,
+            ),
+            "watch_pairs_biswap",
         ))
         log.info(f"BiSwap watcher started (factory={config.BISWAP_FACTORY[:10]}…)")
 
     if config.BASESWAP_ENABLED and pos_manager_baseswap and w3_base:
-        asyncio.create_task(pos_manager_baseswap.monitor())
-        asyncio.create_task(watch_pairs(
-            config.BASE_WS_RPC,
-            on_baseswap_pair_found,
-            factory_address=config.BASESWAP_FACTORY_BASE,
-            base_tokens=config.BASE_TOKENS_BASE,
-            ws_rpcs=config.BASE_WS_RPCS,
+        asyncio.create_task(_resilient_task(pos_manager_baseswap.monitor, "pos_monitor_baseswap"))
+        asyncio.create_task(_resilient_task(
+            lambda: watch_pairs(
+                config.BASE_WS_RPC,
+                on_baseswap_pair_found,
+                factory_address=config.BASESWAP_FACTORY_BASE,
+                base_tokens=config.BASE_TOKENS_BASE,
+                ws_rpcs=config.BASE_WS_RPCS,
+            ),
+            "watch_pairs_baseswap",
         ))
         log.info(f"BaseSwap watcher started (factory={config.BASESWAP_FACTORY_BASE[:10]}…)")
 
