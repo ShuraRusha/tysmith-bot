@@ -67,6 +67,11 @@ if w3 is None:
 
 trader = Trader(w3, config.PRIVATE_KEY, config.GAS_MULTIPLIER)
 
+# ── Poll w3 instances — one per HTTP RPC, used by _poll_new_pairs fallback ────
+# Pre-created at startup so polling can rotate without repeated object creation.
+_poll_w3s: list = [_make_w3(url) for url in config.BSC_HTTP_RPCS]
+log.info(f"Poll w3 pool: {len(_poll_w3s)} HTTP RPC endpoints")
+
 # ── Base chain setup (optional) ───────────────────────────────────────────────
 w3_base     = None
 trader_base = None
@@ -2083,14 +2088,24 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         activity_str = "*Активность:* пар ещё не замечено\n"
 
+    # ── Poll diagnostics ──────────────────────────────────────────────────────
+    if _poll_last_ok_ts:
+        poll_ago = int(time.time() - _poll_last_ok_ts)
+        poll_str = f"✅ последний успешный поллинг: {poll_ago}с назад (RPC#{_poll_ok_rpc_idx})"
+    else:
+        poll_str = "⚠️ поллинг ещё не завершил ни одного успешного запроса"
+    if _poll_consecutive_errors:
+        poll_str += f" | ошибок подряд: {_poll_consecutive_errors}"
+
     await update.message.reply_text(
         f"*Статус Sniper Bot* — {status_icon}\n\n"
-        f"RPC: {'✅' if connected else '❌'} {rpc_label} | WS endpoints: {ws_count}\n"
+        f"RPC: {'✅' if connected else '❌'} {rpc_label} | WS endpoints: {ws_count} | Poll RPCs: {len(_poll_w3s)}\n"
         f"Кошелёк: `{trader.wallet}`\n"
         f"Баланс: *{balance:.4f} BNB* (~${balance * bnb_price:.0f})\n"
         f"Позиций открыто: {len(pos_manager.positions)}/{calculate_max_positions(balance) if is_auto else config.MAX_POSITIONS}\n"
         f"Сделок в истории: {len(trade_history)}\n\n"
-        f"{activity_str}\n"
+        f"{activity_str}"
+        f"HTTP Poll: {poll_str}\n\n"
         f"*Размер позиции:*\n"
         f"Режим: {size_mode}\n"
         f"Следующая сделка: *{buy_amount} BNB* (~${buy_amount * bnb_price:.0f})\n"
@@ -2696,69 +2711,106 @@ async def _resilient_task(coro_factory, name: str, restart_delay: float = 5.0):
 
 # ── Backup polling: catch any pairs WebSocket might have missed ───────────────
 
-_last_polled_block: int = 0
+_last_polled_block: int  = 0
+_poll_consecutive_errors: int = 0   # how many polls in a row failed all RPCs
+_poll_ok_rpc_idx:     int = 0       # index of last working RPC in _poll_w3s
+_poll_last_ok_ts:     float = 0.0   # timestamp of last successful poll
 
 
 async def _poll_new_pairs():
     """
-    Fallback to eth_getLogs every 15 seconds to catch pairs missed by WebSocket.
+    Polls eth_getLogs every 15 seconds across all BSC_HTTP_RPCS in round-robin.
     Deduplication via _is_token_duplicate prevents reprocessing WS-seen tokens.
-    Primary path when WS nodes are stale; runs in parallel with WS watchers.
+    Acts as primary detection when WebSocket nodes are stale.
     """
-    global _last_polled_block
+    global _last_polled_block, _poll_consecutive_errors, _poll_ok_rpc_idx, _poll_last_ok_ts
     POLL_INTERVAL    = 15   # seconds between polls
-    LOOK_BACK_BLOCKS = 6    # ~18s on BSC (3s/block) — slightly wider than interval
+    LOOK_BACK_BLOCKS = 8    # ~24s safety buffer (3s/block on BSC)
+    ALERT_AFTER      = 20   # alert to Telegram after this many consecutive all-RPC failures
+
+    log.info(f"Poll task started — {len(_poll_w3s)} RPC(s), interval {POLL_INTERVAL}s")
 
     while True:
         await asyncio.sleep(POLL_INTERVAL)
         if is_paused:
             continue
-        try:
-            latest = await asyncio.to_thread(lambda: w3.eth.block_number)
-            if _last_polled_block > 0:
-                from_block = _last_polled_block + 1
-            else:
-                from_block = max(0, latest - LOOK_BACK_BLOCKS)
-            if from_block > latest:
+
+        # Determine block range
+        latest    = None
+        logs      = None
+        last_err  = ""
+
+        # Try each RPC starting from last known-good one
+        n = len(_poll_w3s)
+        for i in range(n):
+            idx   = (_poll_ok_rpc_idx + i) % n
+            pw3   = _poll_w3s[idx]
+            try:
+                latest = await asyncio.to_thread(lambda _w=pw3: _w.eth.block_number)
+                if _last_polled_block > 0:
+                    from_block = _last_polled_block + 1
+                else:
+                    from_block = max(0, latest - LOOK_BACK_BLOCKS)
+                if from_block > latest:
+                    _last_polled_block = latest
+                    logs = []
+                    _poll_ok_rpc_idx = idx
+                    break
+
+                logs = await asyncio.to_thread(
+                    pw3.eth.get_logs,
+                    {
+                        "address":   Web3.to_checksum_address(config.PANCAKE_FACTORY_V2),
+                        "fromBlock": from_block,
+                        "toBlock":   latest,
+                        "topics":    [PAIR_CREATED_TOPIC],
+                    },
+                )
                 _last_polled_block = latest
-                continue
+                _poll_ok_rpc_idx   = idx
+                _poll_consecutive_errors = 0
+                _poll_last_ok_ts   = time.time()
+                rpc_short = config.BSC_HTTP_RPCS[idx][:35] if idx < len(config.BSC_HTTP_RPCS) else "?"
+                if logs:
+                    log.info(f"Poll[{idx}] {rpc_short}…: {len(logs)} events (blocks {from_block}–{latest})")
+                break
+            except Exception as e:
+                last_err = str(e)
+                log.warning(f"Poll[{idx}] RPC failed: {e}")
 
-            logs = await asyncio.to_thread(
-                w3.eth.get_logs,
-                {
-                    "address":   Web3.to_checksum_address(config.PANCAKE_FACTORY_V2),
-                    "fromBlock": from_block,
-                    "toBlock":   latest,
-                    "topics":    [PAIR_CREATED_TOPIC],
-                },
-            )
-            _last_polled_block = latest
+        if logs is None:
+            # All RPCs failed this round
+            _poll_consecutive_errors += 1
+            log.error(f"Poll: all {n} RPCs failed (streak={_poll_consecutive_errors}). Last: {last_err}")
+            if _poll_consecutive_errors == ALERT_AFTER:
+                await tg_send(
+                    f"🔴 *HTTP поллинг не работает* — все {n} RPC упали {ALERT_AFTER} раз подряд\n"
+                    f"Последняя ошибка: `{last_err[:200]}`\n\n"
+                    f"Пары не обнаруживаются ни через WS, ни через поллинг.\n"
+                    f"Проверь Railway логи и статус RPC-нод."
+                )
+            continue
 
-            if logs:
-                log.info(f"Poll: {len(logs)} PairCreated events (blocks {from_block}–{latest})")
+        for log_entry in logs:
+            try:
+                topics = log_entry.get("topics", [])
+                if len(topics) < 3:
+                    continue
+                token0 = Web3.to_checksum_address(log_entry["topics"][1][-20:])
+                token1 = Web3.to_checksum_address(log_entry["topics"][2][-20:])
+                pair   = Web3.to_checksum_address(log_entry["data"][12:32])
 
-            for log_entry in logs:
-                try:
-                    topics = log_entry.get("topics", [])
-                    if len(topics) < 3:
-                        continue
-                    token0 = Web3.to_checksum_address(log_entry["topics"][1][-20:])
-                    token1 = Web3.to_checksum_address(log_entry["topics"][2][-20:])
-                    pair   = Web3.to_checksum_address(log_entry["data"][12:32])
+                t0, t1 = token0.lower(), token1.lower()
+                if t0 in config.BASE_TOKENS and t1 not in config.BASE_TOKENS:
+                    new_token, base_token = token1, token0
+                elif t1 in config.BASE_TOKENS and t0 not in config.BASE_TOKENS:
+                    new_token, base_token = token0, token1
+                else:
+                    continue
 
-                    t0, t1 = token0.lower(), token1.lower()
-                    if t0 in config.BASE_TOKENS and t1 not in config.BASE_TOKENS:
-                        new_token, base_token = token1, token0
-                    elif t1 in config.BASE_TOKENS and t0 not in config.BASE_TOKENS:
-                        new_token, base_token = token0, token1
-                    else:
-                        continue
-
-                    asyncio.create_task(on_pair_found(new_token, base_token, pair))
-                except Exception as e:
-                    log.warning(f"Poll: log parse error: {e}")
-        except Exception as e:
-            log.error(f"Poll new pairs error: {e}")
+                asyncio.create_task(on_pair_found(new_token, base_token, pair))
+            except Exception as e:
+                log.warning(f"Poll: log parse error: {e}")
 
 
 async def main(need_polling_grace: bool = False):
