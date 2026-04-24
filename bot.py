@@ -230,7 +230,7 @@ def _is_token_duplicate(token_address: str, dex_label: str = "") -> bool:
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 15
+SETTINGS_VERSION = 16
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -425,6 +425,13 @@ def _load_settings():
         if saved_version < 15:
             config.GAS_BUY_GWEI = 10.0
             log.info("Settings migration v14→v15: GAS_BUY_GWEI 5 → 10")
+
+        # Migration v15 → v16: MIN_FDV_USD отключён (0)
+        #   Симуляция buy/sell + LP check = достаточная защита
+        #   FDV фильтр режет легитимные токены на старте листинга
+        if saved_version < 16:
+            config.MIN_FDV_USD = 0.0
+            log.info("Settings migration v15→v16: MIN_FDV_USD → 0 (отключён)")
 
         # Restore bot mode (after migrations so v10 override above takes effect)
         if "__is_auto" in data and saved_version >= 10:

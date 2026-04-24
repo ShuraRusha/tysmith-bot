@@ -121,7 +121,7 @@ MIN_HOLDER_COUNT     = int(os.getenv("MIN_HOLDER_COUNT",       "0"))   # 0 = dis
 
 # ── Token quality filters ─────────────────────────────────────────────────────
 MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD",   "10000"))    # min market cap at buy time
-MIN_FDV_USD        = float(os.getenv("MIN_FDV_USD",          "5000"))     # min fully-diluted value (real safety = honeypot sim + LP check)
+MIN_FDV_USD        = float(os.getenv("MIN_FDV_USD",          "0"))        # 0 = отключён — реальная защита = симуляция buy/sell + LP check
 MAX_FDV_USD        = float(os.getenv("MAX_FDV_USD",          "10000000")) # max FDV (avoid huge caps)
 MIN_VOLUME_5M_USD  = float(os.getenv("MIN_VOLUME_5M_USD",    "0"))        # DexScreener 5-min volume — 0 = disabled (снайпер входит в первые секунды)
 MAX_TOKEN_AGE_DAYS = int(os.getenv("MAX_TOKEN_AGE_DAYS",     "7"))        # reject tokens older than this
