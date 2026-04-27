@@ -204,6 +204,10 @@ _MAX_REJECT_LOG = 20
 # Speed/competition tracking — how many blocks after listing the bot buys
 _stats_delta_blocks: list[int] = []  # rolling window of last 20 buys
 
+# Circuit breaker — auto-pause after N consecutive losing trades
+CIRCUIT_BREAKER_LOSSES = int(os.getenv("CIRCUIT_BREAKER_LOSSES", "10"))
+_consecutive_losses: int = 0  # reset to 0 on any profitable close
+
 # ── Cross-DEX token deduplication ─────────────────────────────────────────────
 # Prevents the same token from being processed by multiple DEX watchers
 # simultaneously (e.g. PancakeSwap + BiSwap both list the same token).
@@ -529,6 +533,30 @@ def _record_buy(pos: Position, tx_hash: str, delta_blocks: int = None, buyers_be
 
 def _record_trade(pos: Position, pnl_pct: float, reason: str, sell_price: float = 0.0):
     """Close a trade record. Updates the matching open entry if it exists."""
+    global is_paused, _consecutive_losses
+
+    # Circuit breaker: track consecutive losses, auto-pause on threshold
+    if pnl_pct < 0:
+        _consecutive_losses += 1
+        if _consecutive_losses >= CIRCUIT_BREAKER_LOSSES and not is_paused:
+            is_paused = True
+            _save_settings()
+            log.warning(
+                f"Circuit breaker triggered: {_consecutive_losses} consecutive losing trades — bot paused"
+            )
+            try:
+                loop = asyncio.get_event_loop()
+                loop.create_task(tg_send(
+                    f"🛑 *Автопауза* — сработал защитный механизм\n\n"
+                    f"*{_consecutive_losses} убыточных сделок подряд* — бот остановлен чтобы не допустить критических потерь.\n\n"
+                    f"Последняя: *{pos.symbol}* {pnl_pct:+.1f}%\n\n"
+                    f"Проверь настройки фильтров (/status) и возобнови торговлю вручную: /resume"
+                ))
+            except RuntimeError:
+                pass  # no running event loop (shouldn't happen in normal operation)
+    else:
+        _consecutive_losses = 0  # profitable trade resets the streak
+
     # Auto-blacklist deployer when a token is confirmed stuck (honeypot)
     if reason == "Honeypot" and pos.deployer_address:
         was_new = blacklist.add(
@@ -2154,6 +2182,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if _last_reject:
             activity_str += f"Последний отказ: _{_last_reject}_\n"
+        if _consecutive_losses > 0:
+            activity_str += (
+                f"⚠️ Убыточных сделок подряд: *{_consecutive_losses}/{CIRCUIT_BREAKER_LOSSES}* "
+                f"(автопауза при достижении)\n"
+            )
     else:
         activity_str = "*Активность:* пар ещё не замечено\n"
 

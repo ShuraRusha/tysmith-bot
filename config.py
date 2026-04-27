@@ -54,7 +54,7 @@ BUY_MIN_BNB        = float(os.getenv("BUY_MIN_BNB",        "0.01")) # skip trade
 BUY_MAX_BNB        = float(os.getenv("BUY_MAX_BNB",        "0.5"))  # hard cap per trade
 GAS_RESERVE_BNB    = float(os.getenv("GAS_RESERVE_BNB",    "0.015"))# always keep in wallet
 
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "3000"))  # pool liquidity floor
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "2000"))  # pool liquidity floor
 MAX_BUY_TAX       = float(os.getenv("MAX_BUY_TAX",       "10"))   # 10% — honeypot.is blocks anything above (real honeypots are 20-99%)
 MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "10"))   # 10% — GoPlus also checks; real honeypots won't pass sell simulation
 
@@ -89,7 +89,7 @@ TX_DEADLINE_SEC   = int(os.getenv("TX_DEADLINE_SEC",     "30"))    # short deadl
 BSCSCAN_API_KEY          = os.getenv("BSCSCAN_API_KEY", "")
 # Basescan API key for Base chain deployer history (free at basescan.org/myapikey)
 BASESCAN_API_KEY         = os.getenv("BASESCAN_API_KEY", "")
-MAX_DEPLOYER_TOKENS_30D  = int(os.getenv("MAX_DEPLOYER_TOKENS_30D", "15")) # >N contracts/30d = serial scammer (was 8)
+MAX_DEPLOYER_TOKENS_30D  = int(os.getenv("MAX_DEPLOYER_TOKENS_30D", "20")) # >N contracts/30d = serial scammer (was 15)
 
 # ── Position monitoring ──────────────────────────────────────────────────────
 MONITOR_INTERVAL_SEC    = float(os.getenv("MONITOR_INTERVAL_SEC",    "1"))   # price check frequency (was 5s, now 1s for memecoins)
@@ -120,11 +120,11 @@ MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "0"))  # 0 = auto formu
 # ── Safety filters ────────────────────────────────────────────────────────────
 TOP_HOLDER_MAX_PCT   = float(os.getenv("TOP_HOLDER_MAX_PCT",   "50"))  # reject if single wallet > X% (was 30)
 MAX_TOP10_HOLDER_PCT = float(os.getenv("MAX_TOP10_HOLDER_PCT", "60"))  # top-10 combined (excl. DEX/locked) > X% → reject (was 30)
-LP_HOLDER_MAX_PCT    = float(os.getenv("LP_HOLDER_MAX_PCT",    "70"))  # reject if any unlocked wallet holds >X% of LP (was 50)
+LP_HOLDER_MAX_PCT    = float(os.getenv("LP_HOLDER_MAX_PCT",    "100")) # 100 = disabled for sniper (deployer always holds LP at T+0)
 MIN_HOLDER_COUNT     = int(os.getenv("MIN_HOLDER_COUNT",       "0"))   # 0 = disabled — sniper enters first, 1-3 holders is normal at launch
 
 # ── Token quality filters ─────────────────────────────────────────────────────
-MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD",   "10000"))    # min market cap at buy time
+MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD",   "1000"))     # min market cap at buy time (was 10000)
 MIN_FDV_USD        = float(os.getenv("MIN_FDV_USD",          "0"))        # 0 = отключён — реальная защита = симуляция buy/sell + LP check
 MAX_FDV_USD        = float(os.getenv("MAX_FDV_USD",          "10000000")) # max FDV (avoid huge caps)
 MIN_VOLUME_5M_USD  = float(os.getenv("MIN_VOLUME_5M_USD",    "0"))        # DexScreener 5-min volume — 0 = disabled (снайпер входит в первые секунды)
