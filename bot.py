@@ -242,7 +242,7 @@ def _is_token_duplicate(token_address: str, dex_label: str = "") -> bool:
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 16
+SETTINGS_VERSION = 17
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -444,6 +444,20 @@ def _load_settings():
         if saved_version < 16:
             config.MIN_FDV_USD = 0.0
             log.info("Settings migration v15→v16: MIN_FDV_USD → 0 (отключён)")
+
+        # Migration v16 → v17: снайпер-настройки для T+0 листинга
+        #   MIN_LIQUIDITY_USD      3000 → 2000  (нижний порог — больше пар проходит)
+        #   MIN_MARKET_CAP_USD    10000 → 1000  (FDV на T+0 всегда мал — не показатель качества)
+        #   LP_HOLDER_MAX_PCT        70 → 100   (100 = выкл.: деплоер держит 100% LP при листинге)
+        #   MAX_DEPLOYER_TOKENS_30D  15 → 20    (немного мягче для активных разработчиков)
+        if saved_version < 17:
+            config.MIN_LIQUIDITY_USD       = 2_000.0
+            config.MIN_MARKET_CAP_USD      = 1_000.0
+            config.LP_HOLDER_MAX_PCT       = 100.0
+            config.MAX_DEPLOYER_TOKENS_30D = 20
+            log.info(
+                "Settings migration v16→v17: liq=2k, mcap=1k, lp_holder=100 (выкл.), deployer=20"
+            )
 
         # Restore bot mode (after migrations so v10 override above takes effect)
         if "__is_auto" in data and saved_version >= 10:
@@ -2023,7 +2037,7 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(args) != 2:
         await update.message.reply_text(
             "❌ Формат: `/set <параметр> <значение>`\n\n"
-            "Параметры: `buy`, `sl`, `tp1`, `trail`, `liq`, `tax`, `max`",
+            "Параметры: `buy`, `sl`, `tp1`, `trail`, `liq`, `mcap`, `lp`, `deployer`, `tax`, `max`, `gwei`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -2052,8 +2066,9 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "vol5m":  ("MIN_VOLUME_5M_USD",   0.0,   1e6,   "Мин. объём за 5 мин USD"),
         "age":    ("MAX_TOKEN_AGE_DAYS",  1,     365,   "Макс. возраст токена (дней)"),
         "top10":  ("MAX_TOP10_HOLDER_PCT",1.0,   99.0,  "Макс. топ-10 холдеры % (excl. DEX)"),
-        "lp":     ("LP_HOLDER_MAX_PCT",  1.0,   99.0,  "Макс. % LP в одном незаблокированном кошельке"),
+        "lp":     ("LP_HOLDER_MAX_PCT",  1.0,   100.0, "Макс. % LP в одном незаблокированном кошельке (100 = выкл.)"),
         "holders":("MIN_HOLDER_COUNT",   1,     10000, "Мин. кол-во холдеров токена"),
+        "deployer":("MAX_DEPLOYER_TOKENS_30D", 1, 200, "Макс. контрактов деплоера за 30 дней"),
         # Taxes and limits
         "tax":    ("MAX_BUY_TAX",         1.0,   50.0,  "Макс. налог %"),
         "max":    ("MAX_POSITIONS",       1,     20,    "Макс. позиций"),
