@@ -208,6 +208,77 @@ _stats_delta_blocks: list[int] = []  # rolling window of last 20 buys
 CIRCUIT_BREAKER_LOSSES = int(os.getenv("CIRCUIT_BREAKER_LOSSES", "10"))
 _consecutive_losses: int = 0  # reset to 0 on any profitable close
 
+# ── Persistent analytics (survives restarts) ──────────────────────────────────
+# All-time rejection counts by category, stored to disk on each update.
+ANALYTICS_FILE = "/data/tysmith_analytics.json"
+_analytics: dict = {
+    "total_seen":     0,   # all-time pairs detected
+    "total_rejected": 0,   # all-time pairs rejected
+    "rejection_counts": {}, # category → count (all-time)
+}
+
+_ANALYTICS_SAVE_EVERY = 10  # write to disk every N rejections (avoid I/O flood)
+_analytics_unsaved = 0       # counter since last save
+
+
+def _categorize_rejection(reason: str) -> str:
+    """Map a raw rejection reason string to a short category label."""
+    r = reason.lower()
+    if "ликвидность" in r:                         return "Ликвидность"
+    if "market cap" in r:                           return "Market cap"
+    if "fdv" in r:                                  return "FDV"
+    if "блокирует продажу" in r or "sell simulation" in r: return "Блокировка продажи"
+    if "honeypot" in r:                             return "Honeypot"
+    if "sell tax" in r:                             return "Sell tax"
+    if "buy tax" in r:                              return "Buy tax"
+    if "rug риск" in r or "lp" in r:               return "LP не заблокирован"
+    if "топ-10 холдеров" in r:                      return "Концентрация холдеров"
+    if "деплоер в чёрном" in r:                    return "Деплоер (блеклист)"
+    if "серийный" in r or "контракт" in r:         return "Серийный деплоер"
+    if "слишком старый" in r or "возраст" in r:    return "Возраст токена"
+    if "объём" in r or "volume" in r:              return "Объём 5м"
+    if "холдеров слишком мало" in r:               return "Мало холдеров"
+    if "симуляция" in r:                           return "Симуляция (ошибка)"
+    if "selfdestruct" in r:                        return "Selfdestruct"
+    if "blacklist" in r or "заморозить" in r:      return "Blacklist функция"
+    if "ownership" in r:                           return "Ownership риск"
+    if "нет ликвидности" in r:                    return "Нет ликвидности"
+    if "цена нативного" in r:                     return "Ошибка RPC"
+    return "Другое"
+
+
+def _track_rejection(reason: str) -> None:
+    """Increment persistent rejection counter for this reason category."""
+    global _analytics_unsaved
+    cat = _categorize_rejection(reason)
+    _analytics["total_rejected"] = _analytics.get("total_rejected", 0) + 1
+    counts = _analytics.setdefault("rejection_counts", {})
+    counts[cat] = counts.get(cat, 0) + 1
+    _analytics_unsaved += 1
+    if _analytics_unsaved >= _ANALYTICS_SAVE_EVERY:
+        _save_analytics()
+        _analytics_unsaved = 0
+
+
+def _save_analytics() -> None:
+    try:
+        with open(ANALYTICS_FILE, "w") as f:
+            json.dump(_analytics, f)
+    except Exception as e:
+        log.warning(f"Could not save analytics: {e}")
+
+
+def _load_analytics() -> None:
+    global _analytics
+    try:
+        with open(ANALYTICS_FILE, "r") as f:
+            data = json.load(f)
+        _analytics.update(data)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"Could not load analytics: {e}")
+
 # ── Cross-DEX token deduplication ─────────────────────────────────────────────
 # Prevents the same token from being processed by multiple DEX watchers
 # simultaneously (e.g. PancakeSwap + BiSwap both list the same token).
@@ -794,6 +865,7 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str, 
         return
 
     _stats_seen  += 1
+    _analytics["total_seen"] = _analytics.get("total_seen", 0) + 1
     _last_seen_ts = time.time()
 
     # Check mempool pre-analysis cache first
@@ -834,6 +906,7 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str, 
     if not result["ok"]:
         _stats_rejected += 1
         _last_reject     = result["reason"]
+        _track_rejection(result["reason"])
         # Log rejection with symbol if available
         sym = (result.get("info") or {}).get("symbol") or token_address[:10]
         entry = {
@@ -1042,6 +1115,7 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
         return
 
     _stats_seen  += 1
+    _analytics["total_seen"] = _analytics.get("total_seen", 0) + 1
     _last_seen_ts = time.time()
 
     log.info(f"[Base] Analyzing: {token_address}")
@@ -1074,6 +1148,7 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
     if not result["ok"]:
         _stats_rejected += 1
         _last_reject     = result["reason"]
+        _track_rejection(result["reason"])
         sym = (result.get("info") or {}).get("symbol") or token_address[:10]
         entry = {
             "ts":     datetime.now(MOSCOW_TZ).strftime("%H:%M:%S"),
@@ -1228,6 +1303,7 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
         return
 
     _stats_seen  += 1
+    _analytics["total_seen"] = _analytics.get("total_seen", 0) + 1
     _last_seen_ts = time.time()
 
     log.info(f"[BiSwap] Analyzing: {token_address}")
@@ -1256,6 +1332,7 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
     if not result["ok"]:
         _stats_rejected += 1
         _last_reject     = result["reason"]
+        _track_rejection(result["reason"])
         sym = (result.get("info") or {}).get("symbol") or token_address[:10]
         entry = {
             "ts":     datetime.now(MOSCOW_TZ).strftime("%H:%M:%S"),
@@ -1397,6 +1474,7 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
         return
 
     _stats_seen  += 1
+    _analytics["total_seen"] = _analytics.get("total_seen", 0) + 1
     _last_seen_ts = time.time()
 
     log.info(f"[BaseSwap] Analyzing: {token_address}")
@@ -1429,6 +1507,7 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
     if not result["ok"]:
         _stats_rejected += 1
         _last_reject     = result["reason"]
+        _track_rejection(result["reason"])
         sym = (result.get("info") or {}).get("symbol") or token_address[:10]
         entry = {
             "ts":     datetime.now(MOSCOW_TZ).strftime("%H:%M:%S"),
@@ -1776,7 +1855,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Диагностика*\n"
         "/rejects — последние 10 отклонённых токенов с причиной\n\n"
         "*Статистика*\n"
-        "/stats — полная статистика (win rate, PnL, breakdown)\n"
+        "/analytics — полная аналитика: воронка, топ причин отклонения, honeypot, P&L\n"
+        "/stats — статистика сделок (win rate, PnL, breakdown)\n"
         "/stats today — только сегодня\n"
         "/stats week — за последние 7 дней\n"
         "/history — последние 10 сделок с временем удержания\n\n"
@@ -2517,6 +2597,122 @@ async def cmd_rejects(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
+async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Full analytics dashboard: funnel, rejection breakdown, trading performance."""
+    # ── Funnel ────────────────────────────────────────────────────────────────
+    total_seen_ever = _analytics.get("total_seen", 0)
+    total_rej_ever  = _analytics.get("total_rejected", 0)
+    total_seen_now  = _stats_seen
+    total_rej_now   = _stats_rejected
+
+    closed_trades = [t for t in trade_history if t.get("status") == "closed" or "pnl_pct" in t]
+    open_trades   = [t for t in trade_history if t.get("status") == "open"]
+    total_bought  = len(closed_trades) + len(open_trades)
+
+    passed_filters = total_bought  # every bought token passed filters
+    pass_rate = passed_filters / total_seen_ever * 100 if total_seen_ever else 0
+    buy_rate  = total_bought  / total_seen_ever * 100 if total_seen_ever else 0
+
+    funnel = (
+        f"*🔍 Воронка (за всё время):*\n"
+        f"Обнаружено пар: *{total_seen_ever:,}*\n"
+        f"Отклонено: *{total_rej_ever:,}* ({100 - pass_rate:.1f}%)\n"
+        f"Прошло фильтры: *{passed_filters}* ({pass_rate:.2f}%)\n"
+        f"Куплено: *{total_bought}* ({buy_rate:.2f}%)\n"
+    )
+
+    # ── Rejection breakdown ────────────────────────────────────────────────────
+    counts = _analytics.get("rejection_counts", {})
+    if counts:
+        sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        top = sorted_counts[:10]
+        rej_lines = [f"\n*❌ Топ причин отклонения (за всё время):*"]
+        for i, (cat, cnt) in enumerate(top, 1):
+            pct = cnt / total_rej_ever * 100 if total_rej_ever else 0
+            bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+            rej_lines.append(f"{i}\\. *{cat}* — {pct:.1f}% ({cnt:,} шт.)")
+        rejection_section = "\n".join(rej_lines)
+    else:
+        rejection_section = "\n*❌ Статистика отклонений:* пока нет данных"
+
+    # ── Safety catches ─────────────────────────────────────────────────────────
+    honeypot_caught    = counts.get("Honeypot", 0) + counts.get("Блокировка продажи", 0)
+    honeypot_bought    = sum(1 for t in closed_trades if t.get("reason") == "Honeypot")
+    rug_stuck          = sum(1 for t in closed_trades if t.get("reason") == "Honeypot")
+    blacklisted_caught = counts.get("Деплоер (блеклист)", 0)
+    serial_caught      = counts.get("Серийный деплоер", 0)
+
+    safety = (
+        f"\n*🛡️ Безопасность:*\n"
+        f"Honeypot поймано фильтром: *{honeypot_caught}*\n"
+        f"Куплено honeypot (прорвалось): *{honeypot_bought}*\n"
+        f"Деплоер в блеклисте: *{blacklisted_caught}* заблок.\n"
+        f"Серийный скамер: *{serial_caught}* заблок.\n"
+    )
+
+    # ── Trading performance ────────────────────────────────────────────────────
+    if closed_trades:
+        valid = [t for t in closed_trades if isinstance(t.get("pnl_pct"), (int, float))]
+        wins  = [t for t in valid if t["pnl_pct"] > 0]
+        losses= [t for t in valid if t["pnl_pct"] <= 0]
+        wr    = len(wins) / len(valid) * 100 if valid else 0
+        avg_pnl = sum(t["pnl_pct"] for t in valid) / len(valid) if valid else 0
+        total_pnl_bnb = sum(t.get("pnl_bnb", 0) for t in valid)
+        best  = max(valid, key=lambda t: t["pnl_pct"], default=None)
+        worst = min(valid, key=lambda t: t["pnl_pct"], default=None)
+
+        avg_hold_win  = (sum(t.get("hold_sec", 0) for t in wins)   / len(wins)   if wins   else 0)
+        avg_hold_loss = (sum(t.get("hold_sec", 0) for t in losses) / len(losses) if losses else 0)
+        fmt_time = lambda s: f"{int(s)//3600}ч {(int(s)%3600)//60}м" if s >= 3600 else f"{int(s)//60}м {int(s)%60}с"
+
+        best_str  = f"+{best['pnl_pct']:.1f}% ({best.get('symbol','?')})"  if best  else "—"
+        worst_str = f"{worst['pnl_pct']:.1f}% ({worst.get('symbol','?')})" if worst else "—"
+
+        # Exit reason breakdown
+        reasons: dict[str, list] = {}
+        for t in valid:
+            reasons.setdefault(t.get("reason", "?"), []).append(t["pnl_pct"])
+        reason_lines = []
+        for r, pnls in sorted(reasons.items(), key=lambda x: -len(x[1])):
+            rwr = sum(1 for p in pnls if p > 0) / len(pnls) * 100
+            reason_lines.append(f"  {r}: {len(pnls)} сд., WR {rwr:.0f}%, avg {sum(pnls)/len(pnls):+.1f}%")
+
+        speed_str = ""
+        if _stats_delta_blocks:
+            avg_d = sum(_stats_delta_blocks) / len(_stats_delta_blocks)
+            speed_str = f"Avg блоков от листинга: *{avg_d:.1f}* (последние {len(_stats_delta_blocks)})\n"
+
+        perf = (
+            f"\n*💰 Торговля ({len(valid)} закрытых):*\n"
+            f"Прибыльных: *{len(wins)}* | Убыточных: *{len(losses)}* | WR: *{wr:.0f}%*\n"
+            f"Avg P&L: *{avg_pnl:+.1f}%* | Итого: *{total_pnl_bnb:+.4f} BNB*\n"
+            f"Лучшая: {best_str}\n"
+            f"Худшая: {worst_str}\n"
+            f"Avg hold (win): {fmt_time(avg_hold_win)} | (loss): {fmt_time(avg_hold_loss)}\n"
+            + speed_str +
+            f"Открытых позиций: *{len(open_trades)}*\n"
+            f"\n*Причины выхода:*\n" + "\n".join(reason_lines)
+        )
+    else:
+        perf = "\n*💰 Торговля:* сделок пока нет"
+
+    # ── Session stats ──────────────────────────────────────────────────────────
+    session = (
+        f"\n\n*📡 Сессия (с запуска):*\n"
+        f"Обнаружено: {total_seen_now} | Отклонено: {total_rej_now}\n"
+        f"Последовательных потерь: {_consecutive_losses}/{CIRCUIT_BREAKER_LOSSES}"
+    )
+
+    full = funnel + rejection_section + safety + perf + session
+    # Telegram limit 4096 chars — split if needed
+    for i in range(0, len(full), 4000):
+        await update.message.reply_text(
+            full[i:i+4000],
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+@owner_only
 async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Manage the deployer blacklist.
@@ -2998,6 +3194,7 @@ async def _poll_new_pairs():
 async def main(need_polling_grace: bool = False):
     _load_history()
     _load_settings()
+    _load_analytics()
     blacklist.load()
     log.info("Sniper Bot starting...")
 
@@ -3028,6 +3225,7 @@ async def main(need_polling_grace: bool = False):
     app.add_handler(CommandHandler("set",       cmd_set))
     app.add_handler(CommandHandler("analyze",   cmd_analyze))
     app.add_handler(CommandHandler("rejects",   cmd_rejects))
+    app.add_handler(CommandHandler("analytics", cmd_analytics))
     app.add_handler(CommandHandler("blacklist", cmd_blacklist))
     app.add_handler(CallbackQueryHandler(handle_callback))
     # Handle plain token addresses sent as messages (0x... 42 chars)
