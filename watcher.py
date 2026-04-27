@@ -12,6 +12,11 @@ log = logging.getLogger(__name__)
 # keccak256("PairCreated(address,address,address,uint256)")
 PAIR_CREATED_TOPIC = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
 
+# Raised when node explicitly rejects newPendingTransactions (wrong tier/plan).
+# Caught by the caller to disable mempool without endless retries.
+class MemPoolNotSupportedError(Exception):
+    pass
+
 # ── CREATE2 pair address prediction ──────────────────────────────────────────
 # createPair(address,address) selector (same on all Uniswap V2 forks)
 _CREATE_PAIR_SIG = "0xc9c65396"
@@ -240,8 +245,18 @@ async def watch_pending_pairs(
                     "params": ["newPendingTransactions"],
                 }))
 
-                resp = json.loads(await ws.recv())
+                resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
                 if "error" in resp:
+                    err = resp["error"]
+                    msg = str(err.get("message", err) if isinstance(err, dict) else err).lower()
+                    # Codes: -32601 = method not found, -32000 = subscription not supported
+                    code = err.get("code", 0) if isinstance(err, dict) else 0
+                    if code in (-32601, -32000) or any(
+                        x in msg for x in ("not found", "not support", "unsupport", "unavailable")
+                    ):
+                        raise MemPoolNotSupportedError(
+                            f"Node rejected newPendingTransactions: {resp['error']}"
+                        )
                     raise RuntimeError(f"Mempool subscribe error: {resp['error']}")
                 sub_id = resp.get("result")
                 log.info(f"Mempool subscribed, sub_id={sub_id}")
@@ -327,6 +342,8 @@ async def watch_pending_pairs(
                 for w in workers:
                     w.cancel()
 
+        except MemPoolNotSupportedError:
+            raise  # propagate so caller can disable mempool permanently
         except Exception as e:
             log.warning(f"Mempool WS error: {e}. Reconnecting in {backoff}s...")
             await asyncio.sleep(backoff)

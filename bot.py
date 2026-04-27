@@ -30,7 +30,7 @@ from position import (
     POSITIONS_FILE_BASE, POSITIONS_FILE_BISWAP, POSITIONS_FILE_BASESWAP,
 )
 from trader import Trader
-from watcher import watch_pairs, watch_pending_pairs, PAIR_CREATED_TOPIC
+from watcher import watch_pairs, watch_pending_pairs, PAIR_CREATED_TOPIC, MemPoolNotSupportedError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -656,6 +656,12 @@ def owner_only(fn):
 _mempool_cache: dict[str, dict] = {}
 _MEMPOOL_CACHE_TTL = 120  # seconds — discard stale pre-analysis results
 
+# Mempool stats — how many tokens pre-analyzed, how many cache hits saved time
+_mp_stats_pending: int   = 0   # tokens pre-analyzed from mempool
+_mp_stats_hits:    int   = 0   # times cache was used in on_pair_found
+_mp_stats_saved_s: float = 0.0 # total seconds saved by cache hits
+_mp_enabled:       bool  = False  # set True when mempool task actually starts
+
 
 async def on_pending_pair_found(token_address: str, base_token: str, pair_address: str):
     """
@@ -663,11 +669,14 @@ async def on_pending_pair_found(token_address: str, base_token: str, pair_addres
     Runs check_token immediately and caches the result.
     When PairCreated event fires, on_pair_found picks up the cached result.
     """
+    global _mp_stats_pending
     key = token_address.lower()
     if key in _mempool_cache:
         return  # already analyzing or analyzed
 
-    _mempool_cache[key] = {"result": None, "ts": time.time()}  # placeholder = "in progress"
+    t0 = time.time()
+    _mempool_cache[key] = {"result": None, "ts": t0}  # placeholder = "in progress"
+    _mp_stats_pending += 1
 
     try:
         result = await check_token(
@@ -685,9 +694,11 @@ async def on_pending_pair_found(token_address: str, base_token: str, pair_addres
             bscscan_api_key=config.BSCSCAN_API_KEY,
             max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
         )
-        _mempool_cache[key] = {"result": result, "ts": time.time()}
-        status = "OK" if result["ok"] else f"rejected: {result['reason']}"
-        log.info(f"Mempool pre-analysis done for {token_address[:10]}…: {status}")
+        elapsed = time.time() - t0
+        _mempool_cache[key] = {"result": result, "ts": time.time(), "elapsed": elapsed}
+        status = "✅ OK" if result["ok"] else f"❌ {result['reason']}"
+        sym = (result.get("info") or {}).get("symbol") or token_address[:10]
+        log.info(f"Mempool pre-analysis {sym} ({token_address[:10]}…): {status} [{elapsed:.1f}s]")
     except Exception as e:
         log.warning(f"Mempool pre-analysis error for {token_address[:10]}…: {e}")
         _mempool_cache.pop(key, None)
@@ -712,8 +723,15 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
     key = token_address.lower()
     cached = _mempool_cache.pop(key, None)
     if cached and cached.get("result") and (time.time() - cached["ts"]) < _MEMPOOL_CACHE_TTL:
-        result = cached["result"]
-        log.info(f"Using mempool pre-analysis cache for {token_address[:10]}…")
+        global _mp_stats_hits, _mp_stats_saved_s
+        result    = cached["result"]
+        saved_sec = cached.get("elapsed", 0.0)
+        _mp_stats_hits   += 1
+        _mp_stats_saved_s += saved_sec
+        log.info(
+            f"⚡ Mempool cache HIT for {token_address[:10]}… "
+            f"(saved ~{saved_sec:.1f}s, total hits={_mp_stats_hits})"
+        )
     else:
         log.info(f"Analyzing: {token_address}")
         try:
@@ -2105,7 +2123,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Позиций открыто: {len(pos_manager.positions)}/{calculate_max_positions(balance) if is_auto else config.MAX_POSITIONS}\n"
         f"Сделок в истории: {len(trade_history)}\n\n"
         f"{activity_str}"
-        f"HTTP Poll: {poll_str}\n\n"
+        f"HTTP Poll: {poll_str}\n"
+        f"Mempool: {'🧠 активен' if _mp_enabled else ('🔴 выкл' if not config.MEMPOOL_ENABLED else '⏳ стартует')}"
+        f" | pre-analyzed: {_mp_stats_pending} | cache hits: {_mp_stats_hits}"
+        f"{f' | saved: {_mp_stats_saved_s:.0f}s' if _mp_stats_hits else ''}\n\n"
         f"*Размер позиции:*\n"
         f"Режим: {size_mode}\n"
         f"Следующая сделка: *{buy_amount} BNB* (~${buy_amount * bnb_price:.0f})\n"
@@ -2697,6 +2718,58 @@ async def _lock_refresher(app):
             log.error(f"Lock refresher error (non-fatal): {e}")
 
 
+async def _start_mempool_watcher():
+    """
+    Start the mempool watcher using NodeReal WS (the only free node that supports
+    newPendingTransactions on BSC). Sends a Telegram alert if the node rejects
+    the subscription (wrong tier) and stops retrying to avoid log spam.
+    """
+    global _mp_enabled
+    # Prefer the NodeReal WS; fall back to the configured BSC WS
+    mempool_ws = config._NR_WS or config.BSC_WS_RPC
+    if not config.BSC_NODEREAL_KEY:
+        await tg_send(
+            "⚠️ *Mempool включён, но BSC\\_NODEREAL\\_KEY не задан*\n\n"
+            "Публичные ноды не поддерживают `newPendingTransactions`.\n"
+            "Добавь ключ NodeReal в Railway → Variables → BSC\\_NODEREAL\\_KEY\n"
+            "_(Mempool бесполезен без NodeReal — отключён автоматически)_"
+        )
+        log.warning("MEMPOOL_ENABLED=true but BSC_NODEREAL_KEY not set — mempool disabled")
+        return
+
+    _mp_enabled = True
+    await tg_send(
+        f"🧠 *Mempool мониторинг запущен*\n"
+        f"Нода: `{mempool_ws[:50]}…`\n"
+        f"Токены будут проанализированы до создания пары — мгновенная покупка при листинге."
+    )
+    log.info(f"Mempool watcher starting on {mempool_ws[:60]}…")
+
+    backoff = 5
+    while True:
+        try:
+            await watch_pending_pairs(mempool_ws, on_pending_pair_found)
+        except MemPoolNotSupportedError as e:
+            _mp_enabled = False
+            await tg_send(
+                f"⚠️ *Мемпул не поддерживается нодой NodeReal*\n\n"
+                f"`{e}`\n\n"
+                f"Скорее всего тариф NodeReal не включает `newPendingTransactions`.\n"
+                f"Нужен тариф *Growth* или выше (nodereal.io/pricing).\n"
+                f"_Бот продолжает работу без мемпула._"
+            )
+            log.error(f"Mempool not supported: {e} — disabling permanently")
+            return  # don't restart
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error(f"Mempool watcher crashed: {e} — restarting in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+        else:
+            backoff = 5  # reset on clean exit
+
+
 async def _resilient_task(coro_factory, name: str, restart_delay: float = 5.0):
     """Run a coroutine factory in a loop, logging and restarting on any exception."""
     while True:
@@ -2869,11 +2942,7 @@ async def main(need_polling_grace: bool = False):
     asyncio.create_task(_resilient_task(_poll_new_pairs, "poll_new_pairs"))
 
     if config.MEMPOOL_ENABLED:
-        asyncio.create_task(_resilient_task(
-            lambda: watch_pending_pairs(config.BSC_WS_RPC, on_pending_pair_found),
-            "mempool_watcher",
-        ))
-        log.info("Mempool monitoring enabled — pre-analyzing pending createPair txs")
+        asyncio.create_task(_start_mempool_watcher())
 
     if config.BASE_CHAIN_ENABLED and pos_manager_base:
         asyncio.create_task(_resilient_task(pos_manager_base.monitor, "pos_monitor_base"))
