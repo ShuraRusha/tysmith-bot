@@ -141,8 +141,9 @@ async def _watch_single(ws_url: str, callback, factory_address: str = None, base
                         else:
                             continue
 
+                        creation_block = int(log_entry.get("blockNumber", "0x0"), 16)
                         log.info(f"New pair detected: {new_token} / {base_token} @ {pair}")
-                        asyncio.create_task(callback(new_token, base_token, pair))
+                        asyncio.create_task(callback(new_token, base_token, pair, creation_block))
 
                     except Exception as e:
                         log.warning(f"Event parse error: {e}")
@@ -163,7 +164,7 @@ _seen_lock = asyncio.Lock()
 MAX_SEEN = 5000
 
 
-async def _dedup_callback(callback, new_token, base_token, pair):
+async def _dedup_callback(callback, new_token, base_token, pair, creation_block=0):
     """Wrapper that deduplicates events across multiple WS connections."""
     async with _seen_lock:
         if pair in _seen_pairs:
@@ -174,7 +175,7 @@ async def _dedup_callback(callback, new_token, base_token, pair):
             to_remove = list(_seen_pairs)[:MAX_SEEN // 2]
             for p in to_remove:
                 _seen_pairs.discard(p)
-    await callback(new_token, base_token, pair)
+    await callback(new_token, base_token, pair, creation_block)
 
 
 async def watch_pairs(
@@ -199,8 +200,8 @@ async def watch_pairs(
     else:
         log.info(f"Multi-WS mode: {len(urls)} endpoints for redundancy")
 
-        async def dedup_cb(new_token, base_token, pair):
-            await _dedup_callback(callback, new_token, base_token, pair)
+        async def dedup_cb(new_token, base_token, pair, creation_block=0):
+            await _dedup_callback(callback, new_token, base_token, pair, creation_block)
 
         tasks = [
             asyncio.create_task(_watch_single(u, dedup_cb, factory_address, base_tokens))

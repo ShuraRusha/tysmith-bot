@@ -255,6 +255,7 @@ class Trader:
                 "tx_hash":         tx_hash.hex(),
                 "tokens_received": balance,
                 "decimals":        decimals,
+                "block_number":    receipt.blockNumber,
             }
         except Exception as e:
             log.error(f"buy({token_address}): {e}")

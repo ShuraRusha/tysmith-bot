@@ -201,6 +201,9 @@ _last_reject:   str   = ""  # reason of last rejection
 _reject_log: list[dict] = []  # last 20 rejections with token + reason
 _MAX_REJECT_LOG = 20
 
+# Speed/competition tracking — how many blocks after listing the bot buys
+_stats_delta_blocks: list[int] = []  # rolling window of last 20 buys
+
 # ── Cross-DEX token deduplication ─────────────────────────────────────────────
 # Prevents the same token from being processed by multiple DEX watchers
 # simultaneously (e.g. PancakeSwap + BiSwap both list the same token).
@@ -503,9 +506,9 @@ def _ensure_history_loaded():
         log.warning(f"History hot-reload failed: {e}")
 
 
-def _record_buy(pos: Position, tx_hash: str):
+def _record_buy(pos: Position, tx_hash: str, delta_blocks: int = None, buyers_before: int = -1):
     """Record a buy event immediately when position opens."""
-    trade_history.append({
+    entry: dict = {
         "status":        "open",
         "symbol":        pos.symbol,
         "token_address": pos.token_address,
@@ -516,7 +519,11 @@ def _record_buy(pos: Position, tx_hash: str):
         "sell_tax":      pos.sell_tax,
         "tx_hash_buy":   tx_hash,
         "opened_at":     datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M"),
-    })
+    }
+    if delta_blocks is not None:
+        entry["delta_blocks"]  = delta_blocks
+        entry["buyers_before"] = buyers_before
+    trade_history.append(entry)
     _save_history()
 
 
@@ -704,9 +711,37 @@ async def on_pending_pair_found(token_address: str, base_token: str, pair_addres
         _mempool_cache.pop(key, None)
 
 
+# ── Speed/competition helpers ────────────────────────────────────────────────
+
+# Swap(address,uint256,uint256,uint256,uint256,address) — same on all Uniswap V2 forks
+_SWAP_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
+
+
+async def _count_prior_buyers(pair_address: str, from_block: int, to_block: int) -> int:
+    """Return number of Swap events on the pair between creation and our buy block."""
+    if not from_block or not to_block or to_block < from_block:
+        return -1
+    try:
+        idx = _poll_ok_rpc_idx
+        pw3 = _poll_w3s[idx] if _poll_w3s else w3
+        logs = await asyncio.to_thread(
+            pw3.eth.get_logs,
+            {
+                "address":   pair_address,
+                "topics":    [_SWAP_TOPIC],
+                "fromBlock": from_block,
+                "toBlock":   to_block,
+            },
+        )
+        # Each log = one swap; subtract 1 for our own buy (last one in range)
+        return max(0, len(logs) - 1)
+    except Exception:
+        return -1
+
+
 # ── New pair handler ──────────────────────────────────────────────────────────
 
-async def on_pair_found(token_address: str, base_token: str, pair_address: str):
+async def on_pair_found(token_address: str, base_token: str, pair_address: str, creation_block: int = 0):
     global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject
 
     if is_paused:
@@ -891,18 +926,34 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
                     deployer_address  = info.get("deployer") or "",
                 )
                 pos_manager.add(pos)
-                _record_buy(pos, result["tx_hash"])
+
+                # Speed metrics — how late vs pair creation
+                buy_block = result.get("block_number", 0)
+                delta_blocks  = (buy_block - creation_block) if creation_block and buy_block else None
+                buyers_before = await _count_prior_buyers(pair_address, creation_block, buy_block) if creation_block and buy_block else -1
+                if delta_blocks is not None:
+                    _stats_delta_blocks.append(delta_blocks)
+                    if len(_stats_delta_blocks) > 20:
+                        _stats_delta_blocks.pop(0)
+                    log.info(f"Speed: +{delta_blocks} blocks from listing | {buyers_before} buyers before us")
+
+                _record_buy(pos, result["tx_hash"], delta_blocks=delta_blocks, buyers_before=buyers_before)
                 amount_fmt = result["tokens_received"] / 10 ** result["decimals"]
                 fdv_str = f" | FDV: ${info['fdv_usd']:,.0f}" if info.get("fdv_usd") else ""
                 moon_str = (
                     f"\n🌙 Moon bag: *{moon_bag / 10**result['decimals']:.2f} {info['symbol']}* "
                     f"({config.MOON_BAG_PCT:.0f}%) — не продаётся авто"
                 ) if moon_bag > 0 else ""
+                speed_str = ""
+                if delta_blocks is not None:
+                    buyers_txt = f" | Покупок до нас: {buyers_before}" if buyers_before >= 0 else ""
+                    speed_str = f"\n📊 Блоков от листинга: +{delta_blocks}{buyers_txt}"
                 await tg_send(
                     f"✅ *Куплено авто* — {info['symbol']}\n\n"
                     f"Получено: {amount_fmt:.4f} {info['symbol']}\n"
                     f"Цена входа: {entry_price:.8f} BNB\n"
-                    f"Tx: `{result['tx_hash']}`\n\n"
+                    f"Tx: `{result['tx_hash']}`"
+                    f"{speed_str}\n\n"
                     f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}%  "
                     f"| Trailing: -{config.TRAILING_STOP_PCT}%  "
                     f"| SL: -{config.STOP_LOSS}%{fdv_str}"
@@ -938,7 +989,7 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
 
 # ── Base chain pair handler ───────────────────────────────────────────────────
 
-async def on_base_pair_found(token_address: str, base_token: str, pair_address: str):
+async def on_base_pair_found(token_address: str, base_token: str, pair_address: str, creation_block: int = 0):
     """Mirror of on_pair_found but for Base chain (Uniswap V2)."""
     global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject
 
@@ -1124,7 +1175,7 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
 
 # ── BiSwap pair handler ───────────────────────────────────────────────────────
 
-async def on_biswap_pair_found(token_address: str, base_token: str, pair_address: str):
+async def on_biswap_pair_found(token_address: str, base_token: str, pair_address: str, creation_block: int = 0):
     """Mirror of on_pair_found for BiSwap V2 (BSC)."""
     global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject
 
@@ -1293,7 +1344,7 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
 
 # ── BaseSwap pair handler ─────────────────────────────────────────────────────
 
-async def on_baseswap_pair_found(token_address: str, base_token: str, pair_address: str):
+async def on_baseswap_pair_found(token_address: str, base_token: str, pair_address: str, creation_block: int = 0):
     """Mirror of on_base_pair_found for BaseSwap V2 (Base)."""
     global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject
 
@@ -2115,6 +2166,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _poll_consecutive_errors:
         poll_str += f" | ошибок подряд: {_poll_consecutive_errors}"
 
+    if _stats_delta_blocks:
+        avg_delta = sum(_stats_delta_blocks) / len(_stats_delta_blocks)
+        speed_status = f"⚡ Скорость покупки: avg +{avg_delta:.1f} блоков от листинга (последние {len(_stats_delta_blocks)} покупок)\n"
+    else:
+        speed_status = ""
+
     await update.message.reply_text(
         f"*Статус Sniper Bot* — {status_icon}\n\n"
         f"RPC: {'✅' if connected else '❌'} {rpc_label} | WS endpoints: {ws_count} | Poll RPCs: {len(_poll_w3s)}\n"
@@ -2123,6 +2180,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Позиций открыто: {len(pos_manager.positions)}/{calculate_max_positions(balance) if is_auto else config.MAX_POSITIONS}\n"
         f"Сделок в истории: {len(trade_history)}\n\n"
         f"{activity_str}"
+        f"{speed_status}"
         f"HTTP Poll: {poll_str}\n"
         f"Mempool: {'🧠 активен' if _mp_enabled else ('🔴 выкл' if not config.MEMPOOL_ENABLED else '⏳ стартует')}"
         f" | pre-analyzed: {_mp_stats_pending} | cache hits: {_mp_stats_hits}"
@@ -2872,6 +2930,9 @@ async def _poll_new_pairs():
                 token0 = Web3.to_checksum_address(log_entry["topics"][1][-20:])
                 token1 = Web3.to_checksum_address(log_entry["topics"][2][-20:])
                 pair   = Web3.to_checksum_address(log_entry["data"][12:32])
+                creation_block = log_entry.get("blockNumber", 0)
+                if isinstance(creation_block, str):
+                    creation_block = int(creation_block, 16)
 
                 t0, t1 = token0.lower(), token1.lower()
                 if t0 in config.BASE_TOKENS and t1 not in config.BASE_TOKENS:
@@ -2881,7 +2942,7 @@ async def _poll_new_pairs():
                 else:
                     continue
 
-                asyncio.create_task(on_pair_found(new_token, base_token, pair))
+                asyncio.create_task(on_pair_found(new_token, base_token, pair, creation_block))
             except Exception as e:
                 log.warning(f"Poll: log parse error: {e}")
 
