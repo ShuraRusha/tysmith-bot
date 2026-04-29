@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import os
+import sys
 import time
 from datetime import datetime
 
@@ -16,7 +18,8 @@ from web3 import Web3
 from web3.middleware import geth_poa_middleware
 
 import config
-from analyzer import check_token, get_bnb_price
+from analyzer import check_token_security, get_bnb_price
+from execution_engine import Candidate, ExecutionEngine
 from position import Position, PositionManager
 from trader import Trader
 from watcher import watch_pairs
@@ -44,8 +47,8 @@ if not w3.is_connected():
 
 trader = Trader(w3, config.PRIVATE_KEY, config.SLIPPAGE, config.GAS_MULTIPLIER)
 
-# callback_id (first 10 chars of token address) → token info
-# cleaned up after user action (buy or skip)
+# cb_id (first 10 chars of token address) → pending token info
+# TTL-controlled; user must click BUY before PENDING_TTL seconds
 pending: dict[str, dict] = {}
 
 
@@ -61,17 +64,25 @@ async def tg_send(text: str, reply_markup=None):
         disable_web_page_preview=True,
     )
 
-pos_manager = PositionManager(trader, tg_send)
+pos_manager    = PositionManager(trader, tg_send)
+execution_engine: ExecutionEngine   # initialized in main()
 
 
-# ── New pair handler ──────────────────────────────────────────────────────────
+# ── Discovery: new pair handler ───────────────────────────────────────────────
 
 async def on_pair_found(token_address: str, base_token: str, pair_address: str):
-    log.info(f"Analyzing: {token_address}")
+    """
+    Called by watcher for every PairCreated event.
 
-    result = await check_token(
-        token_address, pair_address, base_token, w3,
-        config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
+    Responsibility: security screening only.
+    Buying happens later — ExecutionEngine waits for liquidity first.
+    """
+    log.info(f"Analyzing security: {token_address}")
+
+    result = await check_token_security(
+        token_address,
+        config.MAX_BUY_TAX,
+        config.MAX_SELL_TAX,
     )
 
     if not result["ok"]:
@@ -79,9 +90,8 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         return
 
     info      = result["info"]
-    bnb_price = info["bnb_price"]
+    bnb_price = await get_bnb_price(w3)
 
-    # Build warning lines for non-critical flags
     warnings = []
     if info["is_mintable"]:   warnings.append("⚠️ Mintable — могут допечатать токены")
     if info["hidden_owner"]:  warnings.append("⚠️ Hidden owner")
@@ -89,11 +99,13 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
     if info["external_call"]: warnings.append("⚠️ External call в коде")
     warn_block = "\n".join(warnings) if warnings else "✅ Дополнительных угроз нет"
 
+    creation_block = await asyncio.to_thread(lambda: w3.eth.block_number)
+    cb_id = token_address[:10]
+
     text = (
-        f"🎯 *Новый токен прошёл все проверки*\n\n"
+        f"🎯 *Новый токен прошёл проверки*\n\n"
         f"🪙 *{info['name']}* (`{info['symbol']}`)\n"
         f"📄 `{token_address}`\n\n"
-        f"💧 Ликвидность: *${info['liquidity_usd']:,.0f}*\n"
         f"💸 Buy tax: *{info['buy_tax']:.1f}%*  |  Sell tax: *{info['sell_tax']:.1f}%*\n"
         f"👥 Холдеры: {info['holder_count']}\n\n"
         f"{warn_block}\n\n"
@@ -101,16 +113,17 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         f"TP2: +{config.TAKE_PROFIT_2}%  |  SL: -{config.STOP_LOSS}%\n"
         f"💰 Покупка: *{config.BUY_AMOUNT_BNB} BNB* "
         f"(~${config.BUY_AMOUNT_BNB * bnb_price:.0f})\n"
+        f"⏳ Нажмите КУПИТЬ — войду в первый блок ликвидности\n"
         f"⏰ {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')} МСК"
     )
 
-    cb_id = token_address[:10]
     pending[cb_id] = {
-        "token_address": token_address,
-        "base_token":    base_token,
-        "pair_address":  pair_address,
-        "info":          info,
-        "ts":            time.time(),   # TTL: reject if user clicks too late
+        "token_address":  token_address,
+        "base_token":     base_token,
+        "pair_address":   pair_address,
+        "info":           info,
+        "creation_block": creation_block,
+        "ts":             time.time(),
     }
 
     keyboard = InlineKeyboardMarkup([[
@@ -127,7 +140,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data  = query.data
 
-    # ── BUY ──────────────────────────────────────────────────────────────────
+    # ── BUY → hand off to ExecutionEngine ────────────────────────────────────
     if data.startswith("buy_"):
         cb_id      = data[4:]
         token_info = pending.pop(cb_id, None)
@@ -135,31 +148,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ Время ожидания истекло — пара уже устарела.")
             return
 
-        sym           = token_info["info"]["symbol"]
-        token_address = token_info["token_address"]
-
-        # ── Guard: TTL — reject stale alerts ─────────────────────────────────
         if time.time() - token_info["ts"] > config.PENDING_TTL:
+            sym = token_info["info"]["symbol"]
             await query.edit_message_text(
                 f"⏰ Время истекло — {sym} уже {config.PENDING_TTL // 60} мин назад.\n"
                 f"Цена могла сильно измениться."
             )
             return
 
-        # ── Guard: no duplicate positions ─────────────────────────────────────
-        if token_address in pos_manager.positions:
+        sym  = token_info["info"]["symbol"]
+        addr = token_info["token_address"]
+
+        if addr in pos_manager.positions:
             await query.edit_message_text(f"⚠️ Позиция по {sym} уже открыта.")
             return
 
-        # ── Guard: max positions limit ────────────────────────────────────────
         if len(pos_manager.positions) >= config.MAX_POSITIONS:
             await query.edit_message_text(
-                f"🚫 Достигнут лимит позиций ({config.MAX_POSITIONS}).\n"
-                f"Закрой одну из текущих перед новой покупкой."
+                f"🚫 Достигнут лимит позиций ({config.MAX_POSITIONS})."
             )
             return
 
-        # ── Guard: sufficient BNB balance ─────────────────────────────────────
         if not trader.has_enough_bnb(config.BUY_AMOUNT_BNB):
             await query.edit_message_text(
                 f"💸 Недостаточно BNB для покупки {sym}.\n"
@@ -167,58 +176,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        candidate = Candidate(
+            token_address  = addr,
+            base_token     = token_info["base_token"],
+            pair_address   = token_info["pair_address"],
+            info           = token_info["info"],
+            creation_block = token_info["creation_block"],
+        )
+        await execution_engine.enqueue(candidate)
+
         await query.edit_message_text(
-            f"⏳ Покупаю *{sym}*...", parse_mode=ParseMode.MARKDOWN
+            f"⏳ *{sym}* — жду ликвидность ≥ ${config.MIN_LIQUIDITY_USD:,.0f}...\n"
+            f"Куплю автоматически как только появится.",
+            parse_mode=ParseMode.MARKDOWN,
         )
-
-        # Get price BEFORE buying (not inflated by our own tx)
-        price_before = await asyncio.to_thread(
-            trader.get_price, token_address, token_info["base_token"]
-        )
-
-        result = await asyncio.to_thread(
-            trader.buy, token_address, config.BUY_AMOUNT_BNB
-        )
-
-        if result["ok"]:
-            pos = Position(
-                token_address     = token_address,
-                symbol            = sym,
-                name              = token_info["info"]["name"],
-                pair_address      = token_info["pair_address"],
-                buy_price_bnb     = price_before if price_before > 0 else
-                                    result["tokens_received"] and config.BUY_AMOUNT_BNB / (result["tokens_received"] / 10 ** result["decimals"]),
-                tokens_amount     = result["tokens_received"],
-                decimals          = result["decimals"],
-                buy_bnb           = config.BUY_AMOUNT_BNB,
-                take_profit_1     = config.TAKE_PROFIT_1,
-                take_profit_1_pct = config.TAKE_PROFIT_1_PCT,
-                take_profit_2     = config.TAKE_PROFIT_2,
-                stop_loss         = config.STOP_LOSS,
-            )
-            pos_manager.add(pos)
-
-            # Pre-approve router in background so sell is instant later
-            asyncio.create_task(
-                asyncio.to_thread(trader.approve_token, token_address)
-            )
-
-            amount_fmt = result["tokens_received"] / 10 ** result["decimals"]
-            await query.edit_message_text(
-                f"✅ *Куплено!* — {sym}\n\n"
-                f"Получено: {amount_fmt:.4f} {sym}\n"
-                f"Цена входа: {price_before:.8f} BNB\n"
-                f"Tx: `{result['tx_hash']}`\n\n"
-                f"TP1: +{config.TAKE_PROFIT_1}% → продать {config.TAKE_PROFIT_1_PCT:.0f}%\n"
-                f"TP2: +{config.TAKE_PROFIT_2}% → продать остаток\n"
-                f"SL: -{config.STOP_LOSS}%",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        else:
-            await query.edit_message_text(
-                f"❌ *Ошибка покупки* — {sym}\n{result['reason']}",
-                parse_mode=ParseMode.MARKDOWN,
-            )
 
     # ── SKIP ─────────────────────────────────────────────────────────────────
     elif data.startswith("skip_"):
@@ -267,10 +238,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Sniper Bot активен*\n\n"
-        "Слежу за новыми парами на PancakeSwap V2 (BSC).\n"
-        "Каждый токен проходит автоматическую проверку:\n"
-        "honeypot · налог · ликвидность · опасные функции\n\n"
-        "При появлении чистого токена — пришлю уведомление с кнопками.\n\n"
+        "Слежу за новыми парами на PancakeSwap V2 (BSC).\n\n"
+        "Каждый токен проходит проверку:\n"
+        "honeypot · налог · опасные функции\n\n"
+        "При появлении чистого токена — пришлю уведомление.\n"
+        "Нажмите КУПИТЬ — и бот войдёт автоматически в первый блок ликвидности.\n\n"
         "*/positions* — открытые позиции\n"
         "*/status* — состояние бота и баланс кошелька",
         parse_mode=ParseMode.MARKDOWN,
@@ -328,10 +300,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ── Background: remove expired pending alerts ────────────────────────────────
+# ── Background: clean up expired pending alerts ───────────────────────────────
 
 async def _cleanup_pending():
-    """Remove pending tokens older than PENDING_TTL every 60 seconds."""
     while True:
         await asyncio.sleep(60)
         now     = time.time()
@@ -342,20 +313,19 @@ async def _cleanup_pending():
             log.info(f"Cleaned up {len(expired)} expired pending token(s)")
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── PID lock ──────────────────────────────────────────────────────────────────
 
 PID_FILE = "/tmp/tysmith-bot.pid"
 
 def _acquire_pid_lock():
-    """Exit if another instance is already running."""
     if os.path.exists(PID_FILE):
         try:
             old_pid = int(open(PID_FILE).read().strip())
-            os.kill(old_pid, 0)   # signal 0 = check if process exists
+            os.kill(old_pid, 0)
             log.error(f"Бот уже запущен (PID {old_pid}). Выход.")
             sys.exit(1)
         except (ProcessLookupError, ValueError):
-            pass   # stale PID file — overwrite it
+            pass
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
@@ -365,8 +335,16 @@ def _release_pid_lock():
     except FileNotFoundError:
         pass
 
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
 async def main():
+    global execution_engine
+
+    _acquire_pid_lock()
     log.info("Sniper Bot starting...")
+
+    execution_engine = ExecutionEngine(w3, trader, pos_manager, tg_send)
 
     app = Application.builder().token(config.BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",     cmd_start))
@@ -380,6 +358,7 @@ async def main():
 
     asyncio.create_task(pos_manager.monitor())
     asyncio.create_task(watch_pairs(config.BSC_WS_RPC, on_pair_found))
+    asyncio.create_task(execution_engine.run())
     asyncio.create_task(_cleanup_pending())
 
     log.info(f"Ready. Wallet: {trader.wallet}")
@@ -393,6 +372,9 @@ async def main():
         while True:
             await asyncio.sleep(60)
     except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        _release_pid_lock()
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
