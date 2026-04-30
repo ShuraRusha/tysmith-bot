@@ -24,7 +24,7 @@ from web3.middleware import geth_poa_middleware
 
 import blacklist
 import config
-from analyzer import analyze_token, check_token, get_bnb_price, _get_liquidity_usd_sync as _liq_sync, _get_bnb_price_sync as _bnb_price_sync
+from analyzer import analyze_token, check_token, check_token_fast, get_bnb_price, _get_liquidity_usd_sync as _liq_sync, _get_bnb_price_sync as _bnb_price_sync
 from position import (
     Position, PositionManager,
     POSITIONS_FILE_BASE, POSITIONS_FILE_BISWAP, POSITIONS_FILE_BASESWAP,
@@ -791,6 +791,12 @@ _LIQ_WAIT_FAST_COUNT    = 15
 _LIQ_WAIT_SLOW_INTERVAL = 3.0          # then every BSC block (~3s)
 _LIQ_WAIT_TTL           = 300          # give up after 5 minutes
 
+# Security results from the original check_token() call, keyed by token_address.lower().
+# When a token fails only due to liquidity, the 5-second security gather is already done
+# and cached here so the retry only needs ~300ms (buy sim + liquidity + FDV).
+_liq_security_cache: dict[str, dict] = {}
+_LIQ_SECURITY_CACHE_TTL = 600   # discard after 10 minutes
+
 # Rejection reasons that mean "no liquidity yet" — NOT a honeypot/scam reject
 _LIQUIDITY_REASONS = (
     "нет ликвидности",
@@ -837,7 +843,37 @@ async def _wait_for_liquidity_and_retry(
                 _liquidity_waiting.discard(key)
                 # Allow re-entry through dedup (token was blocked by 120s TTL)
                 _seen_tokens_ts.pop(key, None)
-                # Re-run the full discovery flow — all filters apply as normal
+
+                # Fast-path: if we have cached security results (all APIs already ran),
+                # run only buy sim + liquidity + FDV (~300ms) instead of full gather (~5s).
+                # Only available for on_pair_found (BSC PancakeSwap) which accepts _precheck_result.
+                cached_sec = _liq_security_cache.pop(key, None)
+                if (_callback is on_pair_found
+                        and cached_sec
+                        and (time.time() - cached_sec["ts"]) < _LIQ_SECURITY_CACHE_TTL
+                        and cached_sec.get("security")):
+                    log.info(f"{tag}[WaitLiq] {sym} — using cached security, running fast-path check")
+                    fast_result = await check_token_fast(
+                        token_address, pair_address, base_token, _w3,
+                        min_liquidity_usd=config.MIN_LIQUIDITY_USD,
+                        min_market_cap_usd=config.MIN_MARKET_CAP_USD,
+                        min_fdv_usd=config.MIN_FDV_USD,
+                        max_fdv_usd=config.MAX_FDV_USD,
+                        security=cached_sec["security"],
+                    )
+                    if fast_result["ok"]:
+                        log.info(f"{tag}[WaitLiq] {sym} — fast-path PASSED, triggering buy")
+                        await _callback(
+                            token_address, base_token, pair_address, creation_block,
+                            _precheck_result=fast_result,
+                        )
+                    else:
+                        log.info(f"{tag}[WaitLiq] {sym} — fast-path rejected: {fast_result['reason']}")
+                        # Fall back to full re-check in case conditions changed
+                        await _callback(token_address, base_token, pair_address, creation_block)
+                    return
+
+                # No cache or non-BSC chain: re-run the full discovery flow
                 await _callback(token_address, base_token, pair_address, creation_block)
                 return
 
@@ -848,6 +884,7 @@ async def _wait_for_liquidity_and_retry(
         log.info(f"{tag}[WaitLiq] {sym} — TTL expired, no liquidity after {attempt} polls")
     finally:
         _liquidity_waiting.discard(key)
+        _liq_security_cache.pop(key, None)   # clean up on timeout
 
 
 async def on_pending_pair_found(token_address: str, base_token: str, pair_address: str):
@@ -921,7 +958,13 @@ async def _count_prior_buyers(pair_address: str, from_block: int, to_block: int)
 
 # ── New pair handler ──────────────────────────────────────────────────────────
 
-async def on_pair_found(token_address: str, base_token: str, pair_address: str, creation_block: int = 0):
+async def on_pair_found(
+    token_address: str,
+    base_token: str,
+    pair_address: str,
+    creation_block: int = 0,
+    _precheck_result: dict = None,   # pass pre-validated result to skip check_token()
+):
     global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject
 
     if is_paused:
@@ -935,40 +978,45 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str, 
     _analytics["total_seen"] = _analytics.get("total_seen", 0) + 1
     _last_seen_ts = time.time()
 
-    # Check mempool pre-analysis cache first
-    key = token_address.lower()
-    cached = _mempool_cache.pop(key, None)
-    if cached and cached.get("result") and (time.time() - cached["ts"]) < _MEMPOOL_CACHE_TTL:
-        global _mp_stats_hits, _mp_stats_saved_s
-        result    = cached["result"]
-        saved_sec = cached.get("elapsed", 0.0)
-        _mp_stats_hits   += 1
-        _mp_stats_saved_s += saved_sec
-        log.info(
-            f"⚡ Mempool cache HIT for {token_address[:10]}… "
-            f"(saved ~{saved_sec:.1f}s, total hits={_mp_stats_hits})"
-        )
+    # Fast-path: security was pre-validated (e.g. from wait-for-liquidity cache)
+    if _precheck_result is not None:
+        result = _precheck_result
+        log.info(f"⚡ Fast-path for {token_address[:10]}… — skipped full security gather")
+    # Check mempool pre-analysis cache next
     else:
-        log.info(f"Analyzing: {token_address}")
-        try:
-            result = await check_token(
-                token_address, pair_address, base_token, w3,
-                config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
-                wallet_address=trader.wallet,
-                min_market_cap_usd=config.MIN_MARKET_CAP_USD,
-                min_fdv_usd=config.MIN_FDV_USD,
-                max_fdv_usd=config.MAX_FDV_USD,
-                max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
-                min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
-                max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
-                lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
-                min_holder_count=config.MIN_HOLDER_COUNT,
-                bscscan_api_key=config.BSCSCAN_API_KEY,
-                max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
+        key = token_address.lower()
+        cached = _mempool_cache.pop(key, None)
+        if cached and cached.get("result") and (time.time() - cached["ts"]) < _MEMPOOL_CACHE_TTL:
+            global _mp_stats_hits, _mp_stats_saved_s
+            result    = cached["result"]
+            saved_sec = cached.get("elapsed", 0.0)
+            _mp_stats_hits   += 1
+            _mp_stats_saved_s += saved_sec
+            log.info(
+                f"⚡ Mempool cache HIT for {token_address[:10]}… "
+                f"(saved ~{saved_sec:.1f}s, total hits={_mp_stats_hits})"
             )
-        except Exception as e:
-            log.error(f"[PancakeSwap] check_token error for {token_address[:10]}…: {e}")
-            return
+        else:
+            log.info(f"Analyzing: {token_address}")
+            try:
+                result = await check_token(
+                    token_address, pair_address, base_token, w3,
+                    config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
+                    wallet_address=trader.wallet,
+                    min_market_cap_usd=config.MIN_MARKET_CAP_USD,
+                    min_fdv_usd=config.MIN_FDV_USD,
+                    max_fdv_usd=config.MAX_FDV_USD,
+                    max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
+                    min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
+                    max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
+                    lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
+                    min_holder_count=config.MIN_HOLDER_COUNT,
+                    bscscan_api_key=config.BSCSCAN_API_KEY,
+                    max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
+                )
+            except Exception as e:
+                log.error(f"[PancakeSwap] check_token error for {token_address[:10]}…: {e}")
+                return
 
     if not result["ok"]:
         _stats_rejected += 1
@@ -990,6 +1038,17 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str, 
         # If rejection is purely liquidity (reserves not yet added after PairCreated),
         # schedule a polling task instead of discarding the token permanently.
         if any(r in result["reason"] for r in _LIQUIDITY_REASONS):
+            # Cache the already-computed security data for the fast retry path.
+            # check_token() includes "_security" in the rejection dict when all
+            # security APIs passed and only the on-chain liquidity check failed.
+            security_data = result.get("_security")
+            if security_data:
+                _liq_security_cache[token_address.lower()] = {
+                    "security": security_data,
+                    "ts": time.time(),
+                    "base_token": base_token,
+                    "pair_address": pair_address,
+                }
             asyncio.create_task(
                 _wait_for_liquidity_and_retry(token_address, base_token, pair_address, creation_block)
             )

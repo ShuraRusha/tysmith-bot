@@ -932,6 +932,27 @@ async def check_token(
     if not lp_result["ok"]:
         return {"ok": False, "reason": lp_result["reason"]}
 
+    # All security checks passed — build partial cache for wait-for-liquidity fast-path.
+    # Stored in rejection dict when liquidity/FDV fails so bot.py can skip re-running
+    # the expensive 5-second gather on retry.
+    _security_partial = {
+        "goplus_data":    goplus_data,
+        "hp_result":      hp_result,
+        "deployer_result": deployer_result,
+        "dex":            dex,
+        "wallet_address": wallet_address,
+        "router_address": router_address,
+        "native_token":   native_token,
+        "stable_token":   stable_token,
+        "dex_chain":      dex_chain,
+        "max_buy_tax":    max_buy_tax,
+        "max_sell_tax":   max_sell_tax,
+        "min_holder_count": min_holder_count,
+        "max_top10_holder_pct": max_top10_holder_pct,
+        "max_token_age_days": max_token_age_days,
+        "min_volume_5m_usd":  min_volume_5m_usd,
+    }
+
     # ── GoPlus — supplementary, non-blocking ──────────────────────────────────
     # GoPlus typically responds within 3s for indexed tokens.
     # For brand-new tokens it returns None — we proceed anyway using on-chain data.
@@ -1009,7 +1030,8 @@ async def check_token(
         _get_liquidity_usd_sync, w3, pair_address, base_token, native_price, native_token
     )
     if liquidity_usd < min_liquidity_usd:
-        return {"ok": False, "reason": f"Ликвидность: ${liquidity_usd:,.0f} < ${min_liquidity_usd:,.0f}"}
+        return {"ok": False, "reason": f"Ликвидность: ${liquidity_usd:,.0f} < ${min_liquidity_usd:,.0f}",
+                "_security": _security_partial}
 
     # ── FDV / Market cap check (on-chain) ─────────────────────────────────────
     fdv_usd = await asyncio.to_thread(
@@ -1017,9 +1039,11 @@ async def check_token(
     )
     if fdv_usd > 0:
         if fdv_usd < min_market_cap_usd:
-            return {"ok": False, "reason": f"Market cap: ${fdv_usd:,.0f} < ${min_market_cap_usd:,.0f}"}
+            return {"ok": False, "reason": f"Market cap: ${fdv_usd:,.0f} < ${min_market_cap_usd:,.0f}",
+                    "_security": _security_partial}
         if fdv_usd < min_fdv_usd:
-            return {"ok": False, "reason": f"FDV: ${fdv_usd:,.0f} < ${min_fdv_usd:,.0f}"}
+            return {"ok": False, "reason": f"FDV: ${fdv_usd:,.0f} < ${min_fdv_usd:,.0f}",
+                    "_security": _security_partial}
         if fdv_usd > max_fdv_usd:
             return {"ok": False, "reason": f"FDV: ${fdv_usd:,.0f} > ${max_fdv_usd:,.0f} (слишком крупный)"}
 
@@ -1067,6 +1091,121 @@ async def check_token(
         "goplus_ok":      goplus_data is not None,
         "extra_warnings": warnings_from_goplus,
         # Deployer info — used by bot.py to auto-blacklist on honeypot
+        "deployer":       deployer_result.get("deployer"),
+    }
+    return {"ok": True, "info": info}
+
+
+async def check_token_fast(
+    token_address: str,
+    pair_address:  str,
+    base_token:    str,
+    w3:            Web3,
+    min_liquidity_usd:  float,
+    min_market_cap_usd: float,
+    min_fdv_usd:        float,
+    max_fdv_usd:        float,
+    security:           dict,   # cached from _security key in prior check_token() rejection
+) -> dict:
+    """
+    Fast-path re-check for wait-for-liquidity retries.
+
+    Skips the expensive 5-second asyncio.gather() of external APIs.
+    Runs only the three on-chain checks that change after liquidity is added:
+      1. buy simulation (~200ms)
+      2. liquidity amount
+      3. FDV / market cap
+
+    Uses the previously validated security context (GoPlus, honeypot.is, deployer, etc.)
+    so total latency is ~300ms instead of ~5000ms.
+
+    Returns same format as check_token(): {"ok": True, "info": {...}} or {"ok": False, "reason": "..."}
+    """
+    router_address = security.get("router_address")
+    native_token   = security.get("native_token")
+    stable_token   = security.get("stable_token")
+    wallet_address = security.get("wallet_address") or "0x0000000000000000000000000000000000000001"
+    goplus_data    = security.get("goplus_data")
+    hp_result      = security.get("hp_result") or {"ok": True}
+    deployer_result = security.get("deployer_result") or {"ok": True}
+    dex            = security.get("dex")
+    max_buy_tax    = security.get("max_buy_tax", 10.0)
+    max_sell_tax   = security.get("max_sell_tax", 10.0)
+    min_holder_count      = security.get("min_holder_count", 0)
+    max_top10_holder_pct  = security.get("max_top10_holder_pct", 60.0)
+    max_token_age_days    = security.get("max_token_age_days", 7)
+    min_volume_5m_usd     = security.get("min_volume_5m_usd", 0.0)
+
+    # Re-run only the on-chain checks that depend on liquidity being present
+    sim_buy_task = asyncio.to_thread(
+        _simulate_buy_sync, w3, token_address, wallet_address, router_address, native_token
+    )
+    price_task = asyncio.to_thread(
+        _get_bnb_price_sync, w3, router_address, native_token, stable_token
+    )
+    sim_result, native_price = await asyncio.gather(sim_buy_task, price_task)
+
+    if not sim_result["ok"]:
+        return {"ok": False, "reason": sim_result["reason"]}
+    if native_price == 0.0:
+        return {"ok": False, "reason": "Не удалось получить цену нативного токена"}
+
+    liquidity_usd = await asyncio.to_thread(
+        _get_liquidity_usd_sync, w3, pair_address, base_token, native_price, native_token
+    )
+    if liquidity_usd < min_liquidity_usd:
+        return {"ok": False, "reason": f"Ликвидность: ${liquidity_usd:,.0f} < ${min_liquidity_usd:,.0f}"}
+
+    fdv_usd = await asyncio.to_thread(
+        _get_fdv_usd_sync, w3, token_address, native_price, router_address, native_token
+    )
+    if fdv_usd > 0:
+        if fdv_usd < min_market_cap_usd:
+            return {"ok": False, "reason": f"Market cap: ${fdv_usd:,.0f} < ${min_market_cap_usd:,.0f}"}
+        if fdv_usd < min_fdv_usd:
+            return {"ok": False, "reason": f"FDV: ${fdv_usd:,.0f} < ${min_fdv_usd:,.0f}"}
+        if fdv_usd > max_fdv_usd:
+            return {"ok": False, "reason": f"FDV: ${fdv_usd:,.0f} > ${max_fdv_usd:,.0f} (слишком крупный)"}
+
+    # Build warnings and info from cached security data
+    warnings_from_goplus = []
+    buy_tax  = 0.0
+    sell_tax = 0.0
+
+    if goplus_data:
+        if goplus_data.get("can_take_back_ownership") == "1": warnings_from_goplus.append("⚠️ Возврат ownership возможен")
+        if goplus_data.get("is_anti_whale")           == "1": warnings_from_goplus.append("⚠️ Anti-whale: лимит объёма одной транзакции")
+        if goplus_data.get("trading_cooldown")        == "1": warnings_from_goplus.append("⚠️ Trading cooldown: задержка между транзакциями")
+        if goplus_data.get("is_mintable")   == "1": warnings_from_goplus.append("⚠️ Mintable")
+        if goplus_data.get("hidden_owner")  == "1": warnings_from_goplus.append("⚠️ Hidden owner")
+        if goplus_data.get("is_proxy")      == "1": warnings_from_goplus.append("⚠️ Proxy контракт")
+        if goplus_data.get("external_call") == "1": warnings_from_goplus.append("⚠️ External call")
+        buy_tax  = float(goplus_data.get("buy_tax")  or 0)
+        sell_tax = float(goplus_data.get("sell_tax") or 0)
+        name   = goplus_data.get("token_name",   "Unknown")
+        symbol = goplus_data.get("token_symbol", "???")
+        holder_count = goplus_data.get("holder_count", "?")
+    else:
+        token_meta   = await asyncio.to_thread(_get_token_info_sync, w3, token_address)
+        name         = token_meta["name"]
+        symbol       = token_meta["symbol"]
+        holder_count = "?"
+
+    info = {
+        "name":           name,
+        "symbol":         symbol,
+        "buy_tax":        buy_tax,
+        "sell_tax":       sell_tax,
+        "liquidity_usd":  liquidity_usd,
+        "fdv_usd":        fdv_usd,
+        "bnb_price":      native_price,
+        "holder_count":   holder_count,
+        "is_mintable":    bool(goplus_data and goplus_data.get("is_mintable")   == "1"),
+        "hidden_owner":   bool(goplus_data and goplus_data.get("hidden_owner")  == "1"),
+        "is_proxy":       bool(goplus_data and goplus_data.get("is_proxy")      == "1"),
+        "external_call":  bool(goplus_data and goplus_data.get("external_call") == "1"),
+        "goplus_ok":      goplus_data is not None,
+        "extra_warnings": warnings_from_goplus,
         "deployer":       deployer_result.get("deployer"),
     }
     return {"ok": True, "info": info}
