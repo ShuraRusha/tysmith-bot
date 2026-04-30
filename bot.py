@@ -30,7 +30,7 @@ from position import (
     POSITIONS_FILE_BASE, POSITIONS_FILE_BISWAP, POSITIONS_FILE_BASESWAP,
 )
 from trader import Trader
-from watcher import watch_pairs, watch_pending_pairs, PAIR_CREATED_TOPIC, MemPoolNotSupportedError
+from watcher import watch_pairs, watch_pending_pairs, PAIR_CREATED_TOPIC, MemPoolNotSupportedError, _seen_pairs as _ws_seen_pairs, _seen_lock as _ws_seen_lock
 
 logging.basicConfig(
     level=logging.INFO,
@@ -835,6 +835,8 @@ async def _wait_for_liquidity_and_retry(
             if liq >= config.MIN_LIQUIDITY_USD:
                 log.info(f"{tag}[WaitLiq] {sym} — liquidity appeared: ${liq:,.0f} (attempt {attempt+1})")
                 _liquidity_waiting.discard(key)
+                # Allow re-entry through dedup (token was blocked by 120s TTL)
+                _seen_tokens_ts.pop(key, None)
                 # Re-run the full discovery flow — all filters apply as normal
                 await _callback(token_address, base_token, pair_address, creation_block)
                 return
@@ -3283,6 +3285,13 @@ async def _poll_new_pairs():
                     new_token, base_token = token0, token1
                 else:
                     continue
+
+                # Deduplicate against WS-seen pairs so HTTP poll and WebSocket
+                # don't both process the same PairCreated event.
+                async with _ws_seen_lock:
+                    if pair in _ws_seen_pairs:
+                        continue
+                    _ws_seen_pairs.add(pair)
 
                 asyncio.create_task(on_pair_found(new_token, base_token, pair, creation_block))
             except Exception as e:
