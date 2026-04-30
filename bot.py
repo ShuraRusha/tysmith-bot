@@ -24,7 +24,7 @@ from web3.middleware import geth_poa_middleware
 
 import blacklist
 import config
-from analyzer import analyze_token, check_token, get_bnb_price
+from analyzer import analyze_token, check_token, get_bnb_price, _get_liquidity_usd_sync as _liq_sync, _get_bnb_price_sync as _bnb_price_sync
 from position import (
     Position, PositionManager,
     POSITIONS_FILE_BASE, POSITIONS_FILE_BISWAP, POSITIONS_FILE_BASESWAP,
@@ -782,6 +782,71 @@ _mp_stats_hits:    int   = 0   # times cache was used in on_pair_found
 _mp_stats_saved_s: float = 0.0 # total seconds saved by cache hits
 _mp_enabled:       bool  = False  # set True when mempool task actually starts
 
+# ── Wait-for-liquidity queue ──────────────────────────────────────────────────
+# Tracks tokens where PairCreated fired before addLiquidity, so we don't
+# reject them permanently — instead we poll until reserves appear.
+_liquidity_waiting: set[str] = set()   # lowercase token addresses
+_LIQ_WAIT_FAST_INTERVAL = 1.0          # first 15 attempts every 1s
+_LIQ_WAIT_FAST_COUNT    = 15
+_LIQ_WAIT_SLOW_INTERVAL = 3.0          # then every BSC block (~3s)
+_LIQ_WAIT_TTL           = 300          # give up after 5 minutes
+
+# Rejection reasons that mean "no liquidity yet" — NOT a honeypot/scam reject
+_LIQUIDITY_REASONS = (
+    "нет ликвидности",
+    "нулевой выход из пула",
+)
+
+
+async def _wait_for_liquidity_and_retry(
+    token_address: str,
+    base_token: str,
+    pair_address: str,
+    creation_block: int,
+    w3_instance=None,
+    callback=None,
+    label: str = "",
+):
+    """
+    Called when on_pair_found gets a liquidity-only rejection.
+    Polls pair reserves until MIN_LIQUIDITY_USD is met, then re-runs the
+    appropriate on_pair_found callback so all existing filters apply.
+    """
+    key = token_address.lower()
+    if key in _liquidity_waiting:
+        return   # already polling for this token
+    _liquidity_waiting.add(key)
+
+    sym = token_address[:10] + "…"
+    tag = f"[{label}] " if label else ""
+    log.info(f"{tag}[WaitLiq] {sym} — polling for liquidity (TTL={_LIQ_WAIT_TTL}s)")
+
+    deadline  = time.time() + _LIQ_WAIT_TTL
+    attempt   = 0
+    _w3       = w3_instance or w3
+    _callback = callback or on_pair_found
+    bnb_price = await asyncio.to_thread(_bnb_price_sync, _w3)
+
+    try:
+        while time.time() < deadline:
+            liq = await asyncio.to_thread(
+                _liq_sync, _w3, pair_address, base_token, bnb_price
+            )
+            if liq >= config.MIN_LIQUIDITY_USD:
+                log.info(f"{tag}[WaitLiq] {sym} — liquidity appeared: ${liq:,.0f} (attempt {attempt+1})")
+                _liquidity_waiting.discard(key)
+                # Re-run the full discovery flow — all filters apply as normal
+                await _callback(token_address, base_token, pair_address, creation_block)
+                return
+
+            interval = _LIQ_WAIT_FAST_INTERVAL if attempt < _LIQ_WAIT_FAST_COUNT else _LIQ_WAIT_SLOW_INTERVAL
+            attempt += 1
+            await asyncio.sleep(interval)
+
+        log.info(f"{tag}[WaitLiq] {sym} — TTL expired, no liquidity after {attempt} polls")
+    finally:
+        _liquidity_waiting.discard(key)
+
 
 async def on_pending_pair_found(token_address: str, base_token: str, pair_address: str):
     """
@@ -919,6 +984,14 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str, 
         if len(_reject_log) > _MAX_REJECT_LOG:
             _reject_log.pop(0)
         log.info(f"Rejected {sym} ({token_address[:10]}…): {result['reason']}")
+
+        # If rejection is purely liquidity (reserves not yet added after PairCreated),
+        # schedule a polling task instead of discarding the token permanently.
+        if any(r in result["reason"] for r in _LIQUIDITY_REASONS):
+            asyncio.create_task(
+                _wait_for_liquidity_and_retry(token_address, base_token, pair_address, creation_block)
+            )
+            return
 
         # Near-miss alert: passed all safety checks but blocked by a threshold filter
         # Helps the user see activity and understand which filters are too strict
@@ -1161,6 +1234,15 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
             _reject_log.pop(0)
         log.info(f"[Base] Rejected {sym}: {result['reason']}")
 
+        if any(r in result["reason"] for r in _LIQUIDITY_REASONS):
+            asyncio.create_task(
+                _wait_for_liquidity_and_retry(
+                    token_address, base_token, pair_address, creation_block,
+                    w3_instance=w3_base, callback=on_base_pair_found, label="Base",
+                )
+            )
+            return
+
         _THRESHOLD_REASONS = (
             "Ликвидность:", "FDV:", "Market cap:", "Объём за 5 мин:",
             "Токен слишком старый", "Холдеров слишком мало",
@@ -1344,6 +1426,14 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
         if len(_reject_log) > _MAX_REJECT_LOG:
             _reject_log.pop(0)
         log.info(f"[BiSwap] Rejected {sym}: {result['reason']}")
+
+        if any(r in result["reason"] for r in _LIQUIDITY_REASONS):
+            asyncio.create_task(
+                _wait_for_liquidity_and_retry(
+                    token_address, base_token, pair_address, creation_block,
+                    w3_instance=w3, callback=on_biswap_pair_found, label="BiSwap",
+                )
+            )
         return
 
     info      = result["info"]
@@ -1519,6 +1609,14 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
         if len(_reject_log) > _MAX_REJECT_LOG:
             _reject_log.pop(0)
         log.info(f"[BaseSwap] Rejected {sym}: {result['reason']}")
+
+        if any(r in result["reason"] for r in _LIQUIDITY_REASONS):
+            asyncio.create_task(
+                _wait_for_liquidity_and_retry(
+                    token_address, base_token, pair_address, creation_block,
+                    w3_instance=w3_base, callback=on_baseswap_pair_found, label="BaseSwap",
+                )
+            )
         return
 
     info       = result["info"]
