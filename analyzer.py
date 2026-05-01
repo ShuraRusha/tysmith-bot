@@ -911,9 +911,36 @@ async def check_token(
 
     # ── Fast blockers (instant, no GoPlus needed) ─────────────────────────────
 
+    # Helper: build security cache from already-completed gather results.
+    # Used when a token fails due to zero liquidity (not a real security issue) so
+    # the wait-for-liquidity retry can use the fast path instead of re-running gather.
+    def _build_security_partial():
+        return {
+            "goplus_data":    goplus_data,
+            "hp_result":      hp_result,
+            "deployer_result": deployer_result,
+            "dex":            dex,
+            "wallet_address": wallet_address,
+            "router_address": router_address,
+            "native_token":   native_token,
+            "stable_token":   stable_token,
+            "dex_chain":      dex_chain,
+            "max_buy_tax":    max_buy_tax,
+            "max_sell_tax":   max_sell_tax,
+            "min_holder_count": min_holder_count,
+            "max_top10_holder_pct": max_top10_holder_pct,
+            "max_token_age_days": max_token_age_days,
+            "min_volume_5m_usd":  min_volume_5m_usd,
+        }
+
     # Buy simulation — catches: trading not enabled, honeypot on entry
     if not sim_result["ok"]:
-        return {"ok": False, "reason": sim_result["reason"]}
+        reason = sim_result["reason"]
+        # Zero reserves = PairCreated fired before addLiquidity. Other API tasks already
+        # ran in parallel — cache their results for the fast-path retry.
+        if "нет ликвидности" in reason or "нулевой выход" in reason:
+            return {"ok": False, "reason": reason, "_security": _build_security_partial()}
+        return {"ok": False, "reason": reason}
 
     # Sell simulation (from pair) — catches: sell-blocking honeypots (FSOLon, SEDGon)
     if not sell_sim["ok"]:
@@ -933,25 +960,7 @@ async def check_token(
         return {"ok": False, "reason": lp_result["reason"]}
 
     # All security checks passed — build partial cache for wait-for-liquidity fast-path.
-    # Stored in rejection dict when liquidity/FDV fails so bot.py can skip re-running
-    # the expensive 5-second gather on retry.
-    _security_partial = {
-        "goplus_data":    goplus_data,
-        "hp_result":      hp_result,
-        "deployer_result": deployer_result,
-        "dex":            dex,
-        "wallet_address": wallet_address,
-        "router_address": router_address,
-        "native_token":   native_token,
-        "stable_token":   stable_token,
-        "dex_chain":      dex_chain,
-        "max_buy_tax":    max_buy_tax,
-        "max_sell_tax":   max_sell_tax,
-        "min_holder_count": min_holder_count,
-        "max_top10_holder_pct": max_top10_holder_pct,
-        "max_token_age_days": max_token_age_days,
-        "min_volume_5m_usd":  min_volume_5m_usd,
-    }
+    _security_partial = _build_security_partial()
 
     # ── GoPlus — supplementary, non-blocking ──────────────────────────────────
     # GoPlus typically responds within 3s for indexed tokens.
@@ -1136,17 +1145,23 @@ async def check_token_fast(
     max_token_age_days    = security.get("max_token_age_days", 7)
     min_volume_5m_usd     = security.get("min_volume_5m_usd", 0.0)
 
-    # Re-run only the on-chain checks that depend on liquidity being present
-    sim_buy_task = asyncio.to_thread(
+    # Re-run only the on-chain checks that depend on liquidity being present.
+    # All three run in parallel — total ~200-300ms.
+    sim_buy_task  = asyncio.to_thread(
         _simulate_buy_sync, w3, token_address, wallet_address, router_address, native_token
     )
-    price_task = asyncio.to_thread(
+    sim_sell_task = asyncio.to_thread(_simulate_sell_sync, w3, token_address, pair_address)
+    price_task    = asyncio.to_thread(
         _get_bnb_price_sync, w3, router_address, native_token, stable_token
     )
-    sim_result, native_price = await asyncio.gather(sim_buy_task, price_task)
+    sim_result, sell_sim, native_price = await asyncio.gather(
+        sim_buy_task, sim_sell_task, price_task
+    )
 
     if not sim_result["ok"]:
         return {"ok": False, "reason": sim_result["reason"]}
+    if not sell_sim["ok"]:
+        return {"ok": False, "reason": sell_sim["reason"]}
     if native_price == 0.0:
         return {"ok": False, "reason": "Не удалось получить цену нативного токена"}
 

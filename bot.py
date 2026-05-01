@@ -313,7 +313,7 @@ def _is_token_duplicate(token_address: str, dex_label: str = "") -> bool:
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 17
+SETTINGS_VERSION = 18
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -529,6 +529,12 @@ def _load_settings():
             log.info(
                 "Settings migration v16→v17: liq=2k, mcap=1k, lp_holder=100 (выкл.), deployer=20"
             )
+
+        # Migration v17 → v18: снизить порог ликвидности — мемкоины лончатся с $300-$1500,
+        # при MIN_LIQUIDITY_USD=2000 wait-for-liquidity никогда не срабатывал.
+        if saved_version < 18:
+            config.MIN_LIQUIDITY_USD = 500.0
+            log.info("Settings migration v17→v18: MIN_LIQUIDITY_USD 2000 → 500")
 
         # Restore bot mode (after migrations so v10 override above takes effect)
         if "__is_auto" in data and saved_version >= 10:
