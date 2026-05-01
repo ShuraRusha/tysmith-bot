@@ -313,7 +313,7 @@ def _is_token_duplicate(token_address: str, dex_label: str = "") -> bool:
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 18
+SETTINGS_VERSION = 19
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -530,11 +530,24 @@ def _load_settings():
                 "Settings migration v16→v17: liq=2k, mcap=1k, lp_holder=100 (выкл.), deployer=20"
             )
 
-        # Migration v17 → v18: снизить порог ликвидности — мемкоины лончатся с $300-$1500,
-        # при MIN_LIQUIDITY_USD=2000 wait-for-liquidity никогда не срабатывал.
+        # Migration v17 → v18: снизить порог ликвидности
         if saved_version < 18:
             config.MIN_LIQUIDITY_USD = 500.0
             log.info("Settings migration v17→v18: MIN_LIQUIDITY_USD 2000 → 500")
+
+        # Migration v18 → v19: отключить фильтры бесполезные на T+0.
+        # Market cap и FDV на старте ВСЕГДА малы — они не отличают хороший токен от скама.
+        # Единственный реальный фильтр — симуляция buy+sell.
+        if saved_version < 19:
+            config.MIN_LIQUIDITY_USD  = 100.0    # минимум чтобы пул не был совсем пустой
+            config.MIN_MARKET_CAP_USD = 0.0      # 0 = выкл. — бесполезен на T+0
+            config.MIN_FDV_USD        = 0.0      # 0 = выкл. — бесполезен на T+0
+            config.MIN_VOLUME_5M_USD  = 0.0      # 0 = выкл. — снайпер входит первым
+            config.MIN_HOLDER_COUNT   = 0        # 0 = выкл. — 1-3 холдера норма при листинге
+            log.info(
+                "Settings migration v18→v19: отключены T+0-бесполезные фильтры "
+                "(mcap=0, fdv=0, liq=100, vol5m=0, holders=0)"
+            )
 
         # Restore bot mode (after migrations so v10 override above takes effect)
         if "__is_auto" in data and saved_version >= 10:
@@ -796,6 +809,11 @@ _LIQ_WAIT_FAST_INTERVAL = 1.0          # first 15 attempts every 1s
 _LIQ_WAIT_FAST_COUNT    = 15
 _LIQ_WAIT_SLOW_INTERVAL = 3.0          # then every BSC block (~3s)
 _LIQ_WAIT_TTL           = 300          # give up after 5 minutes
+
+# Dedup for near-miss threshold alerts — prevents the same token firing twice
+# when both WS and HTTP poll detect it, or when a retry re-triggers the alert.
+_near_miss_sent: dict[str, float] = {}   # token_address.lower() → timestamp
+_NEAR_MISS_TTL = 120   # seconds — suppress duplicate near-miss for same token
 
 # Security results from the original check_token() call, keyed by token_address.lower().
 # When a token fails only due to liquidity, the 5-second security gather is already done
@@ -1061,18 +1079,20 @@ async def on_pair_found(
             return
 
         # Near-miss alert: passed all safety checks but blocked by a threshold filter
-        # Helps the user see activity and understand which filters are too strict
         _THRESHOLD_REASONS = (
             "Ликвидность:", "FDV:", "Market cap:", "Объём за 5 мин:",
             "Токен слишком старый", "Холдеров слишком мало",
         )
         if any(result["reason"].startswith(r) for r in _THRESHOLD_REASONS):
-            info = result.get("info") or {}
-            await tg_send(
-                f"🔍 *Близко, но не прошёл фильтр*\n"
-                f"`{token_address}`\n"
-                f"❌ {result['reason']}"
-            )
+            _nm_key = token_address.lower()
+            _nm_now = time.time()
+            if _nm_now - _near_miss_sent.get(_nm_key, 0) > _NEAR_MISS_TTL:
+                _near_miss_sent[_nm_key] = _nm_now
+                await tg_send(
+                    f"🔍 *Близко, но не прошёл фильтр*\n"
+                    f"`{token_address}`\n"
+                    f"❌ {result['reason']}"
+                )
         return
 
     info      = result["info"]
@@ -1315,11 +1335,15 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
             "Токен слишком старый", "Холдеров слишком мало",
         )
         if any(result["reason"].startswith(r) for r in _THRESHOLD_REASONS):
-            await tg_send(
-                f"🔵 *[Base] Близко, не прошёл фильтр*\n"
-                f"`{token_address}`\n"
-                f"❌ {result['reason']}"
-            )
+            _nm_key = token_address.lower()
+            _nm_now = time.time()
+            if _nm_now - _near_miss_sent.get(_nm_key, 0) > _NEAR_MISS_TTL:
+                _near_miss_sent[_nm_key] = _nm_now
+                await tg_send(
+                    f"🔵 *[Base] Близко, не прошёл фильтр*\n"
+                    f"`{token_address}`\n"
+                    f"❌ {result['reason']}"
+                )
         return
 
     info       = result["info"]

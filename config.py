@@ -54,7 +54,7 @@ BUY_MIN_BNB        = float(os.getenv("BUY_MIN_BNB",        "0.01")) # skip trade
 BUY_MAX_BNB        = float(os.getenv("BUY_MAX_BNB",        "0.5"))  # hard cap per trade
 GAS_RESERVE_BNB    = float(os.getenv("GAS_RESERVE_BNB",    "0.015"))# always keep in wallet
 
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "500"))   # pool liquidity floor (memecoins often launch $300-1500)
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "100"))   # pool liquidity floor — 0 reserves = broken, $100 = live pool
 MAX_BUY_TAX       = float(os.getenv("MAX_BUY_TAX",       "10"))   # 10% — honeypot.is blocks anything above (real honeypots are 20-99%)
 MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "10"))   # 10% — GoPlus also checks; real honeypots won't pass sell simulation
 
@@ -124,7 +124,7 @@ LP_HOLDER_MAX_PCT    = float(os.getenv("LP_HOLDER_MAX_PCT",    "100")) # 100 = d
 MIN_HOLDER_COUNT     = int(os.getenv("MIN_HOLDER_COUNT",       "0"))   # 0 = disabled — sniper enters first, 1-3 holders is normal at launch
 
 # ── Token quality filters ─────────────────────────────────────────────────────
-MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD",   "1000"))     # min market cap at buy time (was 10000)
+MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD",   "0"))        # 0 = выкл. — market cap на T+0 не отличает хорошее от скама
 MIN_FDV_USD        = float(os.getenv("MIN_FDV_USD",          "0"))        # 0 = отключён — реальная защита = симуляция buy/sell + LP check
 MAX_FDV_USD        = float(os.getenv("MAX_FDV_USD",          "10000000")) # max FDV (avoid huge caps)
 MIN_VOLUME_5M_USD  = float(os.getenv("MIN_VOLUME_5M_USD",    "0"))        # DexScreener 5-min volume — 0 = disabled (снайпер входит в первые секунды)
