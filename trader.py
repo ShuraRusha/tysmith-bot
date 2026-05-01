@@ -256,6 +256,7 @@ class Trader:
                 "tokens_received": balance,
                 "decimals":        decimals,
                 "block_number":    receipt.blockNumber,
+                "gas_bnb":         gas_used_bnb,
             }
         except Exception as e:
             log.error(f"buy({token_address}): {e}")
@@ -329,8 +330,10 @@ class Trader:
                     return self.sell(token_address, amount_tokens, slippage_pct=49)
                 return {"ok": False, "reason": f"Продажа отклонена сетью (slip={slippage_pct:.0f}%)"}
 
-            log.info(f"Sell OK: {token_address}, slippage={slippage_pct}%, tx={tx_hash.hex()}")
-            return {"ok": True, "tx_hash": tx_hash.hex()}
+            gas_sell_bnb = receipt.gasUsed * tx["gasPrice"] / 1e18
+            log.info(f"Sell OK: {token_address}, slippage={slippage_pct}%, "
+                     f"gas={gas_sell_bnb:.4f} BNB, tx={tx_hash.hex()}")
+            return {"ok": True, "tx_hash": tx_hash.hex(), "gas_bnb": gas_sell_bnb}
 
         except Exception as e:
             log.error(f"sell({token_address}): {e}")
@@ -444,11 +447,12 @@ class Trader:
                         tx_hash, timeout=wait_timeout
                     )
                     if receipt.status == 1:
+                        gas_sell_bnb = receipt.gasUsed * gas_price / 1e18
                         log.info(
                             f"sell_escalating OK at attempt #{attempt+1}: "
-                            f"{token_address}, tx={tx_hash.hex()}"
+                            f"{token_address}, gas={gas_sell_bnb:.4f} BNB, tx={tx_hash.hex()}"
                         )
-                        return {"ok": True, "tx_hash": tx_hash.hex()}
+                        return {"ok": True, "tx_hash": tx_hash.hex(), "gas_bnb": gas_sell_bnb}
                     else:
                         # status=0 = contract revert (honeypot), gas escalation won't help
                         return {

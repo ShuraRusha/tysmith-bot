@@ -37,6 +37,7 @@ class Position:
     opened_at:        float = field(default_factory=time.time)
     moon_bag_tokens:  int   = field(default=0)    # tokens excluded from auto-sell (moon bag)
     deployer_address: str   = field(default="")  # deployer wallet — auto-blacklisted on honeypot
+    buy_gas_bnb:      float = field(default=0.0)  # gas paid on buy tx
     # Chain identifier ("bsc" or "base")
     chain:            str   = field(default="bsc")
     # Runtime state
@@ -212,17 +213,26 @@ class PositionManager:
             self.trader.sell_escalating, pos.token_address, pos.tokens_amount
         )
         if result["ok"]:
+            # Subtract buy + sell gas from P&L so history shows real net result
+            sell_gas_bnb = result.get("gas_bnb", 0.0)
+            total_gas_bnb = pos.buy_gas_bnb + sell_gas_bnb
+            gas_pct = (total_gas_bnb / pos.buy_bnb * 100) if pos.buy_bnb > 0 else 0.0
+            net_pnl_pct = pnl_pct - gas_pct
+
             labels = {
                 "SL":             "🛑 Стоп-лосс",
                 "Trailing Stop":  "🔒 Trailing Stop",
             }
             label = labels.get(reason, f"✅ {reason}")
+            gas_str = f"\n⛽ Газ: -{total_gas_bnb:.4f} BNB ({gas_pct:.1f}%)" if total_gas_bnb > 0 else ""
             await self.notify(
                 f"{label} — *{pos.symbol}*\n"
-                f"P&L: {pnl_pct:+.1f}%\n"
+                f"P&L (до газа): {pnl_pct:+.1f}%{gas_str}\n"
+                f"P&L (чистый): *{net_pnl_pct:+.1f}%*\n"
                 f"Потрачено: {pos.buy_bnb} BNB\n"
                 f"Tx: `{result['tx_hash']}`"
             )
+            pnl_pct = net_pnl_pct   # pass net P&L to on_close for correct history
             if self.on_close:
                 self.on_close(pos, pnl_pct, reason, sell_price)
             self.remove(pos.token_address)

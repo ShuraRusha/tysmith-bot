@@ -1199,6 +1199,7 @@ async def on_pair_found(
                     sell_tax          = info["sell_tax"],
                     moon_bag_tokens   = moon_bag,
                     deployer_address  = info.get("deployer") or "",
+                    buy_gas_bnb       = result.get("gas_bnb", 0.0),
                 )
                 pos_manager.add(pos)
 
