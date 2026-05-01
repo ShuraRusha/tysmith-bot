@@ -313,7 +313,7 @@ def _is_token_duplicate(token_address: str, dex_label: str = "") -> bool:
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 19
+SETTINGS_VERSION = 20
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -548,6 +548,11 @@ def _load_settings():
                 "Settings migration v18→v19: отключены T+0-бесполезные фильтры "
                 "(mcap=0, fdv=0, liq=100, vol5m=0, holders=0)"
             )
+
+        # Migration v19 → v20: поднять trailing stop 15% → 30% для волатильных мемкоинов
+        if saved_version < 20:
+            config.TRAILING_STOP_PCT = 30.0
+            log.info("Settings migration v19→v20: TRAILING_STOP_PCT 15 → 30")
 
         # Restore bot mode (after migrations so v10 override above takes effect)
         if "__is_auto" in data and saved_version >= 10:
@@ -2329,9 +2334,9 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "tp1":    ("TAKE_PROFIT_1",       5.0,   500.0, "TP1 %"),
         "trail":  ("TRAILING_STOP_PCT",   1.0,   90.0,  "Trailing stop %"),
         # Token quality filters
-        "liq":    ("MIN_LIQUIDITY_USD",   500.0, 1e7,   "Мин. ликвидность USD"),
-        "mcap":   ("MIN_MARKET_CAP_USD",  1000.0,1e7,   "Мин. market cap USD"),
-        "fdvmin": ("MIN_FDV_USD",         1000.0,1e7,   "Мин. FDV USD"),
+        "liq":    ("MIN_LIQUIDITY_USD",   0.0,   1e7,   "Мин. ликвидность USD (0 = выкл.)"),
+        "mcap":   ("MIN_MARKET_CAP_USD",  0.0,   1e7,   "Мин. market cap USD (0 = выкл.)"),
+        "fdvmin": ("MIN_FDV_USD",         0.0,   1e7,   "Мин. FDV USD (0 = выкл.)"),
         "fdvmax": ("MAX_FDV_USD",         1000.0,1e9,   "Макс. FDV USD"),
         "vol5m":  ("MIN_VOLUME_5M_USD",   0.0,   1e6,   "Мин. объём за 5 мин USD"),
         "age":    ("MAX_TOKEN_AGE_DAYS",  1,     365,   "Макс. возраст токена (дней)"),

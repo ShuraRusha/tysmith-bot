@@ -65,7 +65,7 @@ TAKE_PROFIT_1_PCT = float(os.getenv("TAKE_PROFIT_1_PCT", "50"))   # % of tokens 
 
 # Phase 2 — trailing stop on remaining position after TP1
 # Sells all remaining tokens if price drops TRAILING_STOP_PCT% from peak
-TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "15"))   # % drop from peak → full exit
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "30"))   # % drop from peak → full exit
 
 # Fixed stop loss before TP1 is reached
 STOP_LOSS         = float(os.getenv("STOP_LOSS",         "20"))
