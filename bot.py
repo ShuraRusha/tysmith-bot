@@ -313,7 +313,7 @@ def _is_token_duplicate(token_address: str, dex_label: str = "") -> bool:
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 20
+SETTINGS_VERSION = 21
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -553,6 +553,12 @@ def _load_settings():
         if saved_version < 20:
             config.TRAILING_STOP_PCT = 30.0
             log.info("Settings migration v19→v20: TRAILING_STOP_PCT 15 → 30")
+
+        # Migration v20 → v21: снизить gas 10→5 gwei (BSC 1-3 gwei норма, 10 переплата)
+        # SLIPPAGE_BUY/SELL не в persistent settings — обновляются через config.py напрямую
+        if saved_version < 21:
+            config.GAS_BUY_GWEI = 5.0
+            log.info("Settings migration v20→v21: GAS_BUY_GWEI 10 → 5")
 
         # Restore bot mode (after migrations so v10 override above takes effect)
         if "__is_auto" in data and saved_version >= 10:

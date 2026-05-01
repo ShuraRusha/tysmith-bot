@@ -73,10 +73,10 @@ STOP_LOSS         = float(os.getenv("STOP_LOSS",         "20"))
 # ── Execution params ──────────────────────────────────────────────────────────
 # Sniper-optimized: aggressive buy slippage (new tokens are volatile),
 # tighter sell slippage (selling into established pool)
-SLIPPAGE_BUY      = float(os.getenv("SLIPPAGE_BUY",     "12"))    # % — aggressive for new tokens
-SLIPPAGE_SELL     = float(os.getenv("SLIPPAGE_SELL",     "15"))    # % — wider to survive hidden taxes
+SLIPPAGE_BUY      = float(os.getenv("SLIPPAGE_BUY",     "25"))    # % — при $100-200 ликвидности price impact достигает 15-20%, 12% было мало
+SLIPPAGE_SELL     = float(os.getenv("SLIPPAGE_SELL",     "20"))    # % — шире чтобы пережить скрытые налоги
 GAS_MULTIPLIER    = float(os.getenv("GAS_MULTIPLIER",    "1.5"))   # outbid other buyers on gas
-GAS_BUY_GWEI      = float(os.getenv("GAS_BUY_GWEI",      "10"))   # fixed gwei for buys (10 = fast on BSC, was 5)
+GAS_BUY_GWEI      = float(os.getenv("GAS_BUY_GWEI",      "5"))    # gwei для покупки — BSC сейчас 1-3 gwei, 5 достаточно даже без NodeReal
 GAS_LIMIT_BUY      = int(os.getenv("GAS_LIMIT_BUY",   "500000"))  # gas limit for buy txs
 GAS_LIMIT_SELL     = int(os.getenv("GAS_LIMIT_SELL",   "350000"))  # gas limit for sell txs
 GAS_LIMIT_APPROVE  = int(os.getenv("GAS_LIMIT_APPROVE","80000"))   # gas limit for approve txs
