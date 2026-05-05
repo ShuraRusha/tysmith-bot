@@ -975,19 +975,23 @@ async def check_token(
             "is_honeypot":          "Honeypot (GoPlus)",
             "owner_change_balance": "Владелец может менять балансы",
             "selfdestruct":         "Selfdestruct функция",
-            "is_blacklisted":       "Blacklist функция",
             "cannot_buy":           "Покупка заблокирована контрактом",
             "cannot_sell_all":      "Продажа всех токенов заблокирована",
-            "transfer_pausable":    "Переводы можно заморозить — rug risk",
         }
         for flag, reason in CRITICAL.items():
             if goplus_data.get(flag) == "1":
                 return {"ok": False, "reason": reason}
 
         # Предупреждения — риски есть, но для короткого сниперинга приемлемо:
+        # transfer_pausable: очень распространено (~40% BSC токенов) — владелец может
+        #   приостановить торговлю, но для T+0 снайпера с TP1 это не блокер
+        # is_blacklisted: контракт имеет blacklist функцию — типично для анти-бот защиты,
+        #   не означает что наш адрес заблокирован
         # can_take_back_ownership: владелец может вернуть права (common, ~40% токенов)
         # is_anti_whale: лимит объёма одной транзакции
         # trading_cooldown: задержка между транзакциями
+        if goplus_data.get("transfer_pausable")    == "1": warnings_from_goplus.append("⚠️ Паузируемые переводы (типично для анти-бот)")
+        if goplus_data.get("is_blacklisted")       == "1": warnings_from_goplus.append("⚠️ Blacklist функция в контракте")
         if goplus_data.get("can_take_back_ownership") == "1": warnings_from_goplus.append("⚠️ Возврат ownership возможен")
         if goplus_data.get("is_anti_whale")           == "1": warnings_from_goplus.append("⚠️ Anti-whale: лимит объёма одной транзакции")
         if goplus_data.get("trading_cooldown")        == "1": warnings_from_goplus.append("⚠️ Trading cooldown: задержка между транзакциями")
@@ -1188,6 +1192,8 @@ async def check_token_fast(
     sell_tax = 0.0
 
     if goplus_data:
+        if goplus_data.get("transfer_pausable")    == "1": warnings_from_goplus.append("⚠️ Паузируемые переводы")
+        if goplus_data.get("is_blacklisted")       == "1": warnings_from_goplus.append("⚠️ Blacklist функция")
         if goplus_data.get("can_take_back_ownership") == "1": warnings_from_goplus.append("⚠️ Возврат ownership возможен")
         if goplus_data.get("is_anti_whale")           == "1": warnings_from_goplus.append("⚠️ Anti-whale: лимит объёма одной транзакции")
         if goplus_data.get("trading_cooldown")        == "1": warnings_from_goplus.append("⚠️ Trading cooldown: задержка между транзакциями")
@@ -1197,6 +1203,10 @@ async def check_token_fast(
         if goplus_data.get("external_call") == "1": warnings_from_goplus.append("⚠️ External call")
         buy_tax  = float(goplus_data.get("buy_tax")  or 0)
         sell_tax = float(goplus_data.get("sell_tax") or 0)
+        if buy_tax > max_buy_tax:
+            return {"ok": False, "reason": f"Buy tax (GoPlus): {buy_tax:.1f}% > {max_buy_tax:.0f}%"}
+        if sell_tax > max_sell_tax:
+            return {"ok": False, "reason": f"Sell tax (GoPlus): {sell_tax:.1f}% > {max_sell_tax:.0f}%"}
         name   = goplus_data.get("token_name",   "Unknown")
         symbol = goplus_data.get("token_symbol", "???")
         holder_count = goplus_data.get("holder_count", "?")

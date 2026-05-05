@@ -321,7 +321,7 @@ def _is_token_duplicate(token_address: str, dex_label: str = "") -> bool:
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 22
+SETTINGS_VERSION = 23
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -575,6 +575,16 @@ def _load_settings():
             config.MAX_FDV_USD          = 100_000_000.0
             config.TOP_HOLDER_MAX_PCT   = 90.0
             log.info("Settings migration v21→v22: MAX_FDV_USD 10M → 100M, TOP_HOLDER_MAX_PCT 50 → 90")
+
+        # Migration v22 → v23: налоги + TP1 — математика работает при 20%+20% налогах
+        #   MAX_BUY_TAX   10% → 20%   (~40% BSC токенов имеют launch tax 10-20%)
+        #   MAX_SELL_TAX  10% → 20%   (при 20% налогах: break-even = +56%, TP1=75% = +5% net)
+        #   TAKE_PROFIT_1  50% → 75%  (при 20% налогах: TP1=50% < break-even 56%, убыток!)
+        if saved_version < 23:
+            config.MAX_BUY_TAX   = 20.0
+            config.MAX_SELL_TAX  = 20.0
+            config.TAKE_PROFIT_1 = 75.0
+            log.info("Settings migration v22→v23: MAX_BUY_TAX/SELL_TAX 10→20%, TAKE_PROFIT_1 50→75%")
 
         # Restore bot mode (after migrations so v10 override above takes effect)
         if "__is_auto" in data and saved_version >= 10:

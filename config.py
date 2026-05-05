@@ -54,12 +54,12 @@ BUY_MAX_BNB        = float(os.getenv("BUY_MAX_BNB",        "0.5"))  # hard cap p
 GAS_RESERVE_BNB    = float(os.getenv("GAS_RESERVE_BNB",    "0.015"))# always keep in wallet
 
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "100"))   # pool liquidity floor — 0 reserves = broken, $100 = live pool
-MAX_BUY_TAX       = float(os.getenv("MAX_BUY_TAX",       "10"))   # 10% — honeypot.is blocks anything above (real honeypots are 20-99%)
-MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "10"))   # 10% — GoPlus also checks; real honeypots won't pass sell simulation
+MAX_BUY_TAX       = float(os.getenv("MAX_BUY_TAX",       "20"))   # 20% — launch taxes up to 20% are common; honeypot.is + sell sim catch real honeypots
+MAX_SELL_TAX      = float(os.getenv("MAX_SELL_TAX",      "20"))   # 20% — math: at 20%+20% tax break-even is +56%, TP1=75% gives +5% min net
 
 # ── Entry/Exit strategy ───────────────────────────────────────────────────────
 # Phase 1 — fixed TP: sell TAKE_PROFIT_1_PCT% at TAKE_PROFIT_1% gain
-TAKE_PROFIT_1     = float(os.getenv("TAKE_PROFIT_1",     "50"))   # % gain → partial exit
+TAKE_PROFIT_1     = float(os.getenv("TAKE_PROFIT_1",     "75"))   # % gain → partial exit (min 56% to break even with 20% taxes)
 TAKE_PROFIT_1_PCT = float(os.getenv("TAKE_PROFIT_1_PCT", "50"))   # % of tokens to sell at TP1
 
 # Phase 2 — trailing stop on remaining position after TP1
