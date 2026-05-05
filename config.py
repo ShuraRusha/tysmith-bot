@@ -173,10 +173,20 @@ BASE_HTTP_RPC_BACKUP = os.getenv("BASE_HTTP_RPC_BACKUP", "https://base.publicnod
 BASE_WS_RPC          = os.getenv("BASE_WS_RPC",          "wss://base.publicnode.com/websocket")
 
 BASE_HTTP_RPCS = list(dict.fromkeys(
-    [u for u in [BASE_HTTP_RPC, BASE_HTTP_RPC_BACKUP,
-                 "https://base-mainnet.g.alchemy.com/v2/demo"] if u]
+    [u for u in [
+        BASE_HTTP_RPC,
+        BASE_HTTP_RPC_BACKUP,
+        "https://base.drpc.org",               # dRPC free tier — reliable
+        "https://1rpc.io/base",                # 1RPC — privacy-focused, no key needed
+        "https://base-mainnet.g.alchemy.com/v2/demo",  # Alchemy demo fallback
+    ] if u]
 ))
-BASE_WS_RPCS = [BASE_WS_RPC] if BASE_WS_RPC else []
+# Multiple WS endpoints for failover
+BASE_WS_RPCS = list(dict.fromkeys([u for u in [
+    BASE_WS_RPC,
+    "wss://base.drpc.org",
+    "wss://1rpc.io/base",
+] if u]))
 
 # Base native token + main stablecoin
 WETH_BASE = "0x4200000000000000000000000000000000000006"

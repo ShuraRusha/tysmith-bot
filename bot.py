@@ -78,14 +78,26 @@ w3_base     = None
 trader_base = None
 if config.BASE_CHAIN_ENABLED:
     for rpc_url in config.BASE_HTTP_RPCS:
-        _wb = _make_w3(rpc_url)
-        if _wb.is_connected():
-            w3_base = _wb
-            log.info(f"Base chain connected: {rpc_url[:50]}...")
-            break
-        log.warning(f"Base RPC unavailable: {rpc_url[:50]}...")
+        try:
+            _wb = _make_w3(rpc_url)
+            # Try up to 2 times per endpoint (cold-start latency on Railway)
+            _ok = _wb.is_connected()
+            if not _ok:
+                import time as _t; _t.sleep(2)
+                _ok = _wb.is_connected()
+            if _ok:
+                w3_base = _wb
+                log.info(f"Base chain connected: {rpc_url[:50]}...")
+                break
+            log.warning(f"Base RPC unavailable: {rpc_url[:50]}...")
+        except Exception as _e:
+            log.warning(f"Base RPC error {rpc_url[:50]}: {_e}")
     if w3_base is None:
-        log.error("All Base RPCs failed — Base chain disabled")
+        log.error(
+            "All Base RPCs failed — Base chain DISABLED. "
+            "Set BASE_HTTP_RPC to a reliable endpoint (e.g. Alchemy free tier) "
+            "and redeploy."
+        )
         config.BASE_CHAIN_ENABLED = False
     else:
         trader_base = Trader(
@@ -2873,10 +2885,22 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     watchdog_ok = since_last < 600
     wd_icon = "🟢" if watchdog_ok else "🚨"
 
+    # ── Chain status ──────────────────────────────────────────────────────────
+    bsc_icon  = "🟢" if w3 and w3.is_connected() else "🔴"
+    base_icon = "🟢" if (config.BASE_CHAIN_ENABLED and w3_base) else "🔴"
+    base_label = (
+        "🟢 активен" if (config.BASE_CHAIN_ENABLED and w3_base)
+        else ("🔴 нет RPC — все Base ноды недоступны" if config.BASE_CHAIN_ENABLED
+              else "⚫ выкл (BASE_CHAIN_ENABLED=false)")
+    )
+
     ws_block = "\n".join(ws_lines)
     await update.message.reply_text(
         f"*🔍 Диагностика бота*\n\n"
         f"⏱ Uptime: {uptime_min}м\n\n"
+        f"*Сети:*\n"
+        f"{bsc_icon} BSC (PancakeSwap V2)\n"
+        f"{base_icon} Base — {base_label}\n\n"
         f"*WebSocket endpoints ({len(_ws_endpoint_status)}):*\n"
         f"{ws_block}\n\n"
         f"*Pair rate:*\n"
