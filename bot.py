@@ -816,8 +816,8 @@ _mp_enabled:       bool  = False  # set True when mempool task actually starts
 # Tracks tokens where PairCreated fired before addLiquidity, so we don't
 # reject them permanently — instead we poll until reserves appear.
 _liquidity_waiting: set[str] = set()   # lowercase token addresses
-_LIQ_WAIT_FAST_INTERVAL = 1.0          # first 15 attempts every 1s
-_LIQ_WAIT_FAST_COUNT    = 15
+_LIQ_WAIT_FAST_INTERVAL = 2.0          # first 10 attempts every 2s (was 1s — too aggressive on free RPCs)
+_LIQ_WAIT_FAST_COUNT    = 10
 _LIQ_WAIT_SLOW_INTERVAL = 3.0          # then every BSC block (~3s)
 _LIQ_WAIT_TTL           = 300          # give up after 5 minutes
 

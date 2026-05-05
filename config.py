@@ -26,11 +26,10 @@ BSC_WS_RPC          = os.getenv("BSC_WS_RPC",          _NR_WS or "wss://bsc.publ
 BSC_HTTP_RPC        = os.getenv("BSC_HTTP_RPC",        _NR_HTTP or "https://bsc-dataseed.binance.org/")
 BSC_HTTP_RPC_BACKUP = os.getenv("BSC_HTTP_RPC_BACKUP", "https://bsc-dataseed1.defibit.io/")
 # All HTTP endpoints for round-robin fallback (filtered to non-empty)
-# Ankr and dRPC are added as reliable free alternatives for eth_getLogs polling
+# Note: Ankr requires a paid API key — removed to avoid "Unauthorized" errors
 BSC_HTTP_RPCS = [u for u in [BSC_HTTP_RPC, BSC_HTTP_RPC_BACKUP,
                               "https://bsc-dataseed2.binance.org/",
                               "https://bsc-dataseed3.binance.org/",
-                              "https://rpc.ankr.com/bsc",
                               "https://bsc.drpc.org",
                               ] if u]
 # All WS endpoints for failover — multiple endpoints for redundancy
