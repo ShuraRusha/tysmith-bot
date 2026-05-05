@@ -315,6 +315,12 @@ def _is_token_duplicate(token_address: str, dex_label: str = "") -> bool:
     """
     key = token_address.lower()
     now = time.time()
+    # One-time bypass for wait-for-liquidity retries.
+    # Avoids popping from _seen_tokens_ts (which created re-detection windows).
+    if key in _liq_retry_bypass:
+        _liq_retry_bypass.discard(key)
+        _seen_tokens_ts[key] = now  # refresh dedup TTL after retry
+        return False
     last_seen = _seen_tokens_ts.get(key, 0)
     if now - last_seen < _CROSS_DEX_TOKEN_TTL:
         log.info(f"{dex_label} skipping {key[:10]}… — already handled by another DEX watcher")
@@ -854,10 +860,18 @@ _mp_enabled:       bool  = False  # set True when mempool task actually starts
 # Tracks tokens where PairCreated fired before addLiquidity, so we don't
 # reject them permanently — instead we poll until reserves appear.
 _liquidity_waiting: set[str] = set()   # lowercase token addresses
-_LIQ_WAIT_FAST_INTERVAL = 2.0          # first 10 attempts every 2s (was 1s — too aggressive on free RPCs)
-_LIQ_WAIT_FAST_COUNT    = 10
+_LIQ_WAIT_FAST_INTERVAL = 2.0          # first 15 attempts every 2s
+_LIQ_WAIT_FAST_COUNT    = 15
 _LIQ_WAIT_SLOW_INTERVAL = 3.0          # then every BSC block (~3s)
-_LIQ_WAIT_TTL           = 300          # give up after 5 minutes
+_LIQ_WAIT_TTL           = 900          # give up after 15 minutes (was 5)
+
+# Minimum liquidity to TRIGGER the retry check (lower than MIN_LIQUIDITY_USD).
+# Allows simulation to run when $25+ is present; buy decision still uses MIN_LIQUIDITY_USD.
+_LIQ_WAIT_TRIGGER_USD   = 25.0
+
+# One-time bypass set — allows _wait_for_liquidity retry to pass _is_token_duplicate
+# WITHOUT popping from _seen_tokens_ts (which was causing re-detection bugs)
+_liq_retry_bypass: set[str] = set()
 
 # Dedup for near-miss threshold alerts — prevents the same token firing twice
 # when both WS and HTTP poll detect it, or when a retry re-triggers the alert.
@@ -911,14 +925,12 @@ async def _wait_for_liquidity_and_retry(
             liq = await asyncio.to_thread(
                 _liq_sync, _w3, pair_address, base_token, bnb_price
             )
-            if liq >= config.MIN_LIQUIDITY_USD:
+            if liq >= _LIQ_WAIT_TRIGGER_USD:
                 log.info(f"{tag}[WaitLiq] {sym} — liquidity appeared: ${liq:,.0f} (attempt {attempt+1})")
-                # NOTE: do NOT discard key from _liquidity_waiting here.
-                # If _callback fails (simulation still reverts) and tries to create
-                # a new wait task, that task sees key in _liquidity_waiting and exits
-                # immediately — preventing an infinite retry loop.
-                # The finally block below always cleans up.
-                _seen_tokens_ts.pop(key, None)
+                # Use bypass set instead of popping from _seen_tokens_ts.
+                # Pop created a re-detection window where HTTP poll would add the same
+                # token to _reject_log a second time; bypass set is consumed exactly once.
+                _liq_retry_bypass.add(key)
 
                 # Fast-path: if we have cached security results (all APIs already ran),
                 # run only buy sim + liquidity + FDV (~300ms) instead of full gather (~5s).
@@ -944,8 +956,18 @@ async def _wait_for_liquidity_and_retry(
                             _precheck_result=fast_result,
                         )
                     else:
-                        log.info(f"{tag}[WaitLiq] {sym} — fast-path rejected: {fast_result['reason']}")
-                        # Fall back to full re-check in case conditions changed
+                        reason = fast_result["reason"]
+                        log.info(f"{tag}[WaitLiq] {sym} — fast-path rejected: {reason}")
+                        # Notify user why the token was rejected AFTER liquidity appeared.
+                        # Liquidity reasons mean we should keep waiting, not alert.
+                        if not any(r in reason for r in _LIQUIDITY_REASONS):
+                            await tg_send(
+                                f"⚠️ *{sym}* — ликвидность появилась (${liq:,.0f}), но отклонён\n"
+                                f"`{token_address}`\n"
+                                f"Причина: {reason}"
+                            )
+                        # Fall back to full re-check (also bypasses dedup via _liq_retry_bypass)
+                        _liq_retry_bypass.add(key)
                         await _callback(token_address, base_token, pair_address, creation_block)
                     return
 
@@ -957,7 +979,7 @@ async def _wait_for_liquidity_and_retry(
             attempt += 1
             await asyncio.sleep(interval)
 
-        log.info(f"{tag}[WaitLiq] {sym} — TTL expired, no liquidity after {attempt} polls")
+        log.info(f"{tag}[WaitLiq] {sym} — TTL expired after {attempt} polls (max liq seen: tracked in logs)")
     finally:
         _liquidity_waiting.discard(key)
         _liq_security_cache.pop(key, None)   # clean up on timeout
