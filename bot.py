@@ -281,22 +281,21 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    connected = w3.is_connected()
-    balance   = w3.eth.get_balance(trader.wallet) / 1e18
+    connected = await asyncio.to_thread(w3.is_connected)
+    balance   = await asyncio.to_thread(lambda: w3.eth.get_balance(trader.wallet) / 1e18)
     bnb_price = await get_bnb_price(w3)
     await update.message.reply_text(
-        f"*Статус Sniper Bot*\n\n"
+        f"Статус Sniper Bot\n\n"
         f"RPC: {'✅ подключён' if connected else '❌ нет соединения'}\n"
-        f"Кошелёк: `{trader.wallet}`\n"
-        f"Баланс: *{balance:.4f} BNB* (~${balance * bnb_price:.0f})\n"
+        f"Кошелёк: {trader.wallet}\n"
+        f"Баланс: {balance:.4f} BNB (~${balance * bnb_price:.0f})\n"
         f"Позиций открыто: {len(pos_manager.positions)}\n\n"
-        f"*Настройки:*\n"
-        f"Buy: {config.BUY_AMOUNT_BNB} BNB  |  Slippage: {config.SLIPPAGE}%\n"
-        f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции\n"
-        f"TP2: +{config.TAKE_PROFIT_2}% → остаток  |  SL: -{config.STOP_LOSS}%\n"
+        f"Настройки:\n"
+        f"Buy: {config.BUY_AMOUNT_BNB} BNB | Slippage: {config.SLIPPAGE}%\n"
+        f"TP1: +{config.TAKE_PROFIT_1}% -> {config.TAKE_PROFIT_1_PCT:.0f}% позиции\n"
+        f"TP2: +{config.TAKE_PROFIT_2}% -> остаток | SL: -{config.STOP_LOSS}%\n"
         f"Min ликвидность: ${config.MIN_LIQUIDITY_USD:,.0f}\n"
         f"Max tax: {config.MAX_BUY_TAX}% buy / {config.MAX_SELL_TAX}% sell",
-        parse_mode=ParseMode.MARKDOWN,
     )
 
 
