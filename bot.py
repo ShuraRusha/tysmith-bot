@@ -3462,7 +3462,7 @@ async def _poll_new_pairs():
     """
     global _last_polled_block, _poll_consecutive_errors, _poll_ok_rpc_idx, _poll_last_ok_ts
     POLL_INTERVAL    = 15   # seconds between polls
-    LOOK_BACK_BLOCKS = 8    # ~24s safety buffer (3s/block on BSC)
+    LOOK_BACK_BLOCKS = 200  # ~10 min catchup on restart (was 8 = 24s, too short)
     ALERT_AFTER      = 20   # alert to Telegram after this many consecutive all-RPC failures
 
     log.info(f"Poll task started — {len(_poll_w3s)} RPC(s), interval {POLL_INTERVAL}s")
