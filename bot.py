@@ -3461,7 +3461,7 @@ async def _poll_new_pairs():
     Acts as primary detection when WebSocket nodes are stale.
     """
     global _last_polled_block, _poll_consecutive_errors, _poll_ok_rpc_idx, _poll_last_ok_ts
-    POLL_INTERVAL    = 15   # seconds between polls
+    POLL_INTERVAL    = 5    # seconds between polls (was 15 — too slow for sniper)
     LOOK_BACK_BLOCKS = 200  # ~10 min catchup on restart (was 8 = 24s, too short)
     ALERT_AFTER      = 20   # alert to Telegram after this many consecutive all-RPC failures
 
