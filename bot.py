@@ -2515,8 +2515,8 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    connected  = w3.is_connected()
-    balance    = w3.eth.get_balance(trader.wallet) / 1e18
+    connected  = await asyncio.to_thread(w3.is_connected)
+    balance    = await asyncio.to_thread(lambda: w3.eth.get_balance(trader.wallet) / 1e18)
     bnb_price  = await get_bnb_price(w3)
     buy_amount = calculate_buy_amount(balance)
     auto_icon   = "⚡ авто" if is_auto else "👆 ручной"
@@ -2532,7 +2532,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         size_mode = f"2% авто (баланс > 5 BNB)"
 
     rpc_label = "NodeReal" if config.BSC_NODEREAL_KEY else "Public"
-    gas_gwei  = w3.eth.gas_price / 1e9 if connected else 0
+    gas_gwei  = (await asyncio.to_thread(lambda: w3.eth.gas_price) / 1e9) if connected else 0
     gas_mode  = f"{config.GAS_BUY_GWEI} gwei (фикс)" if config.GAS_BUY_GWEI > 0 else f"{gas_gwei:.1f} x{config.GAS_MULTIPLIER}"
     ws_count  = len(config.BSC_WS_RPCS)
 
@@ -2555,7 +2555,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Последняя пара: {last_seen_str}\n"
         )
         if _last_reject:
-            activity_str += f"Последний отказ: _{_last_reject}_\n"
+            activity_str += f"Последний отказ: {_last_reject}\n"
         if _consecutive_losses > 0:
             activity_str += (
                 f"⚠️ Убыточных сделок подряд: *{_consecutive_losses}/{CIRCUIT_BREAKER_LOSSES}* "
@@ -2579,32 +2579,31 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         speed_status = ""
 
-    await update.message.reply_text(
-        f"*Статус Sniper Bot* — {status_icon}\n\n"
-        f"RPC: {'✅' if connected else '❌'} {rpc_label} | WS endpoints: {ws_count} | Poll RPCs: {len(_poll_w3s)}\n"
-        f"Кошелёк: `{trader.wallet}`\n"
-        f"Баланс: *{balance:.4f} BNB* (~${balance * bnb_price:.0f})\n"
-        f"Позиций открыто: {len(pos_manager.positions)}/{calculate_max_positions(balance) if is_auto else config.MAX_POSITIONS}\n"
+    msg = (
+        f"Статус Sniper Bot — {status_icon}\n\n"
+        f"RPC: {'✅' if connected else '❌'} {rpc_label} | WS: {ws_count} | Poll RPCs: {len(_poll_w3s)}\n"
+        f"Кошелёк: {trader.wallet}\n"
+        f"Баланс: {balance:.4f} BNB (~${balance * bnb_price:.0f})\n"
+        f"Позиций: {len(pos_manager.positions)}/{calculate_max_positions(balance) if is_auto else config.MAX_POSITIONS}\n"
         f"Сделок в истории: {len(trade_history)}\n\n"
         f"{activity_str}"
         f"{speed_status}"
         f"HTTP Poll: {poll_str}\n"
-        f"Mempool: {'🧠 активен' if _mp_enabled else ('🔴 выкл' if not config.MEMPOOL_ENABLED else '⏳ стартует')}"
+        f"Mempool: {'активен' if _mp_enabled else ('выкл' if not config.MEMPOOL_ENABLED else 'стартует')}"
         f" | pre-analyzed: {_mp_stats_pending} | cache hits: {_mp_stats_hits}"
         f"{f' | saved: {_mp_stats_saved_s:.0f}s' if _mp_stats_hits else ''}\n\n"
-        f"*Размер позиции:*\n"
+        f"Размер позиции:\n"
         f"Режим: {size_mode}\n"
-        f"Следующая сделка: *{buy_amount} BNB* (~${buy_amount * bnb_price:.0f})\n"
-        f"Мин: {config.BUY_MIN_BNB} BNB  |  Макс: {config.BUY_MAX_BNB} BNB  "
-        f"|  Газ-резерв: {config.GAS_RESERVE_BNB} BNB\n\n"
-        f"*Выход:*\n"
+        f"Следующая сделка: {buy_amount} BNB (~${buy_amount * bnb_price:.0f})\n"
+        f"Мин: {config.BUY_MIN_BNB} BNB | Макс: {config.BUY_MAX_BNB} BNB | Газ-резерв: {config.GAS_RESERVE_BNB} BNB\n\n"
+        f"Выход:\n"
         f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции\n"
-        f"Trailing stop: -{config.TRAILING_STOP_PCT}% от пика  |  SL: -{config.STOP_LOSS}%\n"
+        f"Trailing stop: -{config.TRAILING_STOP_PCT}% от пика | SL: -{config.STOP_LOSS}%\n"
         f"{moon_str}\n\n"
-        f"*Фильтры покупки:*\n"
+        f"Фильтры покупки:\n"
         f"Ликвидность: ${config.MIN_LIQUIDITY_USD:,.0f} мин\n"
         f"Market cap: ${config.MIN_MARKET_CAP_USD:,.0f} мин\n"
-        f"FDV: ${config.MIN_FDV_USD/1000:.0f}k – ${config.MAX_FDV_USD/1000000:.0f}М\n"
+        f"FDV: ${config.MIN_FDV_USD/1000:.0f}k – ${config.MAX_FDV_USD/1000000:.0f}M\n"
         f"Объём 5м: ${config.MIN_VOLUME_5M_USD:,.0f} мин\n"
         f"Возраст: {config.MAX_TOKEN_AGE_DAYS} дней макс\n"
         f"Холдеры: {config.MIN_HOLDER_COUNT} мин\n"
@@ -2612,14 +2611,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"LP незаблокирован: {config.LP_HOLDER_MAX_PCT:.0f}% макс на кошелёк\n"
         f"Max tax: {config.MAX_BUY_TAX}% buy / {config.MAX_SELL_TAX}% sell\n"
         f"Деплоер: макс {config.MAX_DEPLOYER_TOKENS_30D} контракт(ов) за 30 дн. "
-        f"{'✅ BSCScan OK' if config.BSCSCAN_API_KEY else '⚠️ BSCScan нет ключа'}"
-        f"{' | ✅ Basescan OK' if config.BASESCAN_API_KEY else ' | ⚠️ Basescan нет ключа'}\n\n"
-        f"*Исполнение:*\n"
+        f"{'BSCScan OK' if config.BSCSCAN_API_KEY else 'BSCScan нет ключа'}"
+        f"{' | Basescan OK' if config.BASESCAN_API_KEY else ' | Basescan нет ключа'}\n\n"
+        f"Исполнение:\n"
         f"Gas buy: {gas_mode}\n"
         f"Slip buy/sell: {config.SLIPPAGE_BUY}%/{config.SLIPPAGE_SELL}%\n"
-        f"Deadline: {config.TX_DEADLINE_SEC}s",
-        parse_mode=ParseMode.MARKDOWN,
+        f"Deadline: {config.TX_DEADLINE_SEC}s"
     )
+    await update.message.reply_text(msg)
 
 
 @owner_only
@@ -2948,14 +2947,11 @@ async def cmd_rejects(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    lines = [f"🚫 *Последние отклонения* (всего: {_stats_rejected})\n"]
+    lines = [f"🚫 Последние отклонения (всего: {_stats_rejected})\n"]
     for e in _reject_log[-10:][::-1]:
-        lines.append(f"`{e['ts']}` *{e['symbol']}* — {e['reason']}")
+        lines.append(f"{e['ts']}  {e['symbol']} — {e['reason']}")
 
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await update.message.reply_text("\n".join(lines))
 
 
 @owner_only
