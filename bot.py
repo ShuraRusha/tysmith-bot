@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -30,7 +31,7 @@ from position import (
     POSITIONS_FILE_BASE, POSITIONS_FILE_BISWAP, POSITIONS_FILE_BASESWAP,
 )
 from trader import Trader
-from watcher import watch_pairs, watch_pending_pairs, PAIR_CREATED_TOPIC, MemPoolNotSupportedError, _seen_pairs as _ws_seen_pairs, _seen_lock as _ws_seen_lock
+from watcher import watch_pairs, watch_pending_pairs, PAIR_CREATED_TOPIC, MemPoolNotSupportedError, _seen_pairs as _ws_seen_pairs, _seen_lock as _ws_seen_lock, _ws_endpoint_status
 
 logging.basicConfig(
     level=logging.INFO,
@@ -198,8 +199,15 @@ _stats_seen    = 0          # total pairs detected since start
 _stats_rejected = 0         # rejected by any filter
 _last_seen_ts:  float = 0.0 # timestamp of last detected pair
 _last_reject:   str   = ""  # reason of last rejection
+_last_pair_token: str = ""  # token address of last detected pair (for /debug)
 _reject_log: list[dict] = []  # last 20 rejections with token + reason
 _MAX_REJECT_LOG = 20
+
+# Rolling window of pair event timestamps — used to compute pairs/hour in /debug
+_pair_event_times: collections.deque = collections.deque(maxlen=500)
+
+# DEBUG_ALERTS — send Telegram notification for every rejected token (verbose)
+DEBUG_ALERTS = os.getenv("DEBUG_ALERTS", "false").lower() == "true"
 
 # Speed/competition tracking — how many blocks after listing the bot buys
 _stats_delta_blocks: list[int] = []  # rolling window of last 20 buys
@@ -313,7 +321,7 @@ def _is_token_duplicate(token_address: str, dex_label: str = "") -> bool:
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 21
+SETTINGS_VERSION = 22
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -559,6 +567,14 @@ def _load_settings():
         if saved_version < 21:
             config.GAS_BUY_GWEI = 5.0
             log.info("Settings migration v20→v21: GAS_BUY_GWEI 10 → 5")
+
+        # Migration v21 → v22: расширить фильтры для большего охвата
+        #   MAX_FDV_USD       10M → 100M  (некоторые листинги приходят с FDV >10M)
+        #   TOP_HOLDER_MAX_PCT  50 → 90   (деплоер держит 80-90% токенов на T+0 — это норма)
+        if saved_version < 22:
+            config.MAX_FDV_USD          = 100_000_000.0
+            config.TOP_HOLDER_MAX_PCT   = 90.0
+            log.info("Settings migration v21→v22: MAX_FDV_USD 10M → 100M, TOP_HOLDER_MAX_PCT 50 → 90")
 
         # Restore bot mode (after migrations so v10 override above takes effect)
         if "__is_auto" in data and saved_version >= 10:
@@ -1003,7 +1019,7 @@ async def on_pair_found(
     creation_block: int = 0,
     _precheck_result: dict = None,   # pass pre-validated result to skip check_token()
 ):
-    global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject
+    global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject, _last_pair_token
 
     if is_paused:
         log.info(f"Bot paused — skipping {token_address}")
@@ -1015,6 +1031,8 @@ async def on_pair_found(
     _stats_seen  += 1
     _analytics["total_seen"] = _analytics.get("total_seen", 0) + 1
     _last_seen_ts = time.time()
+    _last_pair_token = token_address
+    _pair_event_times.append(_last_seen_ts)
 
     # Fast-path: security was pre-validated (e.g. from wait-for-liquidity cache)
     if _precheck_result is not None:
@@ -1072,6 +1090,12 @@ async def on_pair_found(
         if len(_reject_log) > _MAX_REJECT_LOG:
             _reject_log.pop(0)
         log.info(f"Rejected {sym} ({token_address[:10]}…): {result['reason']}")
+        if DEBUG_ALERTS:
+            await tg_send(
+                f"🔍 *{sym}* — отклонён\n"
+                f"`{token_address}`\n"
+                f"Причина: {result['reason']}"
+            )
 
         # If rejection is purely liquidity (reserves not yet added after PairCreated),
         # schedule a polling task instead of discarding the token permanently.
@@ -1281,7 +1305,7 @@ async def on_pair_found(
 
 async def on_base_pair_found(token_address: str, base_token: str, pair_address: str, creation_block: int = 0):
     """Mirror of on_pair_found but for Base chain (Uniswap V2)."""
-    global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject
+    global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject, _last_pair_token
 
     if is_paused or not trader_base or not pos_manager_base:
         return
@@ -1292,6 +1316,8 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
     _stats_seen  += 1
     _analytics["total_seen"] = _analytics.get("total_seen", 0) + 1
     _last_seen_ts = time.time()
+    _last_pair_token = token_address
+    _pair_event_times.append(_last_seen_ts)
 
     log.info(f"[Base] Analyzing: {token_address}")
     try:
@@ -1482,7 +1508,7 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
 
 async def on_biswap_pair_found(token_address: str, base_token: str, pair_address: str, creation_block: int = 0):
     """Mirror of on_pair_found for BiSwap V2 (BSC)."""
-    global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject
+    global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject, _last_pair_token
 
     if is_paused or not trader_biswap or not pos_manager_biswap:
         return
@@ -1493,6 +1519,8 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
     _stats_seen  += 1
     _analytics["total_seen"] = _analytics.get("total_seen", 0) + 1
     _last_seen_ts = time.time()
+    _last_pair_token = token_address
+    _pair_event_times.append(_last_seen_ts)
 
     log.info(f"[BiSwap] Analyzing: {token_address}")
     try:
@@ -1661,7 +1689,7 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
 
 async def on_baseswap_pair_found(token_address: str, base_token: str, pair_address: str, creation_block: int = 0):
     """Mirror of on_base_pair_found for BaseSwap V2 (Base)."""
-    global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject
+    global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject, _last_pair_token
 
     if is_paused or not trader_baseswap or not pos_manager_baseswap:
         return
@@ -1672,6 +1700,8 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
     _stats_seen  += 1
     _analytics["total_seen"] = _analytics.get("total_seen", 0) + 1
     _last_seen_ts = time.time()
+    _last_pair_token = token_address
+    _pair_event_times.append(_last_seen_ts)
 
     log.info(f"[BaseSwap] Analyzing: {token_address}")
     try:
@@ -2057,7 +2087,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/blacklist add 0x... — добавить деплоера вручную\n"
         "/blacklist remove 0x... — удалить из списка\n\n"
         "*Диагностика*\n"
-        "/rejects — последние 10 отклонённых токенов с причиной\n\n"
+        "/rejects — последние 10 отклонённых токенов с причиной\n"
+        "/debug — диагностика: статус WS, количество пар/час, heartbeat\n\n"
         "*Статистика*\n"
         "/analytics — полная аналитика: воронка, топ причин отклонения, honeypot, P&L\n"
         "/stats — статистика сделок (win rate, PnL, breakdown)\n"
@@ -2781,6 +2812,77 @@ async def _do_analyze(update, raw_address: str):
 # ── Deployer blacklist commands ──────────────────────────────────────────────
 
 @owner_only
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnostic info: WS endpoint health, pair rate, RPC status."""
+    now = time.time()
+
+    # ── WebSocket endpoints ───────────────────────────────────────────────────
+    ws_lines = []
+    for ep_key, st in _ws_endpoint_status.items():
+        icon = "🟢" if st["connected"] else "🔴"
+        if st["last_event_ts"]:
+            ago = int(now - st["last_event_ts"])
+            ago_str = f"{ago}s ago" if ago < 120 else f"{ago // 60}m ago"
+            ev_str = f"last event {ago_str}, total={st['events_total']}"
+        else:
+            ev_str = "no events yet"
+        err_str = f" | err: {st['last_error'][:50]}" if st["last_error"] else ""
+        recon = f" | reconnects={st['reconnects']}" if st["reconnects"] else ""
+        url_short = st.get("url", ep_key)[:55]
+        ws_lines.append(f"{icon} `{url_short}`\n    {ev_str}{recon}{err_str}")
+
+    if not ws_lines:
+        ws_lines = ["⚠️ Нет данных — WS ещё не запустился или нет соединений"]
+
+    # ── Pairs per hour (rolling window) ──────────────────────────────────────
+    cutoff_1h = now - 3600
+    pairs_1h  = sum(1 for t in _pair_event_times if t > cutoff_1h)
+    cutoff_10m = now - 600
+    pairs_10m  = sum(1 for t in _pair_event_times if t > cutoff_10m)
+
+    if _last_seen_ts:
+        last_ago = int(now - _last_seen_ts)
+        last_str = f"{last_ago}s назад" if last_ago < 120 else f"{last_ago // 60}м назад"
+        last_token = f"`{_last_pair_token[:20]}…`" if _last_pair_token else "—"
+        last_info = f"Последняя пара: {last_token} ({last_str})"
+    else:
+        last_info = "Пар ещё не получено"
+
+    # ── HTTP poll ─────────────────────────────────────────────────────────────
+    if _poll_last_ok_ts:
+        poll_ago = int(now - _poll_last_ok_ts)
+        poll_str = f"✅ последний ОК: {poll_ago}s назад (RPC#{_poll_ok_rpc_idx})"
+    else:
+        poll_str = "⚠️ ещё не завершил успешный опрос"
+    if _poll_consecutive_errors:
+        poll_str += f" | ошибок: {_poll_consecutive_errors}"
+
+    # ── Watchdog status ───────────────────────────────────────────────────────
+    uptime_min = int((now - _BOT_START_TIME) / 60)
+    since_last = int(now - _last_seen_ts) if _last_seen_ts else uptime_min * 60
+    watchdog_ok = since_last < 600
+    wd_icon = "🟢" if watchdog_ok else "🚨"
+
+    ws_block = "\n".join(ws_lines)
+    await update.message.reply_text(
+        f"*🔍 Диагностика бота*\n\n"
+        f"⏱ Uptime: {uptime_min}м\n\n"
+        f"*WebSocket endpoints ({len(_ws_endpoint_status)}):*\n"
+        f"{ws_block}\n\n"
+        f"*Pair rate:*\n"
+        f"За последние 10 мин: *{pairs_10m}* пар\n"
+        f"За последний час: *{pairs_1h}* пар\n"
+        f"{last_info}\n\n"
+        f"*HTTP Poll:* {poll_str}\n\n"
+        f"*Heartbeat:* {wd_icon} "
+        f"{'OK' if watchdog_ok else f'⚠️ нет пар {since_last//60}м — проверь WS'}\n\n"
+        f"DEBUG\\_ALERTS: {'🔔 вкл' if DEBUG_ALERTS else '🔕 выкл'}\n"
+        f"Отклонено всего: {_stats_rejected} | Замечено: {_stats_seen}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@owner_only
 async def cmd_rejects(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show last rejected tokens with reason."""
     if not _reject_log:
@@ -3085,12 +3187,12 @@ async def _ws_watchdog():
     BSC normally produces dozens of new pairs per hour — silence = broken WS.
     """
     global _last_seen_ts
-    await asyncio.sleep(15 * 60)   # give WS 15 min to connect and deliver first event
+    await asyncio.sleep(10 * 60)   # give WS 10 min to connect and deliver first event
     while True:
         uptime = time.time() - _BOT_START_TIME
         since_last = time.time() - _last_seen_ts if _last_seen_ts else uptime
 
-        if since_last > 15 * 60 and not is_paused:
+        if since_last > 10 * 60 and not is_paused:
             log.error(f"WS watchdog: no pairs seen for {since_last/60:.0f} min — alerting")
             try:
                 await tg_send(
@@ -3436,6 +3538,7 @@ async def main(need_polling_grace: bool = False):
     app.add_handler(CommandHandler("set",       cmd_set))
     app.add_handler(CommandHandler("analyze",   cmd_analyze))
     app.add_handler(CommandHandler("rejects",   cmd_rejects))
+    app.add_handler(CommandHandler("debug",     cmd_debug))
     app.add_handler(CommandHandler("analytics", cmd_analytics))
     app.add_handler(CommandHandler("blacklist", cmd_blacklist))
     app.add_handler(CallbackQueryHandler(handle_callback))

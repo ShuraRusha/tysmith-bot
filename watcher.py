@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 
 import websockets
 from web3 import Web3
@@ -11,6 +12,10 @@ log = logging.getLogger(__name__)
 
 # keccak256("PairCreated(address,address,address,uint256)")
 PAIR_CREATED_TOPIC = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
+
+# Per-endpoint connection status — read by /debug command in bot.py
+# key: ws_url (first 60 chars), value: {connected, last_event_ts, events_total, reconnects, last_error}
+_ws_endpoint_status: dict[str, dict] = {}
 
 # Raised when node explicitly rejects newPendingTransactions (wrong tier/plan).
 # Caught by the caller to disable mempool without endless retries.
@@ -59,15 +64,35 @@ def compute_pair_address(
     return Web3.to_checksum_address("0x" + raw.hex()[-40:])
 
 
+def _ep_key(ws_url: str) -> str:
+    return ws_url[:60]
+
+
+def _ep_init(ws_url: str):
+    key = _ep_key(ws_url)
+    if key not in _ws_endpoint_status:
+        _ws_endpoint_status[key] = {
+            "url":          ws_url,
+            "connected":    False,
+            "last_event_ts": 0.0,
+            "events_total": 0,
+            "reconnects":   0,
+            "last_error":   "",
+        }
+    return key
+
+
 async def _watch_single(ws_url: str, callback, factory_address: str = None, base_tokens: set = None):
     """Connect to one WS endpoint and stream PairCreated events."""
     factory = factory_address or PANCAKE_FACTORY_V2
     tokens  = base_tokens or BASE_TOKENS
     backoff = 2
+    ep = _ep_init(ws_url)
     # BSC produces pairs every few seconds — if nothing arrives in 3 min, the node is stale.
     # Many free nodes accept subscriptions but silently stop delivering events.
     _RECV_TIMEOUT = 3 * 60
     while True:
+        _ws_endpoint_status[ep]["connected"] = False
         try:
             log.info(f"WS connecting: {ws_url[:60]}...")
             async with websockets.connect(
@@ -95,6 +120,8 @@ async def _watch_single(ws_url: str, callback, factory_address: str = None, base
                 sub_id = resp.get("result")
                 log.info(f"WS subscribed ({ws_url[:40]}…) sub_id={sub_id}")
                 backoff = 2
+                _ws_endpoint_status[ep]["connected"] = True
+                _ws_endpoint_status[ep]["last_error"] = ""
 
                 while True:
                     try:
@@ -104,6 +131,7 @@ async def _watch_single(ws_url: str, callback, factory_address: str = None, base
                             f"WS: no events for {_RECV_TIMEOUT}s ({ws_url[:40]}…) "
                             "— node is stale, reconnecting"
                         )
+                        _ws_endpoint_status[ep]["reconnects"] += 1
                         break  # exit inner loop → reconnect
 
                     try:
@@ -143,17 +171,25 @@ async def _watch_single(ws_url: str, callback, factory_address: str = None, base
 
                         creation_block = int(log_entry.get("blockNumber", "0x0"), 16)
                         log.info(f"New pair detected: {new_token} / {base_token} @ {pair}")
+                        _ws_endpoint_status[ep]["last_event_ts"] = time.time()
+                        _ws_endpoint_status[ep]["events_total"] += 1
                         asyncio.create_task(callback(new_token, base_token, pair, creation_block))
 
                     except Exception as e:
                         log.warning(f"Event parse error: {e}")
 
         except asyncio.TimeoutError:
-            log.error(f"WS subscribe timeout ({ws_url[:40]}…). Reconnecting in {backoff}s...")
+            err = f"subscribe timeout"
+            log.error(f"WS {err} ({ws_url[:40]}…). Reconnecting in {backoff}s...")
+            _ws_endpoint_status[ep]["last_error"] = err
+            _ws_endpoint_status[ep]["reconnects"] += 1
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 15)
         except Exception as e:
+            err = str(e)[:80]
             log.error(f"WS error ({ws_url[:40]}…): {e}. Reconnecting in {backoff}s...")
+            _ws_endpoint_status[ep]["last_error"] = err
+            _ws_endpoint_status[ep]["reconnects"] += 1
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 15)   # max 15s — публичная нода нестабильна, восстанавливаемся быстро
 

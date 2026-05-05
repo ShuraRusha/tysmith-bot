@@ -117,7 +117,7 @@ AUTO_BUY           = os.getenv("AUTO_BUY",           "true").lower() == "true"
 MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "0"))  # 0 = auto formula
 
 # ── Safety filters ────────────────────────────────────────────────────────────
-TOP_HOLDER_MAX_PCT   = float(os.getenv("TOP_HOLDER_MAX_PCT",   "50"))  # reject if single wallet > X% (was 30)
+TOP_HOLDER_MAX_PCT   = float(os.getenv("TOP_HOLDER_MAX_PCT",   "90"))  # deployer holds 80-90% at T+0 — 90 = practical limit
 MAX_TOP10_HOLDER_PCT = float(os.getenv("MAX_TOP10_HOLDER_PCT", "60"))  # top-10 combined (excl. DEX/locked) > X% → reject (was 30)
 LP_HOLDER_MAX_PCT    = float(os.getenv("LP_HOLDER_MAX_PCT",    "100")) # 100 = disabled for sniper (deployer always holds LP at T+0)
 MIN_HOLDER_COUNT     = int(os.getenv("MIN_HOLDER_COUNT",       "0"))   # 0 = disabled — sniper enters first, 1-3 holders is normal at launch
@@ -125,7 +125,7 @@ MIN_HOLDER_COUNT     = int(os.getenv("MIN_HOLDER_COUNT",       "0"))   # 0 = dis
 # ── Token quality filters ─────────────────────────────────────────────────────
 MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD",   "0"))        # 0 = выкл. — market cap на T+0 не отличает хорошее от скама
 MIN_FDV_USD        = float(os.getenv("MIN_FDV_USD",          "0"))        # 0 = отключён — реальная защита = симуляция buy/sell + LP check
-MAX_FDV_USD        = float(os.getenv("MAX_FDV_USD",          "10000000")) # max FDV (avoid huge caps)
+MAX_FDV_USD        = float(os.getenv("MAX_FDV_USD",          "100000000")) # max FDV — 100M allows most legit launches
 MIN_VOLUME_5M_USD  = float(os.getenv("MIN_VOLUME_5M_USD",    "0"))        # DexScreener 5-min volume — 0 = disabled (снайпер входит в первые секунды)
 MAX_TOKEN_AGE_DAYS = int(os.getenv("MAX_TOKEN_AGE_DAYS",     "7"))        # reject tokens older than this
 
