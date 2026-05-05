@@ -875,8 +875,11 @@ async def _wait_for_liquidity_and_retry(
             )
             if liq >= config.MIN_LIQUIDITY_USD:
                 log.info(f"{tag}[WaitLiq] {sym} — liquidity appeared: ${liq:,.0f} (attempt {attempt+1})")
-                _liquidity_waiting.discard(key)
-                # Allow re-entry through dedup (token was blocked by 120s TTL)
+                # NOTE: do NOT discard key from _liquidity_waiting here.
+                # If _callback fails (simulation still reverts) and tries to create
+                # a new wait task, that task sees key in _liquidity_waiting and exits
+                # immediately — preventing an infinite retry loop.
+                # The finally block below always cleans up.
                 _seen_tokens_ts.pop(key, None)
 
                 # Fast-path: if we have cached security results (all APIs already ran),
