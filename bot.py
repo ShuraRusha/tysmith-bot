@@ -76,6 +76,7 @@ log.info(f"Poll w3 pool: {len(_poll_w3s)} HTTP RPC endpoints")
 # ── Base chain setup (optional) ───────────────────────────────────────────────
 w3_base     = None
 trader_base = None
+_base_chain_rpc_failed = False  # True = configured but all RPCs failed
 if config.BASE_CHAIN_ENABLED:
     for rpc_url in config.BASE_HTTP_RPCS:
         try:
@@ -98,6 +99,7 @@ if config.BASE_CHAIN_ENABLED:
             "Set BASE_HTTP_RPC to a reliable endpoint (e.g. Alchemy free tier) "
             "and redeploy."
         )
+        _base_chain_rpc_failed = True
         config.BASE_CHAIN_ENABLED = False
     else:
         trader_base = Trader(
@@ -2911,7 +2913,8 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     base_icon = "🟢" if (config.BASE_CHAIN_ENABLED and w3_base) else "🔴"
     base_label = (
         "🟢 активен" if (config.BASE_CHAIN_ENABLED and w3_base)
-        else ("🔴 нет RPC — все Base ноды недоступны" if config.BASE_CHAIN_ENABLED
+        else ("🔴 BASE_CHAIN_ENABLED=true, но все RPC недоступны при старте — добавь надёжный BASE_HTTP_RPC"
+              if _base_chain_rpc_failed
               else "⚫ выкл (BASE_CHAIN_ENABLED=false)")
     )
 
