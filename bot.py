@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import signal
 import sys
 import time
 from datetime import datetime
@@ -367,16 +368,30 @@ async def main():
         "/status — баланс и настройки"
     )
 
+    # Graceful shutdown on SIGTERM (Railway zero-downtime deploys) and SIGINT (Ctrl-C).
+    # Without this handler Railway sends SIGTERM → bot ignores it → waits for SIGKILL →
+    # old instance keeps polling Telegram → HTTP 409 Conflict with the new instance.
+    _shutdown_event = asyncio.Event()
+    loop = asyncio.get_event_loop()
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(_sig, _shutdown_event.set)
+        except (NotImplementedError, RuntimeError):
+            pass  # Windows / test env
+
     try:
-        while True:
-            await asyncio.sleep(60)
+        await _shutdown_event.wait()
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
+        log.info("Shutdown signal received — stopping bot gracefully…")
         _release_pid_lock()
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+        try:
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+        except Exception as e:
+            log.error(f"Shutdown error: {e}")
 
 
 if __name__ == "__main__":
