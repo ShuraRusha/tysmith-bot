@@ -207,49 +207,65 @@ def _get_token_info_sync(w3: Web3, token_address: str) -> dict:
 def _simulate_sell_sync(w3: Web3, token_address: str, pair_address: str,
                         router_address: str = None) -> dict:
     """
-    Simulate a sell by transferring tokens TO the pair/router address.
+    Simulate a sell by transferring tokens TO the pair/router from non-whitelisted addresses.
 
-    Most BSC honeypots block sells with:  if (to == pair && from != owner) revert
-    We simulate exactly this: transfer(pair, 1) called from the pair itself.
-    The pair is not the owner, so a honeypot WILL revert here.
-    Legitimate tokens have no such restriction and will pass.
-
-    Returns {"ok": True} on success or ambiguous error (don't block good tokens).
-    Returns {"ok": False, ...} only when contract clearly blocks the sell.
+    Three checks in sequence:
+      1. transfer(pair, 1) from pair     — catches "if to==pair → revert" pattern
+      2. transfer(pair, 1) from addr(1)  — catches "whitelist-only" pattern where pair is exempt
+         (addr(1) has no tokens; we filter out "insufficient balance" errors so only true honeypot
+          reverts — which check sender before balance — are flagged)
+      3. transfer(router, 1) from pair   — catches "if to==router → revert" pattern
     """
+    # Errors that indicate a legitimate balance/gas issue — NOT a honeypot block
+    _BALANCE_ERRORS = (
+        "transfer amount exceeds balance", "exceeds balance",
+        "insufficient balance", "amount exceeds", "balance exceeded",
+        "insufficient funds", "gas required", "out of gas",
+    )
+
     try:
         token_cs = Web3.to_checksum_address(token_address)
         pair_cs  = Web3.to_checksum_address(pair_address)
         token    = w3.eth.contract(address=token_cs, abi=TRANSFER_ABI)
 
-        # Confirm the pair actually holds tokens before simulating
         pair_balance = token.functions.balanceOf(pair_cs).call()
         if pair_balance == 0:
-            return {"ok": True}  # brand-new pair with no balance yet — can't judge
+            return {"ok": True}  # brand-new pair — can't simulate yet
 
-        # Simulate transfer TO the pair (the honeypot trigger: to == pair)
-        # from=pair means pair is not owner → triggers anti-sell check in honeypots
+        # ── Check 1: transfer TO pair FROM pair ──────────────────────────────
+        # Catches honeypots that check: if (recipient == pair) revert
         try:
             token.functions.transfer(pair_cs, 1).call({"from": pair_cs})
         except Exception as e:
             err = str(e).lower()
-            if "execution reverted" in err and not any(
-                x in err for x in ["insufficient funds", "gas required", "out of gas"]
-            ):
-                log.info(f"Sell simulation (to=pair) reverted for {token_address}: {e}")
+            if "execution reverted" in err and not any(x in err for x in _BALANCE_ERRORS):
+                log.info(f"Sell sim [to=pair, from=pair] reverted for {token_address}: {e}")
                 return {"ok": False, "reason": "Симуляция продажи: контракт блокирует продажу — вероятно honeypot"}
 
-        # Also simulate transfer TO the router (some honeypots check to==router)
+        # ── Check 2: transfer TO pair FROM address(1) (not whitelisted) ─────
+        # Many honeypots whitelist the pair address but block everyone else.
+        # address(1) has 0 token balance; if the contract checks the anti-sell
+        # condition BEFORE the balance check (common pattern), it will revert
+        # with a honeypot-specific message, not a balance error.
+        ADDR1 = "0x0000000000000000000000000000000000000001"
+        try:
+            token.functions.transfer(pair_cs, 1).call({"from": ADDR1})
+        except Exception as e:
+            err = str(e).lower()
+            if "execution reverted" in err and not any(x in err for x in _BALANCE_ERRORS):
+                log.info(f"Sell sim [to=pair, from=addr1] reverted for {token_address}: {e}")
+                return {"ok": False, "reason": "Симуляция продажи: контракт блокирует продажу для обычных адресов — вероятно honeypot"}
+
+        # ── Check 3: transfer TO router FROM pair ────────────────────────────
+        # Some honeypots check: if (recipient == router) revert
         if router_address:
             router_cs = Web3.to_checksum_address(router_address)
             try:
                 token.functions.transfer(router_cs, 1).call({"from": pair_cs})
             except Exception as e:
                 err = str(e).lower()
-                if "execution reverted" in err and not any(
-                    x in err for x in ["insufficient funds", "gas required", "out of gas"]
-                ):
-                    log.info(f"Sell simulation (to=router) reverted for {token_address}: {e}")
+                if "execution reverted" in err and not any(x in err for x in _BALANCE_ERRORS):
+                    log.info(f"Sell sim [to=router, from=pair] reverted for {token_address}: {e}")
                     return {"ok": False, "reason": "Симуляция продажи: контракт блокирует продажу через роутер — вероятно honeypot"}
 
         return {"ok": True}
@@ -987,6 +1003,13 @@ async def check_token(
     if not hp_result["ok"]:
         return {"ok": False, "reason": hp_result["reason"]}
 
+    # If BOTH GoPlus AND honeypot.is failed to respond (timeout/error), we have
+    # no external confirmation of safety — too risky to buy.
+    goplus_unavailable   = goplus_data is None
+    honeypot_unavailable = hp_result.get("buy_tax") is None and hp_result.get("sell_tax") is None
+    if goplus_unavailable and honeypot_unavailable:
+        return {"ok": False, "reason": "GoPlus и honeypot.is недоступны — невозможно проверить токен на honeypot"}
+
     # Deployer blacklist + serial deployer check (via BSCScan)
     if not deployer_result["ok"]:
         return {"ok": False, "reason": deployer_result["reason"]}
@@ -1191,7 +1214,7 @@ async def check_token_fast(
     sim_buy_task  = asyncio.to_thread(
         _simulate_buy_sync, w3, token_address, wallet_address, router_address, native_token
     )
-    sim_sell_task = asyncio.to_thread(_simulate_sell_sync, w3, token_address, pair_address)
+    sim_sell_task = asyncio.to_thread(_simulate_sell_sync, w3, token_address, pair_address, router_address)
     price_task    = asyncio.to_thread(
         _get_bnb_price_sync, w3, router_address, native_token, stable_token
     )
