@@ -25,7 +25,7 @@ from web3.middleware import geth_poa_middleware
 
 import blacklist
 import config
-from analyzer import analyze_token, check_token, check_token_fast, fetch_security_partial, get_bnb_price, _get_liquidity_usd_sync as _liq_sync, _get_bnb_price_sync as _bnb_price_sync
+from analyzer import analyze_token, check_token, check_token_fast, fetch_security_partial, get_bnb_price, _get_liquidity_usd_sync as _liq_sync, _get_bnb_price_sync as _bnb_price_sync, _simulate_buy_sync
 from position import (
     Position, PositionManager,
     POSITIONS_FILE_BASE, POSITIONS_FILE_BISWAP, POSITIONS_FILE_BASESWAP,
@@ -923,6 +923,13 @@ _TRADING_NOT_READY_REASONS = (
 _TRADING_WAIT_MAX_SEC = 300   # 5 minutes max wait for trading to open
 
 
+def _simulate_buy_sync_for_wait(w3_instance, token_address: str) -> bool:
+    """Quick buy-sim check: returns True if trading is open, False if still blocked."""
+    result = _simulate_buy_sync(w3_instance, token_address,
+                                "0x0000000000000000000000000000000000000001")
+    return result["ok"]
+
+
 async def _wait_for_liquidity_and_retry(
     token_address: str,
     base_token: str,
@@ -1009,10 +1016,22 @@ async def _wait_for_liquidity_and_retry(
                         )
                         return
                 else:
-                    # No cache or non-BSC chain: full re-check via callback
-                    _liq_security_cache.pop(key, None)
-                    await _callback(token_address, base_token, pair_address, creation_block)
-                    return
+                    # No security cache (e.g. initial "sim rejected" failure before APIs ran).
+                    # Check if trading is now open by running buy sim only (~200ms).
+                    # If open → run full callback (will re-run APIs).
+                    # If still not open → keep polling this same loop (avoid cascading tasks).
+                    _sim_check = await asyncio.to_thread(
+                        _simulate_buy_sync_for_wait, _w3, token_address,
+                    )
+                    if _sim_check:
+                        # Trading is open — fire full callback to run all security checks
+                        log.info(f"{tag}[WaitLiq] {sym} — trading now open, running full check")
+                        _liq_security_cache.pop(key, None)
+                        await _callback(token_address, base_token, pair_address, creation_block)
+                        return
+                    else:
+                        # Trading still not open — keep polling same loop
+                        log.info(f"{tag}[WaitLiq] {sym} — trading not enabled yet, retrying...")
 
             interval = _LIQ_WAIT_FAST_INTERVAL if attempt < _LIQ_WAIT_FAST_COUNT else _LIQ_WAIT_SLOW_INTERVAL
             attempt += 1
@@ -1208,8 +1227,14 @@ async def on_pair_found(
             )
 
         # If rejection is purely liquidity (reserves not yet added after PairCreated),
+        # OR trading is not yet enabled (liquidity present but enableTrading() not called),
         # schedule a polling task instead of discarding the token permanently.
-        if any(r in result["reason"] for r in _LIQUIDITY_REASONS):
+        reason_lc_outer = result["reason"].lower()
+        _should_retry = (
+            any(r in reason_lc_outer for r in _LIQUIDITY_REASONS)
+            or any(r in reason_lc_outer for r in _TRADING_NOT_READY_REASONS)
+        )
+        if _should_retry:
             # Cache the already-computed security data for the fast retry path.
             # check_token() includes "_security" in the rejection dict when all
             # security APIs passed and only the on-chain liquidity check failed.
@@ -1473,7 +1498,8 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
             _reject_log.pop(0)
         log.info(f"[Base] Rejected {sym}: {result['reason']}")
 
-        if any(r in result["reason"] for r in _LIQUIDITY_REASONS):
+        _rlc_base = result["reason"].lower()
+        if any(r in _rlc_base for r in _LIQUIDITY_REASONS) or any(r in _rlc_base for r in _TRADING_NOT_READY_REASONS):
             asyncio.create_task(
                 _wait_for_liquidity_and_retry(
                     token_address, base_token, pair_address, creation_block,
@@ -1673,7 +1699,8 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
             _reject_log.pop(0)
         log.info(f"[BiSwap] Rejected {sym}: {result['reason']}")
 
-        if any(r in result["reason"] for r in _LIQUIDITY_REASONS):
+        _rlc_bi = result["reason"].lower()
+        if any(r in _rlc_bi for r in _LIQUIDITY_REASONS) or any(r in _rlc_bi for r in _TRADING_NOT_READY_REASONS):
             asyncio.create_task(
                 _wait_for_liquidity_and_retry(
                     token_address, base_token, pair_address, creation_block,
@@ -1859,7 +1886,8 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
             _reject_log.pop(0)
         log.info(f"[BaseSwap] Rejected {sym}: {result['reason']}")
 
-        if any(r in result["reason"] for r in _LIQUIDITY_REASONS):
+        _rlc_bs = result["reason"].lower()
+        if any(r in _rlc_bs for r in _LIQUIDITY_REASONS) or any(r in _rlc_bs for r in _TRADING_NOT_READY_REASONS):
             asyncio.create_task(
                 _wait_for_liquidity_and_retry(
                     token_address, base_token, pair_address, creation_block,
