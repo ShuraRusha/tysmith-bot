@@ -45,6 +45,23 @@ ROUTER_ABI_PRICE = [
     }
 ]
 
+TRANSFER_ABI = [
+    {
+        "name": "transfer",
+        "type": "function",
+        "stateMutability": "nonpayable",
+        "inputs":  [{"name": "to", "type": "address"}, {"name": "amount", "type": "uint256"}],
+        "outputs": [{"name": "", "type": "bool"}],
+    },
+    {
+        "name": "balanceOf",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs":  [{"name": "account", "type": "address"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+    },
+]
+
 # ── On-chain helpers (synchronous — call via asyncio.to_thread) ───────────────
 
 def get_bnb_price_sync(w3: Web3) -> float:
@@ -85,6 +102,64 @@ def get_liquidity_usd_sync(
         return 0.0
 
 
+def simulate_sell_sync(w3: Web3, token_address: str, pair_address: str) -> dict:
+    """
+    On-chain sell simulation via eth_call (no gas cost, works in demo mode too).
+
+    Tests three transfer patterns to catch honeypot variants:
+    1. pair -> pair          (catches basic anti-sell: "if to==pair revert")
+    2. address(1) -> pair   (catches whitelist: pair is whitelisted, others blocked)
+    3. pair -> router       (catches router-specific blocks)
+
+    Returns {"ok": True} or {"ok": False, "reason": "..."}.
+    Fail-open on RPC errors so we don't miss real tokens.
+    """
+    _BALANCE_ERRORS = (
+        "transfer amount exceeds balance", "exceeds balance",
+        "insufficient balance", "amount exceeds", "balance exceeded",
+        "insufficient funds", "out of gas",
+    )
+    try:
+        token_cs = Web3.to_checksum_address(token_address)
+        pair_cs  = Web3.to_checksum_address(pair_address)
+        token    = w3.eth.contract(address=token_cs, abi=TRANSFER_ABI)
+
+        pair_balance = token.functions.balanceOf(pair_cs).call()
+        if pair_balance == 0:
+            return {"ok": True}  # no liquidity yet — cannot simulate meaningfully
+
+        # Check 1: pair → pair (basic honeypot trigger)
+        try:
+            token.functions.transfer(pair_cs, 1).call({"from": pair_cs})
+        except Exception as e:
+            err = str(e).lower()
+            if "execution reverted" in err and not any(x in err for x in _BALANCE_ERRORS):
+                return {"ok": False, "reason": "Симуляция продажи: контракт блокирует продажу (honeypot)"}
+
+        # Check 2: non-whitelisted address → pair (whitelist bypass)
+        ADDR1 = "0x0000000000000000000000000000000000000001"
+        try:
+            token.functions.transfer(pair_cs, 1).call({"from": ADDR1})
+        except Exception as e:
+            err = str(e).lower()
+            if "execution reverted" in err and not any(x in err for x in _BALANCE_ERRORS):
+                return {"ok": False, "reason": "Симуляция продажи: обычные адреса заблокированы (whitelist honeypot)"}
+
+        # Check 3: pair → router (router-specific block)
+        router_cs = Web3.to_checksum_address(PANCAKE_ROUTER_V2)
+        try:
+            token.functions.transfer(router_cs, 1).call({"from": pair_cs})
+        except Exception as e:
+            err = str(e).lower()
+            if "execution reverted" in err and not any(x in err for x in _BALANCE_ERRORS):
+                return {"ok": False, "reason": "Симуляция продажи: роутер заблокирован (honeypot)"}
+
+        return {"ok": True}
+    except Exception as e:
+        log.debug(f"simulate_sell non-blocking error ({token_address}): {e}")
+        return {"ok": True}  # fail-open: don't reject good tokens on RPC errors
+
+
 # ── Public async helpers ──────────────────────────────────────────────────────
 
 async def get_bnb_price(w3: Web3) -> float:
@@ -97,6 +172,8 @@ async def check_token_security(
     token_address: str,
     max_buy_tax: float,
     max_sell_tax: float,
+    w3=None,
+    pair_address: str = None,
 ) -> dict:
     """
     GoPlus security analysis + tax check.
@@ -179,4 +256,11 @@ async def check_token_security(
         "is_proxy":      data.get("is_proxy")      == "1",
         "external_call": data.get("external_call") == "1",
     }
+
+    # ── 5. On-chain sell simulation (catches honeypots GoPlus misses) ─────────
+    if w3 is not None and pair_address:
+        sim = await asyncio.to_thread(simulate_sell_sync, w3, token_address, pair_address)
+        if not sim["ok"]:
+            return {"ok": False, "reason": sim["reason"]}
+
     return {"ok": True, "info": info}

@@ -14,6 +14,11 @@ MOSCOW_TZ      = pytz.timezone("Europe/Moscow")
 DATA_DIR       = os.getenv("DATA_DIR", "/data")
 DEMO_LOG_FILE  = os.path.join(DATA_DIR, "tysmith_demo_trades.json")
 
+# Imported lazily to avoid circular import
+def _simulate_sell(w3, token_address, pair_address):
+    from analyzer import simulate_sell_sync
+    return simulate_sell_sync(w3, token_address, pair_address)
+
 
 @dataclass
 class Position:
@@ -76,15 +81,17 @@ class PositionManager:
         except Exception as e:
             log.warning(f"Demo trades save failed: {e}")
 
-    def _record_demo_trade(self, pos: Position, pnl_pct: float, reason: str, sell_price: float):
+    def _record_demo_trade(self, pos: Position, pnl_pct: float, reason: str,
+                           sell_price: float, honeypot_at_exit: bool = False):
         self._demo_trades.append({
-            "symbol":      pos.symbol,
-            "pnl_pct":     round(pnl_pct, 2),
-            "reason":      reason,
-            "buy_bnb":     pos.buy_bnb,
-            "entry_price": pos.buy_price_bnb,
-            "exit_price":  sell_price,
-            "closed_at":   datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M"),
+            "symbol":           pos.symbol,
+            "pnl_pct":          round(pnl_pct, 2),
+            "reason":           reason,
+            "buy_bnb":          pos.buy_bnb,
+            "entry_price":      pos.buy_price_bnb,
+            "exit_price":       sell_price,
+            "honeypot_at_exit": honeypot_at_exit,
+            "closed_at":        datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M"),
         })
         self._save_demo_trades()
 
@@ -93,21 +100,25 @@ class PositionManager:
         if not trades:
             return {"total": 0}
 
-        wins   = [t for t in trades if t["pnl_pct"] > 0]
-        losses = [t for t in trades if t["pnl_pct"] <= 0]
-        avg    = sum(t["pnl_pct"] for t in trades) / len(trades)
-        best   = max(trades, key=lambda t: t["pnl_pct"])
-        worst  = min(trades, key=lambda t: t["pnl_pct"])
+        wins            = [t for t in trades if t["pnl_pct"] > 0 and not t.get("honeypot_at_exit")]
+        losses          = [t for t in trades if t["pnl_pct"] <= 0 and not t.get("honeypot_at_exit")]
+        honeypots       = [t for t in trades if t.get("honeypot_at_exit")]
+        sellable_trades = [t for t in trades if not t.get("honeypot_at_exit")]
 
-        # Virtual BNB P&L: sum of (pnl_pct / 100) * buy_bnb for each trade
+        avg    = sum(t["pnl_pct"] for t in sellable_trades) / len(sellable_trades) if sellable_trades else 0.0
+        best   = max(sellable_trades, key=lambda t: t["pnl_pct"]) if sellable_trades else None
+        worst  = min(sellable_trades, key=lambda t: t["pnl_pct"]) if sellable_trades else None
+
         total_invested = sum(t["buy_bnb"] for t in trades)
-        total_pnl_bnb  = sum(t["pnl_pct"] / 100 * t["buy_bnb"] for t in trades)
+        # Only count P&L from actually sellable trades
+        total_pnl_bnb  = sum(t["pnl_pct"] / 100 * t["buy_bnb"] for t in sellable_trades)
 
         return {
             "total":          len(trades),
             "wins":           len(wins),
             "losses":         len(losses),
-            "win_rate":       len(wins) / len(trades) * 100,
+            "honeypots":      len(honeypots),
+            "win_rate":       len(wins) / len(sellable_trades) * 100 if sellable_trades else 0.0,
             "avg_pnl":        avg,
             "best":           best,
             "worst":          worst,
@@ -201,14 +212,31 @@ class PositionManager:
             emoji, label = "🛑", "SL сработал"
 
         if pos.demo:
-            self._record_demo_trade(pos, pnl_pct, reason, current_price)
+            # Re-check sellability at exit — token may have become a honeypot after listing
+            w3 = self.trader.w3
+            sim = await asyncio.to_thread(_simulate_sell, w3, pos.token_address, pos.pair_address)
+            honeypot_at_exit = not sim["ok"]
+
+            self._record_demo_trade(pos, pnl_pct, reason, current_price,
+                                    honeypot_at_exit=honeypot_at_exit)
             self.remove(pos.token_address)
-            await self.notify(
-                f"{prefix}*{label} — {pos.symbol}*\n"
-                f"P&L: {pnl_pct:+.1f}%\n"
-                f"Вложено: {pos.buy_bnb} BNB (виртуально)\n"
-                f"Прибыль: {pos.buy_bnb * pnl_pct / 100:+.4f} BNB виртуально"
-            )
+
+            if honeypot_at_exit:
+                await self.notify(
+                    f"🎭 [DEMO] *{label} — {pos.symbol}*\n"
+                    f"P&L: {pnl_pct:+.1f}% (виртуально)\n"
+                    f"⚠️ *ВНИМАНИЕ: симуляция продажи ПРОВАЛИЛАСЬ*\n"
+                    f"В реальности этот токен продать нельзя — *HONEYPOT*\n"
+                    f"Причина: {sim.get('reason', '?')}"
+                )
+            else:
+                await self.notify(
+                    f"{prefix}*{label} — {pos.symbol}*\n"
+                    f"P&L: {pnl_pct:+.1f}%\n"
+                    f"Вложено: {pos.buy_bnb} BNB (виртуально)\n"
+                    f"Прибыль: {pos.buy_bnb * pnl_pct / 100:+.4f} BNB виртуально\n"
+                    f"✅ Симуляция продажи прошла — токен sellable"
+                )
         else:
             result = await asyncio.to_thread(
                 self.trader.sell, pos.token_address, pos.tokens_amount

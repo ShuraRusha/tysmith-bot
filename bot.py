@@ -84,6 +84,8 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         token_address,
         config.MAX_BUY_TAX,
         config.MAX_SELL_TAX,
+        w3=w3,
+        pair_address=pair_address,
     )
 
     if not result["ok"]:
@@ -365,14 +367,19 @@ async def cmd_demostats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     open_demo = [p for p in pos_manager.get_all() if p.demo]
     open_line = f"\nОткрытых demo позиций: *{len(open_demo)}*" if open_demo else ""
 
+    honeypot_line = f"Honeypot при закрытии: *{stats['honeypots']}* ⚠️\n" if stats["honeypots"] else ""
+    best_line  = f"Лучшая: *+{stats['best']['pnl_pct']:.1f}%* ({stats['best']['symbol']})\n" if stats.get("best") else ""
+    worst_line = f"Худшая: *{stats['worst']['pnl_pct']:+.1f}%* ({stats['worst']['symbol']})\n" if stats.get("worst") else ""
+
     await update.message.reply_text(
         f"🎭 *Demo статистика*\n\n"
         f"Всего сделок: *{stats['total']}*\n"
         f"Прибыльных: *{stats['wins']}* | Убыточных: *{stats['losses']}*\n"
-        f"Winrate: *{stats['win_rate']:.0f}%*\n\n"
+        f"{honeypot_line}"
+        f"Winrate: *{stats['win_rate']:.0f}%* (без honeypot)\n\n"
         f"Средний P&L: *{stats['avg_pnl']:+.1f}%*\n"
-        f"Лучшая: *+{stats['best']['pnl_pct']:.1f}%* ({stats['best']['symbol']})\n"
-        f"Худшая: *{stats['worst']['pnl_pct']:+.1f}%* ({stats['worst']['symbol']})\n\n"
+        f"{best_line}"
+        f"{worst_line}\n"
         f"Вложено виртуально: *{stats['total_invested']:.3f} BNB*\n"
         f"P&L: *{stats['total_pnl_bnb']:+.4f} BNB* (~${pnl_usd:+.0f})"
         f"{open_line}\n\n"
