@@ -2644,9 +2644,36 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    connected  = await asyncio.to_thread(w3.is_connected)
-    balance    = await asyncio.to_thread(lambda: w3.eth.get_balance(trader.wallet) / 1e18)
-    bnb_price  = await get_bnb_price(w3)
+    _base_active = config.BASE_CHAIN_ENABLED and w3_base and not _base_chain_rpc_failed
+
+    async def _get_base_eth_balance() -> float:
+        if not _base_active:
+            return 0.0
+        try:
+            return await asyncio.to_thread(lambda: w3_base.eth.get_balance(trader_base.wallet) / 1e18)
+        except Exception:
+            return 0.0
+
+    async def _get_eth_price() -> float:
+        if not _base_active:
+            return 0.0
+        try:
+            return await get_bnb_price(
+                w3_base,
+                router_address=config.UNISWAP_V2_ROUTER_BASE,
+                native_token=config.WETH_BASE,
+                stable_token=config.USDC_BASE,
+            )
+        except Exception:
+            return 0.0
+
+    connected, balance, bnb_price, eth_balance, eth_price = await asyncio.gather(
+        asyncio.to_thread(w3.is_connected),
+        asyncio.to_thread(lambda: w3.eth.get_balance(trader.wallet) / 1e18),
+        get_bnb_price(w3),
+        _get_base_eth_balance(),
+        _get_eth_price(),
+    )
     buy_amount = calculate_buy_amount(balance)
     auto_icon   = "⚡ авто" if is_auto else "👆 ручной"
     status_icon = "⏸ ПАУЗА" if is_paused else f"▶️ активен | {auto_icon}"
@@ -2708,11 +2735,23 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         speed_status = ""
 
+    # ── Multi-chain balance section ───────────────────────────────────────────
+    balance_lines = f"  BSC (BNB): {balance:.4f} BNB (~${balance * bnb_price:.0f})"
+    if config.BISWAP_ENABLED:
+        balance_lines += " [PCS+BiSwap]"
+    balance_lines += "\n"
+    if _base_active:
+        eth_usd = eth_balance * eth_price if eth_price else 0.0
+        balance_lines += f"  Base (ETH): {eth_balance:.4f} ETH (~${eth_usd:.0f})"
+        if config.BASESWAP_ENABLED:
+            balance_lines += " [Uniswap+BaseSwap]"
+        balance_lines += "\n"
+
     msg = (
         f"Статус Sniper Bot — {status_icon}\n\n"
         f"RPC: {'✅' if connected else '❌'} {rpc_label} | WS: {ws_count} | Poll RPCs: {len(_poll_w3s)}\n"
         f"Кошелёк: {trader.wallet}\n"
-        f"Баланс: {balance:.4f} BNB (~${balance * bnb_price:.0f})\n"
+        f"Балансы:\n{balance_lines}"
         f"Позиций: {len(pos_manager.positions)}/{calculate_max_positions(balance) if is_auto else config.MAX_POSITIONS}\n"
         f"Сделок в истории: {len(trade_history)}\n\n"
         f"{activity_str}"
