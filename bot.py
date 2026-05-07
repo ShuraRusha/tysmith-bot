@@ -201,9 +201,6 @@ _LOW_BALANCE_ALERT_INTERVAL = 300.0
 
 async def _maybe_alert_low_balance(balance: float, chain: str = "BSC"):
     global _low_balance_alert_ts
-    # Never alert if balance is zero — user just hasn't funded this chain wallet
-    if balance == 0.0:
-        return
     now = time.time()
     if now - _low_balance_alert_ts < _LOW_BALANCE_ALERT_INTERVAL:
         return
@@ -1025,24 +1022,28 @@ async def _wait_for_liquidity_and_retry(
                         )
                         return
                 else:
-                    # No security cache (e.g. initial "sim rejected" failure before APIs ran).
+                    # No security cache (e.g. initial "нет ликвидности" or "sim rejected").
                     # Check if trading is now open by running buy sim only (~200ms).
-                    # If open → run full callback (will re-run APIs).
-                    # If still not open → keep polling this same loop (avoid cascading tasks).
+                    # If open → run full callback to populate security cache + check liquidity.
+                    # If still not open → keep polling same loop.
                     _sim_check = await asyncio.to_thread(
                         _simulate_buy_sync_for_wait, _w3, token_address,
                     )
                     if _sim_check:
-                        # Trading is open — fire full callback to run all security checks
-                        elapsed = int(time.time() - start_time)
-                        log.info(f"{tag}[WaitLiq] {sym} — trading now open (+{elapsed}s), running full check")
-                        await tg_send(
-                            f"⏳ Торговля открылась для `{token_address}`\n"
-                            f"Прошло с листинга: {elapsed}s — запускаю полную проверку…"
-                        )
-                        _liq_security_cache.pop(key, None)
+                        # Trading is open — run full callback once to get security data.
+                        # The callback may populate _liq_security_cache if liq is still
+                        # below the minimum (e.g. $30 < $100). If so, subsequent iterations
+                        # use the fast-path (check_token_fast) until liq reaches minimum.
+                        _liq_security_cache.pop(key, None)  # clear stale cache first
                         await _callback(token_address, base_token, pair_address, creation_block)
-                        return
+                        # After callback:
+                        # - cache set   → callback found liq issue; continue polling (fast-path)
+                        # - cache absent → bought successfully OR permanent rejection → exit
+                        if not _liq_security_cache.get(key):
+                            return
+                        # Cache was repopulated: liquidity still low but security is good.
+                        # Continue the loop — next iterations will use fast-path.
+                        log.info(f"{tag}[WaitLiq] {sym} — security OK, waiting for liq>={config.MIN_LIQUIDITY_USD}")
                     else:
                         # Trading still not open — keep polling same loop
                         log.info(f"{tag}[WaitLiq] {sym} — trading not enabled yet, retrying...")
