@@ -88,9 +88,9 @@ async def _watch_single(ws_url: str, callback, factory_address: str = None, base
     tokens  = base_tokens or BASE_TOKENS
     backoff = 2
     ep = _ep_init(ws_url)
-    # BSC produces pairs every few seconds — if nothing arrives in 3 min, the node is stale.
+    # BSC produces pairs every ~10-30s — if nothing arrives in 90s, the node is stale.
     # Many free nodes accept subscriptions but silently stop delivering events.
-    _RECV_TIMEOUT = 3 * 60
+    _RECV_TIMEOUT = 90
     while True:
         _ws_endpoint_status[ep]["connected"] = False
         try:

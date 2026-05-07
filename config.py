@@ -32,14 +32,20 @@ BSC_HTTP_RPCS = [u for u in [BSC_HTTP_RPC, BSC_HTTP_RPC_BACKUP,
                               "https://bsc-dataseed3.binance.org/",
                               "https://bsc.drpc.org",
                               ] if u]
-# All WS endpoints for failover — multiple endpoints for redundancy
-# bsc.publicnode.com is the most reliable free public BSC WS node
-BSC_WS_RPCS = [u for u in [
-    BSC_WS_RPC,
+# BSC WS endpoints for PairCreated monitoring — public nodes only.
+# NodeReal WS (_NR_WS) is intentionally excluded here: it is reserved
+# exclusively for the mempool watcher (newPendingTransactions). Connecting
+# it here too causes a second WS session → NodeReal free tier returns HTTP 429.
+# nariox.org removed — consistently times out.
+BSC_WS_RPCS = [
     "wss://bsc.publicnode.com",
     "wss://bsc-rpc.publicnode.com",
-    "wss://bsc-ws-node.nariox.org",
-] if u]
+    "wss://bsc.drpc.org",
+]
+# If user explicitly overrides BSC_WS_RPC with a non-NodeReal URL, add it first
+_custom_ws = os.getenv("BSC_WS_RPC", "")
+if _custom_ws and _custom_ws != _NR_WS and _custom_ws not in BSC_WS_RPCS:
+    BSC_WS_RPCS.insert(0, _custom_ws)
 # Deduplicate while preserving order
 BSC_HTTP_RPCS = list(dict.fromkeys(BSC_HTTP_RPCS))
 BSC_WS_RPCS   = list(dict.fromkeys(BSC_WS_RPCS))
@@ -181,11 +187,10 @@ BASE_HTTP_RPCS = list(dict.fromkeys(
         "https://base-mainnet.g.alchemy.com/v2/demo",  # Alchemy demo fallback
     ] if u]
 ))
-# Multiple WS endpoints for failover
+# Base WS endpoints — 1rpc.io removed (returns -32600 error, rejects subscriptions)
 BASE_WS_RPCS = list(dict.fromkeys([u for u in [
     BASE_WS_RPC,
     "wss://base.drpc.org",
-    "wss://1rpc.io/base",
 ] if u]))
 
 # Base native token + main stablecoin
