@@ -25,7 +25,7 @@ from web3.middleware import geth_poa_middleware
 
 import blacklist
 import config
-from analyzer import analyze_token, check_token, check_token_fast, get_bnb_price, _get_liquidity_usd_sync as _liq_sync, _get_bnb_price_sync as _bnb_price_sync
+from analyzer import analyze_token, check_token, check_token_fast, fetch_security_partial, get_bnb_price, _get_liquidity_usd_sync as _liq_sync, _get_bnb_price_sync as _bnb_price_sync
 from position import (
     Position, PositionManager,
     POSITIONS_FILE_BASE, POSITIONS_FILE_BISWAP, POSITIONS_FILE_BASESWAP,
@@ -1005,39 +1005,44 @@ async def _wait_for_liquidity_and_retry(
 async def on_pending_pair_found(token_address: str, base_token: str, pair_address: str):
     """
     Called from mempool watcher when a pending createPair tx is detected.
-    Runs check_token immediately and caches the result.
-    When PairCreated event fires, on_pair_found picks up the cached result.
+
+    Runs ONLY external API checks (GoPlus, honeypot.is, BSCScan, DexScreener) — no
+    on-chain buy simulation, because the pair doesn't exist yet while the tx is pending.
+
+    When PairCreated fires, on_pair_found finds the cached security and runs only the
+    fast on-chain Stage 1 (~300ms) instead of the full 5-10s check_token().
     """
     global _mp_stats_pending
     key = token_address.lower()
     if key in _mempool_cache:
-        return  # already analyzing or analyzed
+        return  # already analyzing
 
     t0 = time.time()
-    _mempool_cache[key] = {"result": None, "ts": t0}  # placeholder = "in progress"
+    _mempool_cache[key] = {"security": None, "pre_reject": None, "ts": t0}
     _mp_stats_pending += 1
 
     try:
-        result = await check_token(
-            token_address, pair_address, base_token, w3,
-            config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
-            wallet_address=trader.wallet,
-            min_market_cap_usd=config.MIN_MARKET_CAP_USD,
-            min_fdv_usd=config.MIN_FDV_USD,
-            max_fdv_usd=config.MAX_FDV_USD,
-            max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
-            min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
-            max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
-            lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
-            min_holder_count=config.MIN_HOLDER_COUNT,
+        mp = await fetch_security_partial(
+            token_address, pair_address,
             bscscan_api_key=config.BSCSCAN_API_KEY,
+            max_buy_tax=config.MAX_BUY_TAX,
+            max_sell_tax=config.MAX_SELL_TAX,
+            wallet_address=trader.wallet,
             max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
+            min_holder_count=config.MIN_HOLDER_COUNT,
+            max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
+            max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
+            min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
         )
         elapsed = time.time() - t0
-        _mempool_cache[key] = {"result": result, "ts": time.time(), "elapsed": elapsed}
-        status = "✅ OK" if result["ok"] else f"❌ {result['reason']}"
-        sym = (result.get("info") or {}).get("symbol") or token_address[:10]
-        log.info(f"Mempool pre-analysis {sym} ({token_address[:10]}…): {status} [{elapsed:.1f}s]")
+        _mempool_cache[key] = {
+            "security":   mp["security"],
+            "pre_reject": mp["pre_reject"],
+            "ts":         time.time(),
+            "elapsed":    elapsed,
+        }
+        status = f"❌ {mp['pre_reject']}" if mp["pre_reject"] else "✅ APIs OK"
+        log.info(f"Mempool pre-analysis {token_address[:10]}…: {status} [{elapsed:.1f}s]")
     except Exception as e:
         log.warning(f"Mempool pre-analysis error for {token_address[:10]}…: {e}")
         _mempool_cache.pop(key, None)
@@ -1099,20 +1104,42 @@ async def on_pair_found(
     if _precheck_result is not None:
         result = _precheck_result
         log.info(f"⚡ Fast-path for {token_address[:10]}… — skipped full security gather")
-    # Check mempool pre-analysis cache next
+    # Mempool pre-analysis cache: APIs already ran while createPair was pending
     else:
         key = token_address.lower()
         cached = _mempool_cache.pop(key, None)
-        if cached and cached.get("result") and (time.time() - cached["ts"]) < _MEMPOOL_CACHE_TTL:
+        if cached and cached.get("security") and (time.time() - cached["ts"]) < _MEMPOOL_CACHE_TTL:
             global _mp_stats_hits, _mp_stats_saved_s
-            result    = cached["result"]
             saved_sec = cached.get("elapsed", 0.0)
             _mp_stats_hits   += 1
             _mp_stats_saved_s += saved_sec
-            log.info(
-                f"⚡ Mempool cache HIT for {token_address[:10]}… "
-                f"(saved ~{saved_sec:.1f}s, total hits={_mp_stats_hits})"
-            )
+
+            if cached["pre_reject"]:
+                # APIs already found honeypot / bad deployer — instant reject
+                log.info(f"⚡ Mempool pre-reject {token_address[:10]}…: {cached['pre_reject']}")
+                result = {"ok": False, "reason": cached["pre_reject"]}
+            else:
+                # APIs passed — run ONLY on-chain Stage 1 (~300ms) with cached security
+                log.info(
+                    f"⚡ Mempool HIT {token_address[:10]}… (saved ~{saved_sec:.1f}s) "
+                    f"— running Stage 1 on-chain only"
+                )
+                result = await check_token_fast(
+                    token_address, pair_address, base_token, w3,
+                    min_liquidity_usd=config.MIN_LIQUIDITY_USD,
+                    min_market_cap_usd=config.MIN_MARKET_CAP_USD,
+                    min_fdv_usd=config.MIN_FDV_USD,
+                    max_fdv_usd=config.MAX_FDV_USD,
+                    security=cached["security"],
+                )
+                if result["ok"]:
+                    # Store security for any subsequent wait-for-liquidity retries
+                    _liq_security_cache[key] = {
+                        "security": cached["security"],
+                        "ts": time.time(),
+                        "base_token": base_token,
+                        "pair_address": pair_address,
+                    }
         else:
             log.info(f"Analyzing: {token_address}")
             try:

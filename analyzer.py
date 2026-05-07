@@ -1254,3 +1254,77 @@ async def check_token_fast(
         "deployer":       deployer_result.get("deployer"),
     }
     return {"ok": True, "info": info}
+
+
+async def fetch_security_partial(
+    token_address:  str,
+    pair_address:   str,
+    bscscan_api_key: str = "",
+    max_buy_tax:    float = 20.0,
+    max_sell_tax:   float = 20.0,
+    chain_id:       int   = 56,
+    wallet_address: str   = "0x0000000000000000000000000000000000000001",
+    router_address: str   = None,
+    native_token:   str   = None,
+    stable_token:   str   = None,
+    dex_chain:      str   = "bsc",
+    explorer_url:   str   = None,
+    max_deployer_tokens_30d: int = 20,
+    min_holder_count:     int   = 0,
+    max_top10_holder_pct: float = 60.0,
+    max_token_age_days:   int   = 7,
+    min_volume_5m_usd:    float = 0.0,
+) -> dict:
+    """
+    Run ONLY the external API checks (GoPlus, honeypot.is, BSCScan, DexScreener).
+    No on-chain calls — safe to call before the pair/liquidity exists.
+
+    Used by the mempool watcher to pre-compute security while createPair() is
+    still pending. Returns a security-partial dict compatible with check_token_fast().
+
+    Also returns a quick "pre_rejected" flag when APIs already confirm a bad token
+    (honeypot, blacklisted deployer) so on_pair_found can skip all further checks.
+    """
+    goplus_data, hp_result, dex, deployer_result = await asyncio.gather(
+        _goplus_fetch(token_address, chain_id),
+        _honeypot_is_check(token_address, max_buy_tax, max_sell_tax, chain_id),
+        _dexscreener_fetch(pair_address, dex_chain),
+        _check_deployer_bscscan(token_address, bscscan_api_key, max_deployer_tokens_30d, explorer_url=explorer_url),
+    )
+
+    # Fast pre-reject on definitive API findings (honeypot.is / deployer blacklist)
+    pre_reject = None
+    if not hp_result["ok"]:
+        pre_reject = hp_result["reason"]
+    elif not deployer_result["ok"]:
+        pre_reject = deployer_result["reason"]
+    elif goplus_data:
+        for flag, reason in {
+            "is_honeypot":          "Honeypot (GoPlus)",
+            "cannot_buy":           "Покупка заблокирована контрактом",
+            "cannot_sell_all":      "Продажа всех токенов заблокирована",
+            "selfdestruct":         "Selfdestruct функция",
+            "owner_change_balance": "Владелец может менять балансы",
+        }.items():
+            if goplus_data.get(flag) == "1":
+                pre_reject = reason
+                break
+
+    security = {
+        "goplus_data":          goplus_data,
+        "hp_result":            hp_result,
+        "deployer_result":      deployer_result,
+        "dex":                  dex,
+        "wallet_address":       wallet_address,
+        "router_address":       router_address,
+        "native_token":         native_token,
+        "stable_token":         stable_token,
+        "dex_chain":            dex_chain,
+        "max_buy_tax":          max_buy_tax,
+        "max_sell_tax":         max_sell_tax,
+        "min_holder_count":     min_holder_count,
+        "max_top10_holder_pct": max_top10_holder_pct,
+        "max_token_age_days":   max_token_age_days,
+        "min_volume_5m_usd":    min_volume_5m_usd,
+    }
+    return {"security": security, "pre_reject": pre_reject}
