@@ -122,6 +122,11 @@ PENDING_TTL       = int(os.getenv("PENDING_TTL",       "60"))   # seconds before
 AUTO_BUY           = os.getenv("AUTO_BUY",           "true").lower() == "true"
 MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "0"))  # 0 = auto formula
 
+# ── Demo / paper-trading mode ─────────────────────────────────────────────────
+# DEMO_MODE=true: all buys/sells are virtual — no real BNB spent.
+# Real on-chain prices are used for all calculations.
+DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
+
 # ── Safety filters ────────────────────────────────────────────────────────────
 TOP_HOLDER_MAX_PCT   = float(os.getenv("TOP_HOLDER_MAX_PCT",   "90"))  # deployer holds 80-90% at T+0 — 90 = practical limit
 MAX_TOP10_HOLDER_PCT = float(os.getenv("MAX_TOP10_HOLDER_PCT", "60"))  # top-10 combined (excl. DEX/locked) > X% → reject (was 30)

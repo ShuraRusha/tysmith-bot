@@ -46,6 +46,7 @@ class Position:
     sell_failures:    int   = field(default=0)
     stuck:            bool  = field(default=False)
     age_alerted:      bool  = field(default=False)
+    demo:             bool  = field(default=False)  # True = paper trade, no real tx
 
 
 class PositionManager:

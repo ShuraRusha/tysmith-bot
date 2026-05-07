@@ -175,6 +175,8 @@ class Trader:
         Approve router to spend this token. Synchronous.
         Returns {"ok": True} or {"ok": False, "reason": "..."}
         """
+        if config.DEMO_MODE:
+            return {"ok": True}
         try:
             token_address = Web3.to_checksum_address(token_address)
             token     = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
@@ -205,7 +207,7 @@ class Trader:
     def buy(self, token_address: str, amount_bnb: float) -> dict:
         """
         Buy token with BNB via PancakeSwap V2.
-        Uses aggressive gas price + high slippage for sniper speed.
+        In DEMO_MODE: simulates buy at current market price, no real tx.
         Synchronous — call via asyncio.to_thread from async code.
         """
         try:
@@ -216,6 +218,21 @@ class Trader:
                 amount_wei, [self.native_token, token_address]
             ).call()
             min_out  = int(amounts[1] * (1 - SLIPPAGE_BUY / 100))
+
+            if config.DEMO_MODE:
+                token    = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
+                decimals = token.functions.decimals().call()
+                virtual_tokens = amounts[1]  # expected output without slippage
+                log.info(f"[DEMO] Buy {token_address}: virtual {virtual_tokens / 10**decimals:.4f} tokens")
+                return {
+                    "ok":              True,
+                    "tx_hash":         f"DEMO-{token_address[:8].lower()}",
+                    "tokens_received": virtual_tokens,
+                    "decimals":        decimals,
+                    "block_number":    self.w3.eth.block_number,
+                    "gas_bnb":         0.0,
+                    "demo":            True,
+                }
 
             gas_price = self._gas_price_buy()
             log.info(f"Buy {token_address}: {amount_bnb} native, "
@@ -269,9 +286,12 @@ class Trader:
              slippage_pct: float = None) -> dict:
         """
         Sell exact token amount back to BNB via PancakeSwap V2.
-        On status=0 failure, automatically retries with 2x slippage.
+        In DEMO_MODE: simulates sell at current price, no real tx.
         Synchronous — call via asyncio.to_thread from async code.
         """
+        if config.DEMO_MODE:
+            log.info(f"[DEMO] Sell {token_address}: virtual {amount_tokens} tokens")
+            return {"ok": True, "tx_hash": f"DEMO-SELL-{token_address[:8].lower()}", "demo": True}
         if slippage_pct is None:
             slippage_pct = SLIPPAGE_SELL
 
@@ -345,6 +365,7 @@ class Trader:
     def sell_escalating(self, token_address: str, amount_tokens: int) -> dict:
         """
         Sell with Replace-By-Fee gas escalation for stuck transactions.
+        In DEMO_MODE: simulates sell instantly, no real tx.
 
         Uses a single nonce across up to 3 attempts with increasing gas+slippage:
           Attempt 1 (t=0):   gas*1.5  + SLIPPAGE_SELL%
@@ -355,6 +376,9 @@ class Trader:
         escalating gas won't help, so we return failure immediately.
         Synchronous — call via asyncio.to_thread from async code.
         """
+        if config.DEMO_MODE:
+            log.info(f"[DEMO] sell_escalating {token_address}: virtual {amount_tokens} tokens")
+            return {"ok": True, "tx_hash": f"DEMO-SELL-{token_address[:8].lower()}", "demo": True}
         try:
             token_address = Web3.to_checksum_address(token_address)
 

@@ -3,6 +3,7 @@ import collections
 import json
 import logging
 import os
+import signal
 import socket
 import sys
 import time
@@ -767,6 +768,7 @@ def _record_trade(pos: Position, pnl_pct: float, reason: str, sell_price: float 
                 "hold_sec":       hold_sec,
                 "hold_str":       hold_str,
                 "closed_at":      datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M"),
+                "demo":           getattr(pos, "demo", False),
             })
             _save_history()
             return
@@ -1405,6 +1407,7 @@ async def _on_pair_found_inner(
                     moon_bag_tokens   = moon_bag,
                     deployer_address  = info.get("deployer") or "",
                     buy_gas_bnb       = result.get("gas_bnb", 0.0),
+                    demo              = config.DEMO_MODE,
                 )
                 pos_manager.add(pos)
 
@@ -1649,6 +1652,7 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
                     moon_bag_tokens   = moon_bag,
                     deployer_address  = info.get("deployer") or "",
                     chain             = "base",
+                    demo              = config.DEMO_MODE,
                 )
                 pos_manager_base.add(pos)
                 _record_buy(pos, buy_result["tx_hash"])
@@ -1833,6 +1837,7 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
                     moon_bag_tokens   = moon_bag,
                     deployer_address  = info.get("deployer") or "",
                     chain             = "bsc",
+                    demo              = config.DEMO_MODE,
                 )
                 pos_manager_biswap.add(pos)
                 _record_buy(pos, buy_result["tx_hash"])
@@ -2020,6 +2025,7 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
                     moon_bag_tokens   = moon_bag,
                     deployer_address  = info.get("deployer") or "",
                     chain             = "base",
+                    demo              = config.DEMO_MODE,
                 )
                 pos_manager_baseswap.add(pos)
                 _record_buy(pos, buy_result["tx_hash"])
@@ -2136,6 +2142,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sell_tax           = token_info["info"]["sell_tax"],
                 moon_bag_tokens    = moon_bag,
                 deployer_address   = token_info["info"].get("deployer") or "",
+                demo               = config.DEMO_MODE,
             )
             pos_manager.add(pos)
             _record_buy(pos, result["tx_hash"])
@@ -3137,6 +3144,53 @@ async def cmd_rejects(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
+async def cmd_demostats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args and context.args[0].lower() == "reset":
+        global trade_history
+        trade_history = [t for t in trade_history if not t.get("demo")]
+        _save_history()
+        await update.message.reply_text("🎭 Demo статистика сброшена.")
+        return
+
+    demo_trades = [t for t in trade_history if t.get("demo") and t.get("status") == "closed"]
+    if not demo_trades:
+        await update.message.reply_text(
+            "🎭 *Demo статистика*\n\nСделок пока нет.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    bnb_price = await get_bnb_price(w3)
+    wins      = [t for t in demo_trades if t.get("pnl_pct", 0) > 0]
+    losses    = [t for t in demo_trades if t.get("pnl_pct", 0) <= 0]
+    avg_pnl   = sum(t.get("pnl_pct", 0) for t in demo_trades) / len(demo_trades)
+    best      = max(demo_trades, key=lambda t: t.get("pnl_pct", 0))
+    worst     = min(demo_trades, key=lambda t: t.get("pnl_pct", 0))
+    total_inv = sum(t.get("buy_bnb", 0) for t in demo_trades)
+    total_pnl = sum(t.get("pnl_bnb", 0) for t in demo_trades)
+
+    open_demo = sum(
+        1 for pm in [pos_manager, pos_manager_base, pos_manager_biswap, pos_manager_baseswap]
+        if pm for p in (pm.get_all() if pm else []) if p.demo
+    )
+    open_line = f"\nОткрытых demo позиций: *{open_demo}*" if open_demo else ""
+
+    await update.message.reply_text(
+        f"🎭 *Demo статистика*\n\n"
+        f"Всего сделок: *{len(demo_trades)}*\n"
+        f"Прибыльных: *{len(wins)}* | Убыточных: *{len(losses)}*\n"
+        f"Winrate: *{len(wins)/len(demo_trades)*100:.0f}%*\n\n"
+        f"Средний P&L: *{avg_pnl:+.1f}%*\n"
+        f"Лучшая: *+{best.get('pnl_pct',0):.1f}%* ({best.get('symbol','?')})\n"
+        f"Худшая: *{worst.get('pnl_pct',0):+.1f}%* ({worst.get('symbol','?')})\n\n"
+        f"Вложено виртуально: *{total_inv:.3f} BNB*\n"
+        f"P&L: *{total_pnl:+.4f} BNB* (~${total_pnl * bnb_price:+.0f})"
+        f"{open_line}\n\n"
+        f"/demostats reset — сбросить статистику",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
 async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Full analytics dashboard: funnel, rejection breakdown, trading performance."""
     # ── Funnel ────────────────────────────────────────────────────────────────
@@ -3768,6 +3822,7 @@ async def main(need_polling_grace: bool = False):
     app.add_handler(CommandHandler("pause",     cmd_pause))
     app.add_handler(CommandHandler("resume",    cmd_resume))
     app.add_handler(CommandHandler("stats",     cmd_stats))
+    app.add_handler(CommandHandler("demostats", cmd_demostats))
     app.add_handler(CommandHandler("history",   cmd_history))
     app.add_handler(CommandHandler("set",       cmd_set))
     app.add_handler(CommandHandler("analyze",   cmd_analyze))
@@ -3843,6 +3898,17 @@ async def main(need_polling_grace: bool = False):
 
     asyncio.create_task(_lock_refresher(app))
 
+    # Graceful shutdown on SIGTERM (Railway zero-downtime deploys) and SIGINT.
+    # Without this Railway sends SIGTERM → bot ignores it → SIGKILL → both instances
+    # poll Telegram simultaneously → HTTP 409 Conflict.
+    _shutdown_event = asyncio.Event()
+    loop = asyncio.get_event_loop()
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(_sig, _shutdown_event.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+
     # Restore open positions from disk (survive restarts/redeploys)
     restored = pos_manager.load()
     if pos_manager_base:
@@ -3902,13 +3968,18 @@ async def main(need_polling_grace: bool = False):
     await tg_send(startup_msg)
 
     try:
-        while True:
-            await asyncio.sleep(60)
+        await _shutdown_event.wait()
     except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        log.info("Shutdown signal received — stopping bot gracefully…")
         _release_distributed_lock()
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+        try:
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+        except Exception as e:
+            log.error(f"Shutdown error: {e}")
 
 
 if __name__ == "__main__":
