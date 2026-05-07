@@ -2960,6 +2960,18 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
               else "⚫ выкл (BASE_CHAIN_ENABLED=false)")
     )
 
+    # ── Mempool status ────────────────────────────────────────────────────────
+    if not config.MEMPOOL_ENABLED:
+        mp_str = "⚫ выкл (MEMPOOL\\_ENABLED=false)"
+    elif _mp_enabled:
+        mp_str = (
+            f"🧠 активен | pre-analyzed: {_mp_stats_pending}"
+            f" | cache hits: {_mp_stats_hits}"
+            + (f" | saved: {_mp_stats_saved_s:.0f}s" if _mp_stats_hits else "")
+        )
+    else:
+        mp_str = "⏳ стартует..."
+
     ws_block = "\n".join(ws_lines)
     await update.message.reply_text(
         f"*🔍 Диагностика бота*\n\n"
@@ -2974,8 +2986,9 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"За последний час: *{pairs_1h}* пар\n"
         f"{last_info}\n\n"
         f"*HTTP Poll:* {poll_str}\n\n"
+        f"*Mempool:* {mp_str}\n\n"
         f"*Heartbeat:* {wd_icon} "
-        f"{'OK' if watchdog_ok else f'⚠️ нет пар {since_last//60}м — проверь WS'}\n\n"
+        f"{'OK' if watchdog_ok else f'нет пар {since_last//60}м — проверь WS'}\n\n"
         f"DEBUG\\_ALERTS: {'🔔 вкл' if DEBUG_ALERTS else '🔕 выкл'}\n"
         f"Отклонено всего: {_stats_rejected} | Замечено: {_stats_seen}",
         parse_mode=ParseMode.MARKDOWN,
