@@ -890,7 +890,15 @@ _LIQ_SECURITY_CACHE_TTL = 600   # discard after 10 minutes
 _LIQUIDITY_REASONS = (
     "нет ликвидности",
     "нулевой выход из пула",
+    "ликвидность:",    # "Ликвидность: $30 < $100" — low but non-zero liquidity
 )
+
+# Reasons that mean "contract not open yet" — trading disabled, not a honeypot.
+# Retry for up to _TRADING_WAIT_MAX_SEC before giving up.
+_TRADING_NOT_READY_REASONS = (
+    "симуляция отклонена контрактом",   # enableTrading() not called yet
+)
+_TRADING_WAIT_MAX_SEC = 300   # 5 minutes max wait for trading to open
 
 
 async def _wait_for_liquidity_and_retry(
@@ -916,11 +924,12 @@ async def _wait_for_liquidity_and_retry(
     tag = f"[{label}] " if label else ""
     log.info(f"{tag}[WaitLiq] {sym} — polling for liquidity (TTL={_LIQ_WAIT_TTL}s)")
 
-    deadline  = time.time() + _LIQ_WAIT_TTL
-    attempt   = 0
-    _w3       = w3_instance or w3
-    _callback = callback or on_pair_found
-    bnb_price = await asyncio.to_thread(_bnb_price_sync, _w3)
+    deadline   = time.time() + _LIQ_WAIT_TTL
+    start_time = time.time()
+    attempt    = 0
+    _w3        = w3_instance or w3
+    _callback  = callback or on_pair_found
+    bnb_price  = await asyncio.to_thread(_bnb_price_sync, _w3)
 
     try:
         while time.time() < deadline:
@@ -928,21 +937,15 @@ async def _wait_for_liquidity_and_retry(
                 _liq_sync, _w3, pair_address, base_token, bnb_price
             )
             if liq >= _LIQ_WAIT_TRIGGER_USD:
-                log.info(f"{tag}[WaitLiq] {sym} — liquidity appeared: ${liq:,.0f} (attempt {attempt+1})")
-                # Use bypass set instead of popping from _seen_tokens_ts.
-                # Pop created a re-detection window where HTTP poll would add the same
-                # token to _reject_log a second time; bypass set is consumed exactly once.
+                log.info(f"{tag}[WaitLiq] {sym} — liquidity ${liq:,.0f} (attempt {attempt+1})")
                 _liq_retry_bypass.add(key)
 
-                # Fast-path: if we have cached security results (all APIs already ran),
-                # run only buy sim + liquidity + FDV (~300ms) instead of full gather (~5s).
-                # Only available for on_pair_found (BSC PancakeSwap) which accepts _precheck_result.
-                cached_sec = _liq_security_cache.pop(key, None)
+                # Fast-path: cached security → only buy sim + liquidity + FDV (~300ms)
+                cached_sec = _liq_security_cache.get(key)
                 if (_callback is on_pair_found
                         and cached_sec
                         and (time.time() - cached_sec["ts"]) < _LIQ_SECURITY_CACHE_TTL
                         and cached_sec.get("security")):
-                    log.info(f"{tag}[WaitLiq] {sym} — using cached security, running fast-path check")
                     fast_result = await check_token_fast(
                         token_address, pair_address, base_token, _w3,
                         min_liquidity_usd=config.MIN_LIQUIDITY_USD,
@@ -953,29 +956,41 @@ async def _wait_for_liquidity_and_retry(
                     )
                     if fast_result["ok"]:
                         log.info(f"{tag}[WaitLiq] {sym} — fast-path PASSED, triggering buy")
+                        _liq_security_cache.pop(key, None)
                         await _callback(
                             token_address, base_token, pair_address, creation_block,
                             _precheck_result=fast_result,
                         )
-                    else:
-                        reason = fast_result["reason"]
-                        log.info(f"{tag}[WaitLiq] {sym} — fast-path rejected: {reason}")
-                        # Notify user why the token was rejected AFTER liquidity appeared.
-                        # Liquidity reasons mean we should keep waiting, not alert.
-                        if not any(r in reason for r in _LIQUIDITY_REASONS):
-                            await tg_send(
-                                f"⚠️ *{sym}* — ликвидность появилась (${liq:,.0f}), но отклонён\n"
-                                f"`{token_address}`\n"
-                                f"Причина: {reason}"
-                            )
-                        # Fall back to full re-check (also bypasses dedup via _liq_retry_bypass)
-                        _liq_retry_bypass.add(key)
-                        await _callback(token_address, base_token, pair_address, creation_block)
-                    return
+                        return
 
-                # No cache or non-BSC chain: re-run the full discovery flow
-                await _callback(token_address, base_token, pair_address, creation_block)
-                return
+                    reason = fast_result["reason"]
+                    reason_lc = reason.lower()
+                    log.info(f"{tag}[WaitLiq] {sym} — fast-path: {reason}")
+
+                    # Liquidity still building — keep polling, don't exit
+                    if any(r in reason_lc for r in _LIQUIDITY_REASONS):
+                        pass  # continue loop
+
+                    # Contract not open yet (enableTrading not called) — retry up to 5 min
+                    elif (any(r in reason_lc for r in _TRADING_NOT_READY_REASONS)
+                          and time.time() - start_time < _TRADING_WAIT_MAX_SEC):
+                        log.info(f"{tag}[WaitLiq] {sym} — trading not enabled yet, retrying...")
+
+                    else:
+                        # Permanent rejection (honeypot, tax, deployer, etc.)
+                        log.info(f"{tag}[WaitLiq] {sym} — permanent reject after liquidity: {reason}")
+                        _liq_security_cache.pop(key, None)
+                        await tg_send(
+                            f"⚠️ {sym} — ликвидность ${liq:,.0f}, но отклонён\n"
+                            f"`{token_address}`\n"
+                            f"Причина: {reason}"
+                        )
+                        return
+                else:
+                    # No cache or non-BSC chain: full re-check via callback
+                    _liq_security_cache.pop(key, None)
+                    await _callback(token_address, base_token, pair_address, creation_block)
+                    return
 
             interval = _LIQ_WAIT_FAST_INTERVAL if attempt < _LIQ_WAIT_FAST_COUNT else _LIQ_WAIT_SLOW_INTERVAL
             attempt += 1
@@ -1182,7 +1197,7 @@ async def on_pair_found(
     info      = result["info"]
     bnb_price = info["bnb_price"]
 
-    balance   = w3.eth.get_balance(trader.wallet) / 1e18
+    balance    = await asyncio.to_thread(lambda: w3.eth.get_balance(trader.wallet) / 1e18)
     buy_amount = calculate_buy_amount(balance)
     if buy_amount == 0.0:
         log.info(f"Skipping {token_address}: balance too low for min trade size")
@@ -1435,7 +1450,7 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
 
     info       = result["info"]
     eth_price  = info["bnb_price"]
-    balance    = w3_base.eth.get_balance(trader_base.wallet) / 1e18
+    balance    = await asyncio.to_thread(lambda: w3_base.eth.get_balance(trader_base.wallet) / 1e18)
     buy_amount = calculate_buy_amount(balance)
 
     if buy_amount == 0.0:
@@ -1618,7 +1633,7 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
 
     info      = result["info"]
     bnb_price = info["bnb_price"]
-    balance   = w3.eth.get_balance(trader_biswap.wallet) / 1e18
+    balance    = await asyncio.to_thread(lambda: w3.eth.get_balance(trader_biswap.wallet) / 1e18)
     buy_amount = calculate_buy_amount(balance)
     if buy_amount == 0.0:
         log.info(f"[BiSwap] Skipping {token_address}: balance too low")
@@ -1803,7 +1818,7 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
 
     info       = result["info"]
     eth_price  = info["bnb_price"]
-    balance    = w3_base.eth.get_balance(trader_baseswap.wallet) / 1e18
+    balance    = await asyncio.to_thread(lambda: w3_base.eth.get_balance(trader_baseswap.wallet) / 1e18)
     buy_amount = calculate_buy_amount(balance)
     if buy_amount == 0.0:
         log.info(f"[BaseSwap] Skipping {token_address}: balance too low")
@@ -1953,7 +1968,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Recalculate at buy time — balance may have changed since notification
-        current_balance = w3.eth.get_balance(trader.wallet) / 1e18
+        current_balance = await asyncio.to_thread(lambda: w3.eth.get_balance(trader.wallet) / 1e18)
         buy_amount = calculate_buy_amount(current_balance)
         if buy_amount == 0.0:
             await query.edit_message_text(
