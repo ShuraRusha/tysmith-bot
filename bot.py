@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import signal
 import sys
 import time
 from datetime import datetime
@@ -83,6 +84,8 @@ async def on_pair_found(token_address: str, base_token: str, pair_address: str):
         token_address,
         config.MAX_BUY_TAX,
         config.MAX_SELL_TAX,
+        w3=w3,
+        pair_address=pair_address,
     )
 
     if not result["ok"]:
@@ -281,22 +284,30 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    connected = w3.is_connected()
-    balance   = w3.eth.get_balance(trader.wallet) / 1e18
+    connected = await asyncio.to_thread(w3.is_connected)
     bnb_price = await get_bnb_price(w3)
+
+    mode_line = "🎭 *DEMO режим* — реальные деньги не тратятся\n" if config.DEMO_MODE else ""
+
+    if config.DEMO_MODE:
+        balance_line = f"Виртуальный баланс: {config.BUY_AMOUNT_BNB} BNB/сделка\n"
+    else:
+        balance = await asyncio.to_thread(lambda: w3.eth.get_balance(trader.wallet) / 1e18)
+        balance_line = f"Баланс: {balance:.4f} BNB (~${balance * bnb_price:.0f})\n"
+
     await update.message.reply_text(
-        f"*Статус Sniper Bot*\n\n"
+        f"{mode_line}"
+        f"Статус Sniper Bot\n\n"
         f"RPC: {'✅ подключён' if connected else '❌ нет соединения'}\n"
-        f"Кошелёк: `{trader.wallet}`\n"
-        f"Баланс: *{balance:.4f} BNB* (~${balance * bnb_price:.0f})\n"
+        f"Кошелёк: {trader.wallet}\n"
+        f"{balance_line}"
         f"Позиций открыто: {len(pos_manager.positions)}\n\n"
-        f"*Настройки:*\n"
-        f"Buy: {config.BUY_AMOUNT_BNB} BNB  |  Slippage: {config.SLIPPAGE}%\n"
-        f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции\n"
-        f"TP2: +{config.TAKE_PROFIT_2}% → остаток  |  SL: -{config.STOP_LOSS}%\n"
+        f"Настройки:\n"
+        f"Buy: {config.BUY_AMOUNT_BNB} BNB | Slippage: {config.SLIPPAGE}%\n"
+        f"TP1: +{config.TAKE_PROFIT_1}% -> {config.TAKE_PROFIT_1_PCT:.0f}% позиции\n"
+        f"TP2: +{config.TAKE_PROFIT_2}% -> остаток | SL: -{config.STOP_LOSS}%\n"
         f"Min ликвидность: ${config.MIN_LIQUIDITY_USD:,.0f}\n"
         f"Max tax: {config.MAX_BUY_TAX}% buy / {config.MAX_SELL_TAX}% sell",
-        parse_mode=ParseMode.MARKDOWN,
     )
 
 
@@ -336,6 +347,47 @@ def _release_pid_lock():
         pass
 
 
+async def cmd_demostats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args and context.args[0].lower() == "reset":
+        pos_manager.reset_demo_stats()
+        await update.message.reply_text("🎭 Demo статистика сброшена.")
+        return
+
+    stats = pos_manager.get_demo_stats()
+    if stats["total"] == 0:
+        await update.message.reply_text(
+            "🎭 *Demo статистика*\n\nСделок пока нет.",
+            parse_mode="Markdown",
+        )
+        return
+
+    bnb_price = await get_bnb_price(w3)
+    pnl_usd   = stats["total_pnl_bnb"] * bnb_price
+
+    open_demo = [p for p in pos_manager.get_all() if p.demo]
+    open_line = f"\nОткрытых demo позиций: *{len(open_demo)}*" if open_demo else ""
+
+    honeypot_line = f"Honeypot при закрытии: *{stats['honeypots']}* ⚠️\n" if stats["honeypots"] else ""
+    best_line  = f"Лучшая: *+{stats['best']['pnl_pct']:.1f}%* ({stats['best']['symbol']})\n" if stats.get("best") else ""
+    worst_line = f"Худшая: *{stats['worst']['pnl_pct']:+.1f}%* ({stats['worst']['symbol']})\n" if stats.get("worst") else ""
+
+    await update.message.reply_text(
+        f"🎭 *Demo статистика*\n\n"
+        f"Всего сделок: *{stats['total']}*\n"
+        f"Прибыльных: *{stats['wins']}* | Убыточных: *{stats['losses']}*\n"
+        f"{honeypot_line}"
+        f"Winrate: *{stats['win_rate']:.0f}%* (без honeypot)\n\n"
+        f"Средний P&L: *{stats['avg_pnl']:+.1f}%*\n"
+        f"{best_line}"
+        f"{worst_line}\n"
+        f"Вложено виртуально: *{stats['total_invested']:.3f} BNB*\n"
+        f"P&L: *{stats['total_pnl_bnb']:+.4f} BNB* (~${pnl_usd:+.0f})"
+        f"{open_line}\n\n"
+        f"/demostats reset — сбросить статистику",
+        parse_mode="Markdown",
+    )
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main():
@@ -347,9 +399,10 @@ async def main():
     execution_engine = ExecutionEngine(w3, trader, pos_manager, tg_send)
 
     app = Application.builder().token(config.BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",     cmd_start))
-    app.add_handler(CommandHandler("positions", cmd_positions))
-    app.add_handler(CommandHandler("status",    cmd_status))
+    app.add_handler(CommandHandler("start",      cmd_start))
+    app.add_handler(CommandHandler("positions",  cmd_positions))
+    app.add_handler(CommandHandler("status",     cmd_status))
+    app.add_handler(CommandHandler("demostats",  cmd_demostats))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     await app.initialize()
@@ -368,16 +421,30 @@ async def main():
         "/status — баланс и настройки"
     )
 
+    # Graceful shutdown on SIGTERM (Railway zero-downtime deploys) and SIGINT (Ctrl-C).
+    # Without this handler Railway sends SIGTERM → bot ignores it → waits for SIGKILL →
+    # old instance keeps polling Telegram → HTTP 409 Conflict with the new instance.
+    _shutdown_event = asyncio.Event()
+    loop = asyncio.get_event_loop()
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(_sig, _shutdown_event.set)
+        except (NotImplementedError, RuntimeError):
+            pass  # Windows / test env
+
     try:
-        while True:
-            await asyncio.sleep(60)
+        await _shutdown_event.wait()
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
+        log.info("Shutdown signal received — stopping bot gracefully…")
         _release_pid_lock()
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+        try:
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+        except Exception as e:
+            log.error(f"Shutdown error: {e}")
 
 
 if __name__ == "__main__":
