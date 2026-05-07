@@ -134,9 +134,12 @@ class ExecutionEngine:
     # ── Buy with retries ──────────────────────────────────────────────────────
 
     async def _buy_with_retry(self, candidate: Candidate) -> dict:
-        sym  = candidate.info.get("symbol", "???")
-        last: dict = {"ok": False, "reason": "no attempts"}
+        sym = candidate.info.get("symbol", "???")
 
+        if config.DEMO_MODE:
+            return await self._demo_buy(candidate)
+
+        last: dict = {"ok": False, "reason": "no attempts"}
         for attempt in range(BUY_RETRY_LIMIT):
             result = await asyncio.to_thread(
                 self.trader.buy, candidate.token_address, config.BUY_AMOUNT_BNB
@@ -152,6 +155,37 @@ class ExecutionEngine:
                 await asyncio.sleep(2)
 
         return last
+
+    async def _demo_buy(self, candidate: Candidate) -> dict:
+        """Simulate a buy at the current on-chain price without sending any transaction."""
+        sym = candidate.info.get("symbol", "???")
+        try:
+            price_bnb = await asyncio.to_thread(
+                self.trader.get_price, candidate.token_address, candidate.base_token
+            )
+            if price_bnb <= 0:
+                return {"ok": False, "reason": "Demo: не удалось получить цену токена"}
+
+            # Get decimals via trader's ERC20 ABI
+            from web3 import Web3
+            from trader import ERC20_ABI
+            token = self.w3.eth.contract(
+                address=Web3.to_checksum_address(candidate.token_address), abi=ERC20_ABI
+            )
+            decs = await asyncio.to_thread(token.functions.decimals().call)
+            virtual_tokens = int(config.BUY_AMOUNT_BNB / price_bnb * 10 ** decs)
+
+            log.info(f"[DEMO][{sym}] Virtual buy: {virtual_tokens / 10**decs:.4f} tokens @ {price_bnb:.8f} BNB")
+            return {
+                "ok":              True,
+                "tx_hash":         f"DEMO-{candidate.token_address[:8]}",
+                "tokens_received": virtual_tokens,
+                "decimals":        decs,
+                "demo":            True,
+            }
+        except Exception as e:
+            log.error(f"[DEMO][{sym}] demo_buy error: {e}")
+            return {"ok": False, "reason": f"Demo buy error: {e}"}
 
     # ── Speed metrics ─────────────────────────────────────────────────────────
 
@@ -190,8 +224,9 @@ class ExecutionEngine:
         addr = candidate.token_address
 
         if result["ok"]:
-            tokens = result["tokens_received"]
-            decs   = result["decimals"]
+            tokens    = result["tokens_received"]
+            decs      = result["decimals"]
+            is_demo   = result.get("demo", False)
 
             price_entry = await asyncio.to_thread(
                 self.trader.get_price, addr, candidate.base_token
@@ -212,22 +247,26 @@ class ExecutionEngine:
                 take_profit_1_pct = config.TAKE_PROFIT_1_PCT,
                 take_profit_2     = config.TAKE_PROFIT_2,
                 stop_loss         = config.STOP_LOSS,
+                demo              = is_demo,
             )
             self.pos_manager.add(pos)
 
-            asyncio.create_task(
-                asyncio.to_thread(self.trader.approve_token, addr)
-            )
+            if not is_demo:
+                asyncio.create_task(
+                    asyncio.to_thread(self.trader.approve_token, addr)
+                )
 
+            prefix    = "🎭 [DEMO] " if is_demo else "✅ "
+            tx_line   = "" if is_demo else f"Tx: `{result['tx_hash']}`\n\n"
             swaps_str = str(swaps_before) if swaps_before >= 0 else "?"
             await self.notify(
-                f"✅ *Куплено!* — {sym}\n\n"
+                f"{prefix}*Куплено!* — {sym}\n\n"
                 f"Получено: {tokens / 10**decs:.4f} {sym}\n"
                 f"Цена входа: {price_entry:.8f} BNB\n"
                 f"Ликвидность: ${liq_usd:,.0f}\n"
-                f"⚡ Блоков после создания пары: *{delta_blocks}*\n"
-                f"🏁 Свапов до нас: *{swaps_str}*\n"
-                f"Tx: `{result['tx_hash']}`\n\n"
+                f"Блоков после создания пары: *{delta_blocks}*\n"
+                f"Свапов до нас: *{swaps_str}*\n"
+                f"{tx_line}"
                 f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}%\n"
                 f"TP2: +{config.TAKE_PROFIT_2}% → остаток  |  SL: -{config.STOP_LOSS}%"
             )

@@ -283,13 +283,22 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     connected = await asyncio.to_thread(w3.is_connected)
-    balance   = await asyncio.to_thread(lambda: w3.eth.get_balance(trader.wallet) / 1e18)
     bnb_price = await get_bnb_price(w3)
+
+    mode_line = "🎭 *DEMO режим* — реальные деньги не тратятся\n" if config.DEMO_MODE else ""
+
+    if config.DEMO_MODE:
+        balance_line = f"Виртуальный баланс: {config.BUY_AMOUNT_BNB} BNB/сделка\n"
+    else:
+        balance = await asyncio.to_thread(lambda: w3.eth.get_balance(trader.wallet) / 1e18)
+        balance_line = f"Баланс: {balance:.4f} BNB (~${balance * bnb_price:.0f})\n"
+
     await update.message.reply_text(
+        f"{mode_line}"
         f"Статус Sniper Bot\n\n"
         f"RPC: {'✅ подключён' if connected else '❌ нет соединения'}\n"
         f"Кошелёк: {trader.wallet}\n"
-        f"Баланс: {balance:.4f} BNB (~${balance * bnb_price:.0f})\n"
+        f"{balance_line}"
         f"Позиций открыто: {len(pos_manager.positions)}\n\n"
         f"Настройки:\n"
         f"Buy: {config.BUY_AMOUNT_BNB} BNB | Slippage: {config.SLIPPAGE}%\n"
@@ -336,6 +345,42 @@ def _release_pid_lock():
         pass
 
 
+async def cmd_demostats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args and context.args[0].lower() == "reset":
+        pos_manager.reset_demo_stats()
+        await update.message.reply_text("🎭 Demo статистика сброшена.")
+        return
+
+    stats = pos_manager.get_demo_stats()
+    if stats["total"] == 0:
+        await update.message.reply_text(
+            "🎭 *Demo статистика*\n\nСделок пока нет.",
+            parse_mode="Markdown",
+        )
+        return
+
+    bnb_price = await get_bnb_price(w3)
+    pnl_usd   = stats["total_pnl_bnb"] * bnb_price
+
+    open_demo = [p for p in pos_manager.get_all() if p.demo]
+    open_line = f"\nОткрытых demo позиций: *{len(open_demo)}*" if open_demo else ""
+
+    await update.message.reply_text(
+        f"🎭 *Demo статистика*\n\n"
+        f"Всего сделок: *{stats['total']}*\n"
+        f"Прибыльных: *{stats['wins']}* | Убыточных: *{stats['losses']}*\n"
+        f"Winrate: *{stats['win_rate']:.0f}%*\n\n"
+        f"Средний P&L: *{stats['avg_pnl']:+.1f}%*\n"
+        f"Лучшая: *+{stats['best']['pnl_pct']:.1f}%* ({stats['best']['symbol']})\n"
+        f"Худшая: *{stats['worst']['pnl_pct']:+.1f}%* ({stats['worst']['symbol']})\n\n"
+        f"Вложено виртуально: *{stats['total_invested']:.3f} BNB*\n"
+        f"P&L: *{stats['total_pnl_bnb']:+.4f} BNB* (~${pnl_usd:+.0f})"
+        f"{open_line}\n\n"
+        f"/demostats reset — сбросить статистику",
+        parse_mode="Markdown",
+    )
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main():
@@ -347,9 +392,10 @@ async def main():
     execution_engine = ExecutionEngine(w3, trader, pos_manager, tg_send)
 
     app = Application.builder().token(config.BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",     cmd_start))
-    app.add_handler(CommandHandler("positions", cmd_positions))
-    app.add_handler(CommandHandler("status",    cmd_status))
+    app.add_handler(CommandHandler("start",      cmd_start))
+    app.add_handler(CommandHandler("positions",  cmd_positions))
+    app.add_handler(CommandHandler("status",     cmd_status))
+    app.add_handler(CommandHandler("demostats",  cmd_demostats))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     await app.initialize()
