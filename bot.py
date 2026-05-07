@@ -138,7 +138,7 @@ if config.BASESWAP_ENABLED and config.BASE_CHAIN_ENABLED and w3_base:
 pending: dict[str, dict] = {}
 
 # Tokens currently being bought (prevents concurrent buy of the same token)
-_buying_tokens: set[str] = {}
+_buying_tokens: set[str] = set()
 
 # ── Dynamic position sizing ───────────────────────────────────────────────────
 
