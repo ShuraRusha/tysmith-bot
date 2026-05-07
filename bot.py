@@ -194,6 +194,28 @@ def calculate_buy_amount(balance_bnb: float) -> float:
     return round(min(amount, config.BUY_MAX_BNB), 4)
 
 
+# Throttle low-balance alerts to at most one per 5 minutes
+_low_balance_alert_ts: float = 0.0
+_LOW_BALANCE_ALERT_INTERVAL = 300.0
+
+
+async def _maybe_alert_low_balance(balance: float):
+    global _low_balance_alert_ts
+    now = time.time()
+    if now - _low_balance_alert_ts < _LOW_BALANCE_ALERT_INTERVAL:
+        return
+    _low_balance_alert_ts = now
+    min_needed = (config.BUY_MIN_BNB / (config.BUY_PCT_OF_BALANCE / 100.0)
+                  if config.BUY_PCT_OF_BALANCE > 0
+                  else config.BUY_MIN_BNB / 0.05) + config.GAS_RESERVE_BNB
+    await tg_send(
+        f"⚠️ Баланс слишком мал для торговли!\n"
+        f"Текущий баланс: {balance:.4f} BNB\n"
+        f"Минимально нужно: ~{min_needed:.3f} BNB\n"
+        f"Пополните кошелёк или снизьте BUY_MIN_BNB в настройках."
+    )
+
+
 def _calc_moon_bag(tokens_received: int, buy_bnb: float, bnb_price: float) -> int:
     """Return the number of raw tokens to reserve as a moon bag (not auto-sold).
     Activated only when trade size >= MOON_BAG_MIN_USD. Returns 0 if disabled."""
@@ -1228,6 +1250,7 @@ async def on_pair_found(
     buy_amount = calculate_buy_amount(balance)
     if buy_amount == 0.0:
         log.info(f"Skipping {token_address}: balance too low for min trade size")
+        await _maybe_alert_low_balance(balance)
         return
 
     warnings = info.get("extra_warnings", [])
@@ -1482,6 +1505,7 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
 
     if buy_amount == 0.0:
         log.info(f"[Base] Skipping {token_address}: balance too low")
+        await _maybe_alert_low_balance(balance)
         return
 
     warnings = info.get("extra_warnings", [])
@@ -1664,6 +1688,7 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
     buy_amount = calculate_buy_amount(balance)
     if buy_amount == 0.0:
         log.info(f"[BiSwap] Skipping {token_address}: balance too low")
+        await _maybe_alert_low_balance(balance)
         return
 
     warnings = info.get("extra_warnings", [])
@@ -1849,6 +1874,7 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
     buy_amount = calculate_buy_amount(balance)
     if buy_amount == 0.0:
         log.info(f"[BaseSwap] Skipping {token_address}: balance too low")
+        await _maybe_alert_low_balance(balance)
         return
 
     warnings = info.get("extra_warnings", [])
