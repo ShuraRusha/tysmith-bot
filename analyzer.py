@@ -892,20 +892,40 @@ async def check_token(
     If both pass         → merge results.
     """
 
-    # ── All checks run in parallel ────────────────────────────────────────────
-    sim_buy_task    = asyncio.to_thread(
-        _simulate_buy_sync, w3, token_address, wallet_address, router_address, native_token
+    # ── Stage 1: fast on-chain checks only (~300ms) ──────────────────────────
+    # Run these BEFORE the slow API calls so that if there's no liquidity yet
+    # (the most common case — PairCreated fires before addLiquidity) we return
+    # immediately instead of waiting 5-10s for BSCScan / GoPlus to time out.
+    sim_result, sell_sim, lp_result = await asyncio.gather(
+        asyncio.to_thread(_simulate_buy_sync,    w3, token_address, wallet_address, router_address, native_token),
+        asyncio.to_thread(_simulate_sell_sync,   w3, token_address, pair_address),
+        asyncio.to_thread(_check_lp_onchain_sync, w3, pair_address, lp_holder_max_pct),
     )
-    sim_sell_task   = asyncio.to_thread(_simulate_sell_sync,    w3, token_address, pair_address)
-    lp_onchain_task = asyncio.to_thread(_check_lp_onchain_sync, w3, pair_address, lp_holder_max_pct)
-    goplus_task     = _goplus_fetch(token_address, chain_id)
-    honeypot_task   = _honeypot_is_check(token_address, max_buy_tax, max_sell_tax, chain_id)
-    dexscreen_task  = _dexscreener_fetch(pair_address, dex_chain)
-    deployer_task   = _check_deployer_bscscan(token_address, bscscan_api_key, max_deployer_tokens_30d, explorer_url=explorer_url)
 
-    (sim_result, sell_sim, lp_result,
-     goplus_data, hp_result, dex, deployer_result) = await asyncio.gather(
-        sim_buy_task, sim_sell_task, lp_onchain_task,
+    # If buy sim fails with a liquidity error, return NOW — don't wait for APIs.
+    # bot.py will put this token in the wait-for-liquidity queue and use
+    # check_token_fast() (~300ms) when liquidity appears.
+    if not sim_result["ok"]:
+        reason = sim_result["reason"]
+        if "нет ликвидности" in reason or "нулевой выход" in reason:
+            return {"ok": False, "reason": reason}
+        return {"ok": False, "reason": reason}
+
+    if not sell_sim["ok"]:
+        return {"ok": False, "reason": sell_sim["reason"]}
+
+    if not lp_result["ok"]:
+        return {"ok": False, "reason": lp_result["reason"]}
+
+    # ── Stage 2: external API checks (3-10s, only runs when liquidity exists) ─
+    # By the time we reach here, trading is active and the pool has reserves.
+    # Now we can afford to wait for GoPlus / honeypot.is / BSCScan results.
+    goplus_task    = _goplus_fetch(token_address, chain_id)
+    honeypot_task  = _honeypot_is_check(token_address, max_buy_tax, max_sell_tax, chain_id)
+    dexscreen_task = _dexscreener_fetch(pair_address, dex_chain)
+    deployer_task  = _check_deployer_bscscan(token_address, bscscan_api_key, max_deployer_tokens_30d, explorer_url=explorer_url)
+
+    goplus_data, hp_result, dex, deployer_result = await asyncio.gather(
         goplus_task, honeypot_task, dexscreen_task, deployer_task
     )
 
