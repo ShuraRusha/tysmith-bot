@@ -199,19 +199,23 @@ _low_balance_alert_ts: float = 0.0
 _LOW_BALANCE_ALERT_INTERVAL = 300.0
 
 
-async def _maybe_alert_low_balance(balance: float):
+async def _maybe_alert_low_balance(balance: float, chain: str = "BSC"):
     global _low_balance_alert_ts
+    # Never alert if balance is zero — user just hasn't funded this chain wallet
+    if balance == 0.0:
+        return
     now = time.time()
     if now - _low_balance_alert_ts < _LOW_BALANCE_ALERT_INTERVAL:
         return
     _low_balance_alert_ts = now
+    native = "ETH" if chain != "BSC" else "BNB"
     min_needed = (config.BUY_MIN_BNB / (config.BUY_PCT_OF_BALANCE / 100.0)
                   if config.BUY_PCT_OF_BALANCE > 0
                   else config.BUY_MIN_BNB / 0.05) + config.GAS_RESERVE_BNB
     await tg_send(
-        f"⚠️ Баланс слишком мал для торговли!\n"
-        f"Текущий баланс: {balance:.4f} BNB\n"
-        f"Минимально нужно: ~{min_needed:.3f} BNB\n"
+        f"⚠️ [{chain}] Баланс слишком мал для торговли!\n"
+        f"Текущий баланс: {balance:.4f} {native}\n"
+        f"Минимально нужно: ~{min_needed:.3f} {native}\n"
         f"Пополните кошелёк или снизьте BUY_MIN_BNB в настройках."
     )
 
@@ -984,7 +988,12 @@ async def _wait_for_liquidity_and_retry(
                         security=cached_sec["security"],
                     )
                     if fast_result["ok"]:
-                        log.info(f"{tag}[WaitLiq] {sym} — fast-path PASSED, triggering buy")
+                        elapsed = int(time.time() - start_time)
+                        log.info(f"{tag}[WaitLiq] {sym} — fast-path PASSED (+{elapsed}s), triggering buy")
+                        await tg_send(
+                            f"⏳ Ликвидность появилась для `{token_address}`\n"
+                            f"Прошло с листинга: {elapsed}s — все проверки пройдены, покупаю…"
+                        )
                         _liq_security_cache.pop(key, None)
                         await _callback(
                             token_address, base_token, pair_address, creation_block,
@@ -1025,7 +1034,12 @@ async def _wait_for_liquidity_and_retry(
                     )
                     if _sim_check:
                         # Trading is open — fire full callback to run all security checks
-                        log.info(f"{tag}[WaitLiq] {sym} — trading now open, running full check")
+                        elapsed = int(time.time() - start_time)
+                        log.info(f"{tag}[WaitLiq] {sym} — trading now open (+{elapsed}s), running full check")
+                        await tg_send(
+                            f"⏳ Торговля открылась для `{token_address}`\n"
+                            f"Прошло с листинга: {elapsed}s — запускаю полную проверку…"
+                        )
                         _liq_security_cache.pop(key, None)
                         await _callback(token_address, base_token, pair_address, creation_block)
                         return
@@ -1125,6 +1139,22 @@ async def on_pair_found(
     pair_address: str,
     creation_block: int = 0,
     _precheck_result: dict = None,   # pass pre-validated result to skip check_token()
+):
+    try:
+        await _on_pair_found_inner(
+            token_address, base_token, pair_address, creation_block, _precheck_result
+        )
+    except Exception as e:
+        log.exception(f"[on_pair_found] unhandled exception for {token_address[:10]}: {e}")
+        await tg_send(f"🚨 Ошибка в обработчике токена {token_address[:10]}…\n`{e}`")
+
+
+async def _on_pair_found_inner(
+    token_address: str,
+    base_token: str,
+    pair_address: str,
+    creation_block: int = 0,
+    _precheck_result: dict = None,
 ):
     global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject, _last_pair_token
 
@@ -1275,7 +1305,7 @@ async def on_pair_found(
     buy_amount = calculate_buy_amount(balance)
     if buy_amount == 0.0:
         log.info(f"Skipping {token_address}: balance too low for min trade size")
-        await _maybe_alert_low_balance(balance)
+        await _maybe_alert_low_balance(balance, "BSC")
         return
 
     warnings = info.get("extra_warnings", [])
@@ -1531,7 +1561,7 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
 
     if buy_amount == 0.0:
         log.info(f"[Base] Skipping {token_address}: balance too low")
-        await _maybe_alert_low_balance(balance)
+        await _maybe_alert_low_balance(balance, "Base")
         return
 
     warnings = info.get("extra_warnings", [])
@@ -1715,7 +1745,7 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
     buy_amount = calculate_buy_amount(balance)
     if buy_amount == 0.0:
         log.info(f"[BiSwap] Skipping {token_address}: balance too low")
-        await _maybe_alert_low_balance(balance)
+        await _maybe_alert_low_balance(balance, "BSC/BiSwap")
         return
 
     warnings = info.get("extra_warnings", [])
@@ -1902,7 +1932,7 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
     buy_amount = calculate_buy_amount(balance)
     if buy_amount == 0.0:
         log.info(f"[BaseSwap] Skipping {token_address}: balance too low")
-        await _maybe_alert_low_balance(balance)
+        await _maybe_alert_low_balance(balance, "Base/BaseSwap")
         return
 
     warnings = info.get("extra_warnings", [])
