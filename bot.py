@@ -1549,7 +1549,13 @@ async def _on_pair_found_inner(
         f"📄 `{token_address}`\n\n"
         f"💧 Ликвидность: *${info['liquidity_usd']:,.0f}*{fdv_str}\n"
         f"💸 Buy tax: *{info['buy_tax']:.1f}%*  |  Sell tax: *{info['sell_tax']:.1f}%*\n"
-        f"👥 Холдеры: {info['holder_count']}\n\n"
+        f"👥 Холдеры: {info['holder_count']}\n"
+        + (
+            f"🏦 Деплоер держит: *{info['deployer_pct']:.1f}%* суплая"
+            + (" ✅" if info['deployer_pct'] <= 20 else " ⚠️ Высокая концентрация" if info['deployer_pct'] <= 50 else " 🚨 Очень высокая концентрация")
+            + "\n\n"
+            if info.get("deployer_pct") is not None else "\n"
+        ) +
         f"{warn_block}\n\n"
         f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
         f"| Trailing: -{config.TRAILING_STOP_PCT}% от пика  "
@@ -1834,7 +1840,13 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
         f"📄 `{token_address}`\n\n"
         f"💧 Ликвидность: *${info['liquidity_usd']:,.0f}*{fdv_str}\n"
         f"💸 Buy tax: *{info['buy_tax']:.1f}%*  |  Sell tax: *{info['sell_tax']:.1f}%*\n"
-        f"👥 Холдеры: {info['holder_count']}\n\n"
+        f"👥 Холдеры: {info['holder_count']}\n"
+        + (
+            f"🏦 Деплоер держит: *{info['deployer_pct']:.1f}%* суплая"
+            + (" ✅" if info['deployer_pct'] <= 20 else " ⚠️ Высокая концентрация" if info['deployer_pct'] <= 50 else " 🚨 Очень высокая концентрация")
+            + "\n\n"
+            if info.get("deployer_pct") is not None else "\n"
+        ) +
         f"{warn_block}\n\n"
         f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
         f"| Trailing: -{config.TRAILING_STOP_PCT}%  | SL: -{config.STOP_LOSS}%\n"
@@ -2050,7 +2062,13 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
         f"📄 `{token_address}`\n\n"
         f"💧 Ликвидность: *${info['liquidity_usd']:,.0f}*{fdv_str}\n"
         f"💸 Buy tax: *{info['buy_tax']:.1f}%*  |  Sell tax: *{info['sell_tax']:.1f}%*\n"
-        f"👥 Холдеры: {info['holder_count']}\n\n"
+        f"👥 Холдеры: {info['holder_count']}\n"
+        + (
+            f"🏦 Деплоер держит: *{info['deployer_pct']:.1f}%* суплая"
+            + (" ✅" if info['deployer_pct'] <= 20 else " ⚠️ Высокая концентрация" if info['deployer_pct'] <= 50 else " 🚨 Очень высокая концентрация")
+            + "\n\n"
+            if info.get("deployer_pct") is not None else "\n"
+        ) +
         f"{warn_block}\n\n"
         f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
         f"| Trailing: -{config.TRAILING_STOP_PCT}%  | SL: -{config.STOP_LOSS}%\n"
@@ -2269,7 +2287,13 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
         f"📄 `{token_address}`\n\n"
         f"💧 Ликвидность: *${info['liquidity_usd']:,.0f}*{fdv_str}\n"
         f"💸 Buy tax: *{info['buy_tax']:.1f}%*  |  Sell tax: *{info['sell_tax']:.1f}%*\n"
-        f"👥 Холдеры: {info['holder_count']}\n\n"
+        f"👥 Холдеры: {info['holder_count']}\n"
+        + (
+            f"🏦 Деплоер держит: *{info['deployer_pct']:.1f}%* суплая"
+            + (" ✅" if info['deployer_pct'] <= 20 else " ⚠️ Высокая концентрация" if info['deployer_pct'] <= 50 else " 🚨 Очень высокая концентрация")
+            + "\n\n"
+            if info.get("deployer_pct") is not None else "\n"
+        ) +
         f"{warn_block}\n\n"
         f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
         f"| Trailing: -{config.TRAILING_STOP_PCT}%  | SL: -{config.STOP_LOSS}%\n"

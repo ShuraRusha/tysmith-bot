@@ -204,6 +204,21 @@ def _get_token_info_sync(w3: Web3, token_address: str) -> dict:
         return {"name": "Unknown", "symbol": "???", "decimals": 18}
 
 
+def _get_deployer_holdings_sync(w3: Web3, token_address: str, deployer_address: str) -> dict:
+    """Return deployer wallet balance as % of total token supply."""
+    try:
+        token        = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
+        total_supply = token.functions.totalSupply().call()
+        if total_supply == 0:
+            return {"pct": 0.0}
+        deployer_cs  = Web3.to_checksum_address(deployer_address)
+        balance      = token.functions.balanceOf(deployer_cs).call()
+        pct          = balance / total_supply * 100
+        return {"pct": round(pct, 1)}
+    except Exception:
+        return {"pct": None}
+
+
 def _simulate_sell_sync(w3: Web3, token_address: str, pair_address: str,
                         router_address: str = None) -> dict:
     """
@@ -774,6 +789,13 @@ async def analyze_token(
         symbol       = token_meta["symbol"]
         holder_count = "?"
 
+    # ── Deployer holdings (on-chain, non-blocking) ────────────────────────────
+    _deployer_addr = deployer_result.get("deployer")
+    deployer_pct: float | None = None
+    if _deployer_addr:
+        _dh = await asyncio.to_thread(_get_deployer_holdings_sync, w3, token_address, _deployer_addr)
+        deployer_pct = _dh.get("pct")
+
     # ── honeypot.is taxes (works before GoPlus indexes the token) ────────────
     hp_buy_tax  = hp_result.get("buy_tax")   # None if API unavailable
     hp_sell_tax = hp_result.get("sell_tax")
@@ -880,6 +902,7 @@ async def analyze_token(
         "deploy_count_30d":   deployer_result.get("deploy_count_30d"),
         "deployer_ok":        deployer_result["ok"],
         "deployer_reason":    deployer_result.get("reason", ""),
+        "deployer_pct":       deployer_pct,
     }
 
 
@@ -1160,6 +1183,12 @@ async def check_token(
         symbol       = token_meta["symbol"]
         holder_count = "?"
 
+    _dep_addr = deployer_result.get("deployer")
+    deployer_pct: float | None = None
+    if _dep_addr:
+        _dh = await asyncio.to_thread(_get_deployer_holdings_sync, w3, token_address, _dep_addr)
+        deployer_pct = _dh.get("pct")
+
     info = {
         "name":           name,
         "symbol":         symbol,
@@ -1177,7 +1206,8 @@ async def check_token(
         "extra_warnings":    warnings_from_goplus,
         "sim_sell_skipped":  sell_sim.get("skipped", False),
         # Deployer info — used by bot.py to auto-blacklist on honeypot
-        "deployer":          deployer_result.get("deployer"),
+        "deployer":          _dep_addr,
+        "deployer_pct":      deployer_pct,
     }
     return {"ok": True, "info": info}
 
@@ -1295,6 +1325,12 @@ async def check_token_fast(
         symbol       = token_meta["symbol"]
         holder_count = "?"
 
+    _dep_addr_f = deployer_result.get("deployer")
+    deployer_pct_f: float | None = None
+    if _dep_addr_f:
+        _dh_f = await asyncio.to_thread(_get_deployer_holdings_sync, w3, token_address, _dep_addr_f)
+        deployer_pct_f = _dh_f.get("pct")
+
     info = {
         "name":           name,
         "symbol":         symbol,
@@ -1311,7 +1347,8 @@ async def check_token_fast(
         "goplus_ok":      goplus_data is not None,
         "extra_warnings":    warnings_from_goplus,
         "sim_sell_skipped":  sell_sim.get("skipped", False),
-        "deployer":          deployer_result.get("deployer"),
+        "deployer":          _dep_addr_f,
+        "deployer_pct":      deployer_pct_f,
     }
     return {"ok": True, "info": info}
 
