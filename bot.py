@@ -729,6 +729,7 @@ def _record_buy(pos: Position, tx_hash: str, delta_blocks: int = None, buyers_be
         "sell_tax":      pos.sell_tax,
         "tx_hash_buy":   tx_hash,
         "opened_at":     datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M"),
+        "demo":          getattr(pos, "demo", False),
     }
     if delta_blocks is not None:
         entry["delta_blocks"]  = delta_blocks
@@ -1710,6 +1711,7 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
                     moon_bag_tokens   = moon_bag,
                     deployer_address  = info.get("deployer") or "",
                     chain             = "base",
+                    buy_gas_bnb       = buy_result.get("gas_bnb", 0.0),
                     demo              = config.DEMO_MODE,
                 )
                 pos_manager_base.add(pos)
@@ -1899,6 +1901,7 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
                     moon_bag_tokens   = moon_bag,
                     deployer_address  = info.get("deployer") or "",
                     chain             = "bsc",
+                    buy_gas_bnb       = buy_result.get("gas_bnb", 0.0),
                     demo              = config.DEMO_MODE,
                 )
                 pos_manager_biswap.add(pos)
@@ -2091,6 +2094,7 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
                     moon_bag_tokens   = moon_bag,
                     deployer_address  = info.get("deployer") or "",
                     chain             = "base",
+                    buy_gas_bnb       = buy_result.get("gas_bnb", 0.0),
                     demo              = config.DEMO_MODE,
                 )
                 pos_manager_baseswap.add(pos)
@@ -2209,6 +2213,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sell_tax           = token_info["info"]["sell_tax"],
                 moon_bag_tokens    = moon_bag,
                 deployer_address   = token_info["info"].get("deployer") or "",
+                buy_gas_bnb        = result.get("gas_bnb", 0.0),
                 demo               = config.DEMO_MODE,
             )
             pos_manager.add(pos)
