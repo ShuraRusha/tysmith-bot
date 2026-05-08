@@ -2236,6 +2236,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.MARKDOWN,
             )
 
+    # ── DEMO mode toggle buttons ──────────────────────────────────────────────
+    elif data in ("demo_on", "demo_off", "noop", "demostats_show"):
+        if data == "noop":
+            return  # already in that state — button is just a label
+        if data == "demostats_show":
+            # Redirect to demostats — answer and let user use /demostats
+            await query.answer("Используй /demostats для просмотра статистики")
+            return
+        new_demo = (data == "demo_on")
+        async def _edit(text, **kw):
+            await query.edit_message_text(text, **kw)
+        await _apply_demo_mode(new_demo, _edit)
+        return
+
     # ── WRITE-OFF (remove to history without selling) ─────────────────────────
     elif data.startswith("writeoff_"):
         token_address = data[9:]
@@ -2305,7 +2319,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Управление*\n"
         "/auto on|off — авто-режим (покупает сам без подтверждения)\n"
         "/pause — приостановить снайпинг\n"
-        "/resume — возобновить снайпинг\n\n"
+        "/resume — возобновить снайпинг\n"
+        "/demo on|off — переключить режим: 🎭 Demo (бумажная торговля) / 💸 Реальный счёт\n"
+        "/demostats — статистика демо-сделок + honeypot-аналитика\n\n"
         "*Настройки* (изменить без перезапуска)\n"
         "`/set pct 3` — % баланса на сделку (0 = авто-тир)\n"
         "`/set minbuy 0.03` — мин. сумма сделки BNB\n"
@@ -2361,69 +2377,104 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _demo_keyboard():
+    """Inline keyboard for /demo — two toggle buttons."""
+    if config.DEMO_MODE:
+        buttons = [
+            [InlineKeyboardButton("✅ Demo включён", callback_data="noop")],
+            [InlineKeyboardButton("💸 Переключить на реальный счёт", callback_data="demo_off")],
+            [InlineKeyboardButton("📊 Статистика демо", callback_data="demostats_show")],
+        ]
+    else:
+        buttons = [
+            [InlineKeyboardButton("💸 Реальный счёт активен", callback_data="noop")],
+            [InlineKeyboardButton("🎭 Включить Demo режим", callback_data="demo_on")],
+        ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def _demo_text():
+    if config.DEMO_MODE:
+        return (
+            "🎭 *Demo режим включён*\n\n"
+            "Бот торгует бумажными деньгами — реальные транзакции не отправляются.\n"
+            "Цены и P\\&L считаются по реальным данным блокчейна.\n"
+            "При выходе из позиции бот проверит, можно ли токен реально продать (антихоунипот).\n\n"
+            "Статистика: /demostats"
+        )
+    else:
+        return (
+            "💸 *Реальный счёт активен*\n\n"
+            "Бот совершает *настоящие* транзакции на реальные средства.\n"
+            "Для переключения на бумажную торговлю нажми кнопку ниже."
+        )
+
+
 @owner_only
 async def cmd_demo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Toggle demo (paper trading) mode on/off at runtime.
 
     Usage:
-      /demo        — show current status
+      /demo        — show current status with toggle buttons
       /demo on     — enable demo mode (no real transactions)
       /demo off    — disable demo mode, switch to REAL trading
     """
     args = context.args
 
     if not args:
-        mode_str = "🎭 *DEMO режим*" if config.DEMO_MODE else "💸 *РЕАЛЬНЫЙ счёт*"
         await update.message.reply_text(
-            f"{mode_str}\n\n"
-            f"Используй:\n"
-            f"  /demo on — включить демо (бумажная торговля)\n"
-            f"  /demo off — переключиться на *реальные* сделки\n\n"
-            f"Смена режима не затрагивает уже открытые позиции — "
-            f"они закрываются в том режиме, в котором были открыты.",
+            _demo_text(),
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_demo_keyboard(),
         )
         return
 
     action = args[0].lower()
     if action not in ("on", "off"):
-        await update.message.reply_text("Используй: /demo on  или  /demo off")
+        await update.message.reply_text(
+            "Используй: `/demo on`  или  `/demo off`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
-    new_demo = (action == "on")
+    await _apply_demo_mode(action == "on", update.message.reply_text)
 
+
+async def _apply_demo_mode(new_demo: bool, reply_fn):
+    """Switch demo mode and send reply via reply_fn(text, **kwargs)."""
     if new_demo == config.DEMO_MODE:
-        state = "уже включён" if new_demo else "уже выключен"
-        await update.message.reply_text(f"Demo режим {state}.")
+        state = "уже включён 🎭" if new_demo else "уже выключен 💸"
+        await reply_fn(f"Demo режим {state}.", reply_markup=_demo_keyboard())
         return
 
     config.DEMO_MODE = new_demo
     _save_settings()
 
     if new_demo:
-        await update.message.reply_text(
+        await reply_fn(
             "🎭 *Demo режим включён*\n\n"
             "Новые покупки — бумажные (без реальных транзакций).\n"
-            "Цены и P&L рассчитываются по реальным данным.\n"
-            "При выходе из демо-позиции бот проверит, можно ли реально продать токен.\n\n"
+            "Цены и P\\&L рассчитываются по реальным данным блокчейна.\n"
+            "При выходе из демо-позиции бот проверит, можно ли токен реально продать.\n\n"
             "Статистика: /demostats",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_demo_keyboard(),
         )
     else:
-        # Count open demo positions so user knows they're still running
         open_demo = sum(
             1 for pm in [pos_manager, pos_manager_base, pos_manager_biswap, pos_manager_baseswap]
             if pm for p in (pm.get_all() if pm else []) if p.demo
         )
         demo_warn = (
-            f"\n\n⚠️ У тебя {open_demo} открытых demo-позиций — они закроются в демо-режиме."
+            f"\n\n⚠️ У тебя {open_demo} открытых demo\\-позиций — они закроются в демо\\-режиме."
             if open_demo else ""
         )
-        await update.message.reply_text(
-            f"💸 *Реальный режим включён*\n\n"
-            f"Следующие покупки будут совершаться на *реальные средства*!\n"
-            f"Убедись, что баланс и фильтры настроены правильно (/status).{demo_warn}",
+        await reply_fn(
+            f"💸 *Реальный счёт включён*\n\n"
+            f"Следующие покупки будут совершаться на *реальные средства*\\!\n"
+            f"Проверь баланс и фильтры: /status{demo_warn}",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_demo_keyboard(),
         )
 
 
@@ -3997,6 +4048,28 @@ async def main(need_polling_grace: bool = False):
 
     # Drop any webhook that might be set — prevents conflict with polling.
     await app.bot.delete_webhook(drop_pending_updates=True)
+
+    # Register command list so the "/" menu in Telegram shows all commands.
+    from telegram import BotCommand
+    await app.bot.set_my_commands([
+        BotCommand("status",      "Баланс и настройки"),
+        BotCommand("positions",   "Открытые позиции с P&L"),
+        BotCommand("demo",        "🎭 Demo / 💸 Реальный счёт — переключить режим"),
+        BotCommand("auto",        "Авто-режим on/off"),
+        BotCommand("pause",       "Приостановить снайпинг"),
+        BotCommand("resume",      "Возобновить снайпинг"),
+        BotCommand("stats",       "Статистика сделок"),
+        BotCommand("demostats",   "Статистика демо + honeypot-аналитика"),
+        BotCommand("history",     "Последние 10 сделок"),
+        BotCommand("analytics",   "Полная аналитика воронки"),
+        BotCommand("analyze",     "Анализ токена BSC: /analyze 0x..."),
+        BotCommand("analyzebase", "Анализ токена Base: /analyzebase 0x..."),
+        BotCommand("set",         "Изменить настройки: /set tp1 60"),
+        BotCommand("rejects",     "Последние отклонённые токены"),
+        BotCommand("blacklist",   "Чёрный список деплоеров"),
+        BotCommand("debug",       "Диагностика WS и поллинга"),
+        BotCommand("help",        "Все команды"),
+    ])
 
     # If we took the lock from another host, that instance may still be polling
     # Telegram for up to LOCK_REFRESH_SEC seconds. Wait before we start polling
