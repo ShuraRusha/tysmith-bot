@@ -26,7 +26,7 @@ from web3.middleware import geth_poa_middleware
 
 import blacklist
 import config
-from analyzer import analyze_token, check_token, check_token_fast, fetch_security_partial, get_bnb_price, _get_liquidity_usd_sync as _liq_sync, _get_bnb_price_sync as _bnb_price_sync, _simulate_buy_sync
+from analyzer import analyze_token, check_token, check_token_fast, fetch_security_partial, get_bnb_price, _get_liquidity_usd_sync as _liq_sync, _get_bnb_price_sync as _bnb_price_sync, _simulate_buy_sync, _simulate_sell_sync
 from position import (
     Position, PositionManager,
     POSITIONS_FILE_BASE, POSITIONS_FILE_BISWAP, POSITIONS_FILE_BASESWAP,
@@ -959,6 +959,31 @@ def _simulate_buy_sync_for_wait(w3_instance, token_address: str) -> bool:
     return result["ok"]
 
 
+async def _pre_buy_sell_check(w3_instance, token_address: str, pair_address: str, symbol: str) -> bool:
+    """
+    Re-run sell simulation immediately before executing a buy.
+
+    The initial check in analyze_token() may have seen pair_balance==0 (brand-new
+    pair, no liquidity yet) and returned ok to avoid false rejections.  By the time
+    we reach the actual buy the pair has liquidity, so the simulation can now catch
+    honeypots that slipped through earlier.
+
+    Returns True if the buy should proceed, False if it should be cancelled.
+    """
+    sim = await asyncio.to_thread(_simulate_sell_sync, w3_instance, token_address, pair_address)
+    if not sim.get("ok"):
+        reason = sim.get("reason", "Симуляция продажи не прошла")
+        log.warning(f"Pre-buy sell sim FAILED for {symbol}: {reason} — buy cancelled")
+        await tg_send(
+            f"🚫 *{symbol}* — honeypot обнаружен прямо перед покупкой!\n\n"
+            f"_{reason}_\n\n"
+            f"Покупка отменена. Токен заблокирован."
+        )
+        blacklist.add(token_address, reason=f"Honeypot pre-buy sim: {symbol}")
+        return False
+    return True
+
+
 async def _wait_for_liquidity_and_retry(
     token_address: str,
     base_token: str,
@@ -1405,6 +1430,9 @@ async def _on_pair_found_inner(
                 )
                 return
 
+            if not await _pre_buy_sell_check(w3, token_address, pair_address, info["symbol"]):
+                return
+
             result = await asyncio.to_thread(trader.buy, token_address, buy_amount)
 
             if result["ok"]:
@@ -1650,6 +1678,9 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
                 )
                 return
 
+            if not await _pre_buy_sell_check(w3_base, token_address, pair_address, info["symbol"]):
+                return
+
             buy_result = await asyncio.to_thread(trader_base.buy, token_address, buy_amount)
 
             if buy_result["ok"]:
@@ -1833,6 +1864,9 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
                     f"❌ [BiSwap] Авто: не удалось одобрить *{info['symbol']}*\n"
                     f"`{approve_result['reason']}`"
                 )
+                return
+
+            if not await _pre_buy_sell_check(w3, token_address, pair_address, info["symbol"]):
                 return
 
             buy_result = await asyncio.to_thread(trader_biswap.buy, token_address, buy_amount)
@@ -2021,6 +2055,9 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
                     f"❌ [BaseSwap] Авто: не удалось одобрить *{info['symbol']}*\n"
                     f"`{approve_result['reason']}`"
                 )
+                return
+
+            if not await _pre_buy_sell_check(w3_base, token_address, pair_address, info["symbol"]):
                 return
 
             buy_result = await asyncio.to_thread(trader_baseswap.buy, token_address, buy_amount)
