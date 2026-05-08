@@ -1368,6 +1368,18 @@ async def _on_pair_found_inner(
     if info["hidden_owner"]:  warnings.append("⚠️ Hidden owner")
     if info["is_proxy"]:      warnings.append("⚠️ Proxy контракт")
     if info["external_call"]: warnings.append("⚠️ External call в коде")
+
+    # Warn if no one has traded yet — first buyer = highest dump risk
+    try:
+        _cur_block = await asyncio.to_thread(lambda: w3.eth.block_number)
+        _recent_swaps = await _count_prior_buyers(pair_address, max(1, _cur_block - 100), _cur_block)
+        if _recent_swaps == 0:
+            warnings.append("🚨 Покупок ещё не было — ты первый! Риск дампа максимальный")
+        elif _recent_swaps <= 3:
+            warnings.append(f"⚠️ Всего {_recent_swaps} покупок до тебя — токен очень новый")
+    except Exception:
+        pass
+
     warn_block = "\n".join(warnings) if warnings else "✅ Дополнительных угроз нет"
 
     fdv_str = f" | FDV: ${info['fdv_usd']:,.0f}" if info.get("fdv_usd") else ""
@@ -2178,6 +2190,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
+
+        # Re-run sell simulation before buying — initial check may have run when
+        # pair had no liquidity yet (pair_balance==0 → returned ok prematurely)
+        pair_address_cb = token_info.get("pair_address", "")
+        if pair_address_cb:
+            sim = await asyncio.to_thread(
+                _simulate_sell_sync, w3, token_address, pair_address_cb
+            )
+            if not sim.get("ok"):
+                sim_reason = sim.get("reason", "Симуляция продажи не прошла")
+                await query.edit_message_text(
+                    f"🚫 *{sym}* — honeypot обнаружен перед покупкой!\n\n"
+                    f"_{sim_reason}_\n\n"
+                    f"Покупка отменена.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                blacklist.add(token_address, reason=f"Honeypot pre-buy sim: {sym}")
+                return
 
         price_before = await asyncio.to_thread(
             trader.get_price, token_address, token_info["base_token"]
