@@ -384,7 +384,7 @@ def _is_token_duplicate(token_address: str, dex_label: str = "") -> bool:
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 23
+SETTINGS_VERSION = 24
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -399,6 +399,8 @@ _PERSISTENT_SETTINGS = [
     "LP_HOLDER_MAX_PCT", "MIN_HOLDER_COUNT",
     # Added in v7:
     "MAX_DEPLOYER_TOKENS_30D",
+    # Added in v24:
+    "DEMO_MODE",
 ]
 
 
@@ -2360,6 +2362,72 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
+async def cmd_demo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle demo (paper trading) mode on/off at runtime.
+
+    Usage:
+      /demo        — show current status
+      /demo on     — enable demo mode (no real transactions)
+      /demo off    — disable demo mode, switch to REAL trading
+    """
+    args = context.args
+
+    if not args:
+        mode_str = "🎭 *DEMO режим*" if config.DEMO_MODE else "💸 *РЕАЛЬНЫЙ счёт*"
+        await update.message.reply_text(
+            f"{mode_str}\n\n"
+            f"Используй:\n"
+            f"  /demo on — включить демо (бумажная торговля)\n"
+            f"  /demo off — переключиться на *реальные* сделки\n\n"
+            f"Смена режима не затрагивает уже открытые позиции — "
+            f"они закрываются в том режиме, в котором были открыты.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    action = args[0].lower()
+    if action not in ("on", "off"):
+        await update.message.reply_text("Используй: /demo on  или  /demo off")
+        return
+
+    new_demo = (action == "on")
+
+    if new_demo == config.DEMO_MODE:
+        state = "уже включён" if new_demo else "уже выключен"
+        await update.message.reply_text(f"Demo режим {state}.")
+        return
+
+    config.DEMO_MODE = new_demo
+    _save_settings()
+
+    if new_demo:
+        await update.message.reply_text(
+            "🎭 *Demo режим включён*\n\n"
+            "Новые покупки — бумажные (без реальных транзакций).\n"
+            "Цены и P&L рассчитываются по реальным данным.\n"
+            "При выходе из демо-позиции бот проверит, можно ли реально продать токен.\n\n"
+            "Статистика: /demostats",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        # Count open demo positions so user knows they're still running
+        open_demo = sum(
+            1 for pm in [pos_manager, pos_manager_base, pos_manager_biswap, pos_manager_baseswap]
+            if pm for p in (pm.get_all() if pm else []) if p.demo
+        )
+        demo_warn = (
+            f"\n\n⚠️ У тебя {open_demo} открытых demo-позиций — они закроются в демо-режиме."
+            if open_demo else ""
+        )
+        await update.message.reply_text(
+            f"💸 *Реальный режим включён*\n\n"
+            f"Следующие покупки будут совершаться на *реальные средства*!\n"
+            f"Убедись, что баланс и фильтры настроены правильно (/status).{demo_warn}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+@owner_only
 async def cmd_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global is_auto
     args = context.args
@@ -2708,7 +2776,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     buy_amount = calculate_buy_amount(balance)
     auto_icon   = "⚡ авто" if is_auto else "👆 ручной"
-    status_icon = "⏸ ПАУЗА" if is_paused else f"▶️ активен | {auto_icon}"
+    demo_badge  = " | 🎭 DEMO" if config.DEMO_MODE else ""
+    status_icon = "⏸ ПАУЗА" if is_paused else f"▶️ активен | {auto_icon}{demo_badge}"
 
     if config.BUY_PCT_OF_BALANCE > 0:
         size_mode = f"{config.BUY_PCT_OF_BALANCE}% (ручной)"
@@ -3946,6 +4015,7 @@ async def main(need_polling_grace: bool = False):
     app.add_handler(CommandHandler("auto",      cmd_auto))
     app.add_handler(CommandHandler("pause",     cmd_pause))
     app.add_handler(CommandHandler("resume",    cmd_resume))
+    app.add_handler(CommandHandler("demo",      cmd_demo))
     app.add_handler(CommandHandler("stats",     cmd_stats))
     app.add_handler(CommandHandler("demostats", cmd_demostats))
     app.add_handler(CommandHandler("history",   cmd_history))
