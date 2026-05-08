@@ -1487,7 +1487,8 @@ async def _on_pair_found_inner(
                     buyers_txt = f" | Покупок до нас: {buyers_before}" if buyers_before >= 0 else ""
                     speed_str = f"\n📊 Блоков от листинга: +{delta_blocks}{buyers_txt}"
                 await tg_send(
-                    f"✅ *Куплено авто* — {info['symbol']}\n\n"
+                    f"✅ *Куплено авто* — {info['symbol']}\n"
+                    f"`{token_address}`\n\n"
                     f"Получено: {amount_fmt:.4f} {info['symbol']}\n"
                     f"Цена входа: {entry_price:.8f} BNB\n"
                     f"Tx: `{result['tx_hash']}`"
@@ -1715,7 +1716,8 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
                 _record_buy(pos, buy_result["tx_hash"])
                 amount_fmt = buy_result["tokens_received"] / 10 ** buy_result["decimals"]
                 await tg_send(
-                    f"🔵✅ *[Base] Куплено авто* — {info['symbol']}\n\n"
+                    f"🔵✅ *[Base] Куплено авто* — {info['symbol']}\n"
+                    f"`{token_address}`\n\n"
                     f"Получено: {amount_fmt:.4f} {info['symbol']}\n"
                     f"Цена входа: {entry_price:.8f} ETH\n"
                     f"Tx: `{buy_result['tx_hash']}`\n\n"
@@ -1903,7 +1905,8 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
                 _record_buy(pos, buy_result["tx_hash"])
                 amount_fmt = buy_result["tokens_received"] / 10 ** buy_result["decimals"]
                 await tg_send(
-                    f"🟠✅ *[BiSwap] Куплено авто* — {info['symbol']}\n\n"
+                    f"🟠✅ *[BiSwap] Куплено авто* — {info['symbol']}\n"
+                    f"`{token_address}`\n\n"
                     f"Получено: {amount_fmt:.4f} {info['symbol']}\n"
                     f"Цена входа: {entry_price:.8f} BNB\n"
                     f"Tx: `{buy_result['tx_hash']}`\n\n"
@@ -2094,7 +2097,8 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
                 _record_buy(pos, buy_result["tx_hash"])
                 amount_fmt = buy_result["tokens_received"] / 10 ** buy_result["decimals"]
                 await tg_send(
-                    f"🔷✅ *[BaseSwap] Куплено авто* — {info['symbol']}\n\n"
+                    f"🔷✅ *[BaseSwap] Куплено авто* — {info['symbol']}\n"
+                    f"`{token_address}`\n\n"
                     f"Получено: {amount_fmt:.4f} {info['symbol']}\n"
                     f"Цена входа: {entry_price:.8f} ETH\n"
                     f"Tx: `{buy_result['tx_hash']}`\n\n"
@@ -2216,7 +2220,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"({config.MOON_BAG_PCT:.0f}%) — не продаётся авто"
             ) if moon_bag > 0 else ""
             await query.edit_message_text(
-                f"✅ *Куплено!* — {sym}\n\n"
+                f"✅ *Куплено!* — {sym}\n"
+                f"`{token_address}`\n\n"
                 f"Получено: {amount_fmt:.4f} {sym}\n"
                 f"Цена входа: {entry_price:.8f} BNB\n"
                 f"Tx: `{result['tx_hash']}`\n\n"
