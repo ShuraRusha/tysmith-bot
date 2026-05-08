@@ -3420,6 +3420,23 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
         await wait_msg.edit_text(f"❌ {data['reason']}")
         return
 
+    # ── Buyer collusion check ──────────────────────────────────────────────────
+    _analyze_collusion = {"suspicious": False}
+    if data.get("pair_address"):
+        try:
+            _w3_a = w3_base if is_base else w3
+            _cur_blk = await asyncio.to_thread(lambda: _w3_a.eth.block_number)
+            _analyze_collusion = await _check_buyer_collusion(
+                data["pair_address"], _w3_a,
+                from_block       = max(1, _cur_blk - 500),
+                to_block         = _cur_blk,
+                deployer_address = data.get("deployer"),
+                bscscan_api_key  = config.BASESCAN_API_KEY if is_base else config.BSCSCAN_API_KEY,
+                explorer_url     = "https://api.basescan.org/api" if is_base else "",
+            )
+        except Exception as _ce:
+            log.debug(f"Collusion check error in /analyze: {_ce}")
+
     # ── Format report ──────────────────────────────────────────────────────────
     sym  = data["symbol"]
     name = data["name"]
@@ -3499,9 +3516,12 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
     else:
         flags_block = "✅ Критических флагов нет"
 
-    # Warnings block
-    if data["warnings"]:
-        warn_block = "\n".join(f"⚠️ {w}" for w in data["warnings"])
+    # Warnings block (include collusion warning if detected)
+    _all_warnings = list(data["warnings"])
+    if _analyze_collusion.get("suspicious"):
+        _all_warnings.append(_analyze_collusion["label"])
+    if _all_warnings:
+        warn_block = "\n".join(f"⚠️ {w}" for w in _all_warnings)
     else:
         warn_block = "✅ Предупреждений нет"
 
@@ -3541,6 +3561,8 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
         caution_flags.append("LP-холдеры не проиндексированы")
     if not data["goplus_ok"]:
         caution_flags.append("GoPlus недоступен")
+    if _analyze_collusion.get("suspicious"):
+        caution_flags.append(_analyze_collusion["label"])
 
     if red_flags:
         rec_icon = "🔴"
