@@ -775,40 +775,45 @@ def _record_trade(pos: Position, pnl_pct: float, reason: str, sell_price: float 
     hold_min = hold_sec // 60
     hold_str = f"{hold_min}м {hold_sec % 60}с" if hold_min < 60 else f"{hold_min // 60}ч {hold_min % 60}м"
 
+    is_honeypot_exit = reason == "Demo Honeypot"
+
     # Try to find and update existing open entry for this token
     for entry in reversed(trade_history):
         if entry.get("status") == "open" and entry.get("token_address") == pos.token_address:
             entry.update({
-                "status":         "closed",
-                "sell_price_bnb": sell_price,
-                "pnl_pct":        round(pnl_pct, 2),
-                "pnl_bnb":        pnl_bnb,
-                "reason":         reason,
-                "hold_sec":       hold_sec,
-                "hold_str":       hold_str,
-                "closed_at":      datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M"),
-                "demo":           getattr(pos, "demo", False),
+                "status":            "closed",
+                "sell_price_bnb":    sell_price,
+                "pnl_pct":           round(pnl_pct, 2),
+                "pnl_bnb":           pnl_bnb,
+                "reason":            reason,
+                "hold_sec":          hold_sec,
+                "hold_str":          hold_str,
+                "closed_at":         datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M"),
+                "demo":              getattr(pos, "demo", False),
+                "honeypot_at_exit":  is_honeypot_exit,
             })
             _save_history()
             return
 
     # Fallback: no open entry found (e.g. position restored from disk before fix)
     trade_history.append({
-        "status":         "closed",
-        "symbol":         pos.symbol,
-        "token_address":  pos.token_address,
-        "buy_price_bnb":  pos.buy_price_bnb,
-        "sell_price_bnb": sell_price,
-        "buy_bnb":        pos.buy_bnb,
-        "pnl_pct":        round(pnl_pct, 2),
-        "pnl_bnb":        pnl_bnb,
-        "reason":         reason,
-        "hold_sec":       hold_sec,
-        "hold_str":       hold_str,
-        "liquidity_usd":  pos.liquidity_usd,
-        "buy_tax":        pos.buy_tax,
-        "sell_tax":       pos.sell_tax,
-        "closed_at":      datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M"),
+        "status":            "closed",
+        "symbol":            pos.symbol,
+        "token_address":     pos.token_address,
+        "buy_price_bnb":     pos.buy_price_bnb,
+        "sell_price_bnb":    sell_price,
+        "buy_bnb":           pos.buy_bnb,
+        "pnl_pct":           round(pnl_pct, 2),
+        "pnl_bnb":           pnl_bnb,
+        "reason":            reason,
+        "hold_sec":          hold_sec,
+        "hold_str":          hold_str,
+        "liquidity_usd":     pos.liquidity_usd,
+        "buy_tax":           pos.buy_tax,
+        "sell_tax":          pos.sell_tax,
+        "closed_at":         datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M"),
+        "demo":              getattr(pos, "demo", False),
+        "honeypot_at_exit":  is_honeypot_exit,
     })
     _save_history()
 
@@ -3237,31 +3242,75 @@ async def cmd_demostats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     bnb_price = await get_bnb_price(w3)
+
+    # ── Honeypot split ────────────────────────────────────────────────────────
+    honeypots   = [t for t in demo_trades if t.get("honeypot_at_exit") or t.get("reason") in ("Demo Honeypot", "Honeypot")]
+    real_trades = [t for t in demo_trades if t not in honeypots]
+
+    # ── Overall stats ─────────────────────────────────────────────────────────
     wins      = [t for t in demo_trades if t.get("pnl_pct", 0) > 0]
-    losses    = [t for t in demo_trades if t.get("pnl_pct", 0) <= 0]
     avg_pnl   = sum(t.get("pnl_pct", 0) for t in demo_trades) / len(demo_trades)
-    best      = max(demo_trades, key=lambda t: t.get("pnl_pct", 0))
-    worst     = min(demo_trades, key=lambda t: t.get("pnl_pct", 0))
     total_inv = sum(t.get("buy_bnb", 0) for t in demo_trades)
     total_pnl = sum(t.get("pnl_bnb", 0) for t in demo_trades)
 
+    # ── Stats excluding honeypots ─────────────────────────────────────────────
+    real_wins = [t for t in real_trades if t.get("pnl_pct", 0) > 0]
+    real_avg  = (sum(t.get("pnl_pct", 0) for t in real_trades) / len(real_trades)) if real_trades else 0.0
+    real_pnl  = sum(t.get("pnl_bnb", 0) for t in real_trades)
+
+    # ── Exit reason breakdown ─────────────────────────────────────────────────
+    reason_counts: dict[str, int] = {}
+    for t in demo_trades:
+        r = t.get("reason", "Unknown")
+        reason_counts[r] = reason_counts.get(r, 0) + 1
+
+    reason_lines = "\n".join(
+        f"  • {r}: {c}"
+        for r, c in sorted(reason_counts.items(), key=lambda x: -x[1])
+    )
+
+    # ── Top 3 best/worst ──────────────────────────────────────────────────────
+    sorted_by_pnl = sorted(demo_trades, key=lambda t: t.get("pnl_pct", 0), reverse=True)
+    best3  = sorted_by_pnl[:3]
+    worst3 = sorted_by_pnl[-3:][::-1]
+
+    best_lines  = "\n".join(f"  +{t.get('pnl_pct',0):.1f}% {t.get('symbol','?')} ({t.get('reason','?')})" for t in best3)
+    worst_lines = "\n".join(f"  {t.get('pnl_pct',0):+.1f}% {t.get('symbol','?')} ({t.get('reason','?')})" for t in worst3)
+
+    # ── Honeypot pass rate ─────────────────────────────────────────────────────
+    hp_count  = len(honeypots)
+    hp_rate   = hp_count / len(demo_trades) * 100 if demo_trades else 0.0
+    hp_note   = (
+        f"⚠️ *{hp_count} из {len(demo_trades)} ({hp_rate:.0f}%) токенов — honeypot*\n"
+        f"Они прошли фильтры при входе, но продать их было бы невозможно!\n"
+        if hp_count else "✅ Honeypot-токенов не обнаружено при выходе"
+    )
+
+    # ── Open demo positions ───────────────────────────────────────────────────
     open_demo = sum(
         1 for pm in [pos_manager, pos_manager_base, pos_manager_biswap, pos_manager_baseswap]
         if pm for p in (pm.get_all() if pm else []) if p.demo
     )
     open_line = f"\nОткрытых demo позиций: *{open_demo}*" if open_demo else ""
 
+    winrate_all  = len(wins) / len(demo_trades) * 100
+    winrate_real = (len(real_wins) / len(real_trades) * 100) if real_trades else 0.0
+
     await update.message.reply_text(
-        f"🎭 *Demo статистика*\n\n"
-        f"Всего сделок: *{len(demo_trades)}*\n"
-        f"Прибыльных: *{len(wins)}* | Убыточных: *{len(losses)}*\n"
-        f"Winrate: *{len(wins)/len(demo_trades)*100:.0f}%*\n\n"
+        f"🎭 *Demo аналитика*\n\n"
+        f"Всего сделок: *{len(demo_trades)}* | Открытых: {open_demo}\n"
+        f"Winrate (все): *{winrate_all:.0f}%* ({len(wins)}/{len(demo_trades)})\n"
         f"Средний P&L: *{avg_pnl:+.1f}%*\n"
-        f"Лучшая: *+{best.get('pnl_pct',0):.1f}%* ({best.get('symbol','?')})\n"
-        f"Худшая: *{worst.get('pnl_pct',0):+.1f}%* ({worst.get('symbol','?')})\n\n"
-        f"Вложено виртуально: *{total_inv:.3f} BNB*\n"
-        f"P&L: *{total_pnl:+.4f} BNB* (~${total_pnl * bnb_price:+.0f})"
-        f"{open_line}\n\n"
+        f"Вложено: *{total_inv:.3f} BNB* | P&L: *{total_pnl:+.4f} BNB* (~${total_pnl * bnb_price:+.0f})\n\n"
+        f"📊 *Без honeypot-токенов ({len(real_trades)} сделок):*\n"
+        f"Winrate: *{winrate_real:.0f}%* ({len(real_wins)}/{len(real_trades)})\n"
+        f"Средний P&L: *{real_avg:+.1f}%*\n"
+        f"P&L: *{real_pnl:+.4f} BNB*\n\n"
+        f"🚫 *Honeypot-статистика:*\n"
+        f"{hp_note}\n\n"
+        f"📋 *Причины выхода:*\n{reason_lines}\n\n"
+        f"🏆 *Топ-3 прибыльных:*\n{best_lines}\n\n"
+        f"💀 *Топ-3 убыточных:*\n{worst_lines}\n\n"
         f"/demostats reset — сбросить статистику",
         parse_mode=ParseMode.MARKDOWN,
     )

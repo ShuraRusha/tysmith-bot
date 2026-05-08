@@ -6,6 +6,7 @@ import time
 from dataclasses import asdict, dataclass, field
 
 import config
+from analyzer import _simulate_sell_sync
 
 log = logging.getLogger(__name__)
 
@@ -210,6 +211,27 @@ class PositionManager:
 
     async def _close_full(self, pos: Position, pnl_pct: float, reason: str, sell_price: float = 0.0):
         """Sell all remaining tokens."""
+        # In demo mode: simulate sell to detect honeypots that passed the entry check
+        if pos.demo and pos.pair_address:
+            sim = await asyncio.to_thread(
+                _simulate_sell_sync,
+                self.trader.w3, pos.token_address, pos.pair_address,
+            )
+            if not sim.get("ok"):
+                sim_reason = sim.get("reason", "Симуляция продажи не прошла")
+                log.warning(f"[DEMO] {pos.symbol} honeypot detected at exit: {sim_reason}")
+                await self.notify(
+                    f"🚫 *[DEMO] {pos.symbol}* — honeypot обнаружен при выходе!\n\n"
+                    f"Симуляция продажи провалилась: _{sim_reason}_\n"
+                    f"P&L по цене: {pnl_pct:+.1f}% — *НЕ реализуем*\n"
+                    f"Реальный результат был бы: *-100%*\n\n"
+                    f"Адрес: `{pos.token_address}`"
+                )
+                if self.on_close:
+                    self.on_close(pos, -100.0, "Demo Honeypot", sell_price)
+                self.remove(pos.token_address)
+                return
+
         result = await asyncio.to_thread(
             self.trader.sell_escalating, pos.token_address, pos.tokens_amount
         )
@@ -226,8 +248,9 @@ class PositionManager:
             }
             label = labels.get(reason, f"✅ {reason}")
             gas_str = f"\n⛽ Газ: -{total_gas_bnb:.4f} BNB ({gas_pct:.1f}%)" if total_gas_bnb > 0 else ""
+            demo_tag = " `[DEMO]`" if pos.demo else ""
             await self.notify(
-                f"{label} — *{pos.symbol}*\n"
+                f"{label}{demo_tag} — *{pos.symbol}*\n"
                 f"P&L (до газа): {pnl_pct:+.1f}%{gas_str}\n"
                 f"P&L (чистый): *{net_pnl_pct:+.1f}%*\n"
                 f"Потрачено: {pos.buy_bnb} BNB\n"
