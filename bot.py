@@ -2279,7 +2279,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status — баланс кошелька и текущие настройки\n"
         "/positions — открытые позиции с P&L\n\n"
         "*Анализ токенов*\n"
-        "/analyze 0x... — полный анализ токена по адресу\n"
+        "/analyze 0x... — полный анализ токена (BSC/PancakeSwap)\n"
+        "/analyzebase 0x... — полный анализ токена (Base/Uniswap V2)\n"
         "_(или просто пришли адрес контракта — бот проанализирует автоматически)_\n\n"
         "*Чёрный список деплоеров*\n"
         "/blacklist — список заблокированных деплоеров\n"
@@ -2830,6 +2831,22 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
+async def cmd_analyzebase(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Analyze a Base chain token. Usage: /analyzebase 0x..."""
+    if not config.BASE_CHAIN_ENABLED or w3_base is None:
+        await update.message.reply_text("❌ Base chain не включён (BASE_CHAIN_ENABLED=false).")
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "❌ Укажи адрес токена:\n`/analyzebase 0x...`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    await _do_analyze(update, args[0].strip(), chain="base")
+
+
+@owner_only
 async def handle_address_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle plain token address messages (0x... 42 chars) as analyze requests."""
     text = (update.message.text or "").strip()
@@ -2837,23 +2854,51 @@ async def handle_address_message(update: Update, context: ContextTypes.DEFAULT_T
         await _do_analyze(update, text)
 
 
-async def _do_analyze(update, raw_address: str):
-    """Core analyze logic shared between command and message handler."""
+async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
+    """Core analyze logic shared between /analyze (BSC) and /analyzebase (Base)."""
     if not Web3.is_address(raw_address):
         await update.message.reply_text("❌ Некорректный адрес токена.")
         return
 
     token_address = Web3.to_checksum_address(raw_address)
+    is_base = chain == "base"
+
     api_sources = "GoPlus + Honeypot.is + DexScreener + on-chain"
-    if config.BSCSCAN_API_KEY:
-        api_sources += " + BSCScan деплоер"
+    if is_base:
+        if config.BASESCAN_API_KEY:
+            api_sources += " + Basescan деплоер"
+        chain_label = "Base"
+    else:
+        if config.BSCSCAN_API_KEY:
+            api_sources += " + BSCScan деплоер"
+        chain_label = "BSC"
+
     wait_msg = await update.message.reply_text(
-        f"🔍 *Анализирую токен...*\n_({api_sources})_",
+        f"🔍 *Анализирую токен ({chain_label})...*\n_({api_sources})_",
         parse_mode=ParseMode.MARKDOWN,
     )
 
     try:
-        data = await analyze_token(token_address, w3, trader.wallet, bscscan_api_key=config.BSCSCAN_API_KEY)
+        if is_base:
+            data = await analyze_token(
+                token_address,
+                w3_base,
+                trader_base.wallet,
+                bscscan_api_key=config.BASESCAN_API_KEY,
+                chain_id=config.BASE_CHAIN_ID,
+                router_address=config.UNISWAP_V2_ROUTER_BASE,
+                factory_address=config.UNISWAP_V2_FACTORY_BASE,
+                native_token=config.WETH_BASE,
+                stable_token=config.USDC_BASE,
+                base_tokens=list(config.BASE_TOKENS_BASE),
+                dex_chain="base",
+                explorer_url="https://basescan.org",
+            )
+        else:
+            data = await analyze_token(
+                token_address, w3, trader.wallet,
+                bscscan_api_key=config.BSCSCAN_API_KEY,
+            )
     except Exception as e:
         log.error(f"analyze_token error: {e}")
         await wait_msg.edit_text(f"❌ Ошибка анализа: {e}")
@@ -2991,13 +3036,24 @@ async def _do_analyze(update, raw_address: str):
         rec_text = "ПРОШЁЛ ВСЕ ФИЛЬТРЫ"
         rec_detail = "Токен соответствует всем условиям покупки"
 
-    base_sym = "BNB" if data["base_token"].lower() == config.WBNB.lower() else (
-        "BUSD" if data["base_token"].lower() == config.BUSD.lower() else "USDT"
-    )
+    if is_base:
+        bt = data["base_token"].lower()
+        base_sym = "ETH" if bt == config.WETH_BASE.lower() else "USDC"
+        dex_name  = "Uniswap V2 (Base)"
+        explorer  = "https://basescan.org/token"
+    else:
+        bt = data["base_token"].lower()
+        base_sym = "BNB" if bt == config.WBNB.lower() else (
+            "BUSD" if bt == config.BUSD.lower() else "USDT"
+        )
+        dex_name  = "PancakeSwap V2"
+        explorer  = "https://bscscan.com/token"
 
     # Deployer block
     deployer_addr = data.get("deployer")
     deploy_count  = data.get("deploy_count_30d")
+    explorer_name = "Basescan" if is_base else "BSCScan"
+    explorer_key  = config.BASESCAN_API_KEY if is_base else config.BSCSCAN_API_KEY
     if deployer_addr:
         deployer_short = deployer_addr[:6] + "…" + deployer_addr[-4:]
         if deploy_count is not None:
@@ -3008,16 +3064,17 @@ async def _do_analyze(update, raw_address: str):
             )
         else:
             deployer_line = f"✅ Деплоер: `{deployer_short}`"
-    elif config.BSCSCAN_API_KEY:
-        deployer_line = "❓ Деплоер: не найден в BSCScan"
+    elif explorer_key:
+        deployer_line = f"❓ Деплоер: не найден в {explorer_name}"
     else:
-        deployer_line = "➖ Деплоер: BSCScan API ключ не задан"
+        deployer_line = f"➖ Деплоер: {explorer_name} API ключ не задан"
 
+    chain_badge = "🔵 Base" if is_base else "🟡 BSC"
     text = (
-        f"🔍 *Анализ токена*\n\n"
+        f"🔍 *Анализ токена* {chain_badge}\n\n"
         f"🪙 *{name}* (`{sym}`)\n"
         f"📄 `{token_address}`\n"
-        f"🔗 Пара: {base_sym}/PancakeSwap V2\n\n"
+        f"🔗 Пара: {base_sym}/{dex_name}\n\n"
         f"*📊 Метрики:*\n"
         f"{liq_icon} Ликвидность: *{liq_str}* (мин ${config.MIN_LIQUIDITY_USD:,.0f})\n"
         f"{fdv_icon} FDV: *{fdv_str}* (${config.MIN_FDV_USD/1000:.0f}k–${config.MAX_FDV_USD/1000000:.0f}М)\n"
@@ -3844,7 +3901,8 @@ async def main(need_polling_grace: bool = False):
     app.add_handler(CommandHandler("demostats", cmd_demostats))
     app.add_handler(CommandHandler("history",   cmd_history))
     app.add_handler(CommandHandler("set",       cmd_set))
-    app.add_handler(CommandHandler("analyze",   cmd_analyze))
+    app.add_handler(CommandHandler("analyze",     cmd_analyze))
+    app.add_handler(CommandHandler("analyzebase", cmd_analyzebase))
     app.add_handler(CommandHandler("rejects",   cmd_rejects))
     app.add_handler(CommandHandler("debug",     cmd_debug))
     app.add_handler(CommandHandler("analytics", cmd_analytics))
