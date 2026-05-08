@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import logging
 import time
 
@@ -598,6 +599,133 @@ async def _check_deployer_bscscan(
     except Exception as e:
         log.warning(f"BSCScan deployer check error: {e}")
         return {"ok": True, "deployer": None}
+
+
+_SWAP_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
+
+COLLUSION_CHECK_TIMEOUT = 3.0   # per BSCScan call for funding check
+
+
+async def _check_buyer_collusion(
+    pair_address:     str,
+    w3:               Web3,
+    from_block:       int,
+    to_block:         int,
+    deployer_address: str | None = None,
+    bscscan_api_key:  str = "",
+    explorer_url:     str = "",
+    max_check:        int = 10,
+) -> dict:
+    """
+    Detect coordinated buyers (wash trading / rug setup) on a freshly listed pair.
+
+    Checks (in order, fail-fast):
+      1. Any single wallet made 3+ buys, or ≥60% of buys → wash trading
+      2. Deployer wallet is among the buyers → self-trading
+      3. BSCScan: ≥50% of unique buyers' first BNB came from the deployer → funded ring
+
+    Returns:
+      {"suspicious": False}
+      {"suspicious": True, "label": "🚨 ...", "reason": "wash_trading|deployer_buying|funded_ring"}
+    """
+    try:
+        logs = await asyncio.to_thread(
+            w3.eth.get_logs,
+            {
+                "address":   Web3.to_checksum_address(pair_address),
+                "topics":    [_SWAP_TOPIC],
+                "fromBlock": from_block,
+                "toBlock":   to_block,
+            },
+        )
+    except Exception as e:
+        log.debug(f"[Collusion] get_logs error: {e}")
+        return {"suspicious": False}
+
+    if not logs:
+        return {"suspicious": False}
+
+    tx_hashes = [log["transactionHash"].hex() for log in logs[:max_check]]
+
+    async def _get_sender(tx_hash: str) -> str | None:
+        try:
+            tx = await asyncio.to_thread(w3.eth.get_transaction, tx_hash)
+            return tx["from"].lower() if tx else None
+        except Exception:
+            return None
+
+    senders_raw = await asyncio.gather(*[_get_sender(h) for h in tx_hashes])
+    senders = [s for s in senders_raw if s]
+    if not senders:
+        return {"suspicious": False}
+
+    # ── Check 1: duplicate senders ───────────────────────────────────────────
+    counts = collections.Counter(senders)
+    top_addr, top_count = counts.most_common(1)[0]
+    if top_count >= 3 or (len(senders) >= 3 and top_count / len(senders) >= 0.6):
+        short = top_addr[:6] + "…" + top_addr[-4:]
+        return {
+            "suspicious": True,
+            "reason":     "wash_trading",
+            "label":      f"🚨 Wash trading: один кошелёк купил {top_count}/{len(senders)} раз ({short})",
+        }
+
+    # ── Check 2: deployer is buying their own token ──────────────────────────
+    if deployer_address:
+        dep = deployer_address.lower()
+        dep_count = senders.count(dep)
+        if dep_count >= 1:
+            short_dep = dep[:6] + "…" + dep[-4:]
+            return {
+                "suspicious": True,
+                "reason":     "deployer_buying",
+                "label":      f"🚨 Деплоер сам покупает токен ({dep_count}x) — вероятный wash trade ({short_dep})",
+            }
+
+    # ── Check 3: BSCScan — buyers funded by deployer ─────────────────────────
+    if bscscan_api_key and deployer_address:
+        api_url   = explorer_url or BSCSCAN_API_URL
+        dep_lower = deployer_address.lower()
+        unique_buyers = list(dict.fromkeys(senders))[:5]   # preserve order, deduplicate
+
+        async def _funded_by_deployer(addr: str) -> bool:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        api_url,
+                        params={
+                            "module":  "account",
+                            "action":  "txlist",
+                            "address": addr,
+                            "sort":    "asc",
+                            "page":    "1",
+                            "offset":  "5",
+                            "apikey":  bscscan_api_key,
+                        },
+                        timeout=aiohttp.ClientTimeout(total=COLLUSION_CHECK_TIMEOUT),
+                    ) as resp:
+                        data = await resp.json(content_type=None)
+                        for tx in data.get("result") or []:
+                            if (tx.get("from", "").lower() == dep_lower
+                                    and int(tx.get("value", "0")) > 0):
+                                return True
+                return False
+            except Exception:
+                return False
+
+        funded = await asyncio.gather(*[_funded_by_deployer(a) for a in unique_buyers])
+        funded_count = sum(1 for f in funded if f)
+        if funded_count >= 2 and funded_count / len(unique_buyers) >= 0.5:
+            return {
+                "suspicious": True,
+                "reason":     "funded_ring",
+                "label":      (
+                    f"🚨 {funded_count}/{len(unique_buyers)} покупателей "
+                    f"финансированы деплоером — схема раг пула"
+                ),
+            }
+
+    return {"suspicious": False}
 
 
 async def _dexscreener_fetch(pair_address: str, chain: str = "bsc") -> dict | None:

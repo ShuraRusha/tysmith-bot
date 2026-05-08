@@ -26,7 +26,7 @@ from web3.middleware import geth_poa_middleware
 
 import blacklist
 import config
-from analyzer import analyze_token, check_token, check_token_fast, fetch_security_partial, get_bnb_price, _get_liquidity_usd_sync as _liq_sync, _get_bnb_price_sync as _bnb_price_sync, _simulate_buy_sync, _simulate_sell_sync
+from analyzer import analyze_token, check_token, check_token_fast, fetch_security_partial, get_bnb_price, _get_liquidity_usd_sync as _liq_sync, _get_bnb_price_sync as _bnb_price_sync, _simulate_buy_sync, _simulate_sell_sync, _check_buyer_collusion
 from position import (
     Position, PositionManager,
     POSITIONS_FILE_BASE, POSITIONS_FILE_BISWAP, POSITIONS_FILE_BASESWAP,
@@ -1533,6 +1533,17 @@ async def _on_pair_found_inner(
     if _recent_swaps >= 1 and _recent_swaps <= 3:
         warnings.append(f"⚠️ Всего {_recent_swaps} покупок до тебя — токен очень новый")
 
+    # Collusion / wash-trading check on first buyers
+    _collusion = await _check_buyer_collusion(
+        pair_address, w3,
+        from_block       = max(1, creation_block or (_cur_block - 500)),
+        to_block         = _cur_block,
+        deployer_address = info.get("deployer"),
+        bscscan_api_key  = config.BSCSCAN_API_KEY,
+    )
+    if _collusion.get("suspicious"):
+        warnings.append(_collusion["label"])
+
     warn_block = "\n".join(warnings) if warnings else "✅ Дополнительных угроз нет"
 
     sell_sim_unverified = info.get("sim_sell_skipped", False)
@@ -1540,6 +1551,8 @@ async def _on_pair_found_inner(
         "⚠️ *Новый токен — sell-симуляция НЕ проверена*"
         if sell_sim_unverified else
         "🎯 *Новый токен прошёл все проверки*"
+        if not _collusion.get("suspicious") else
+        "⚠️ *Новый токен — подозрительные покупатели*"
     )
 
     fdv_str = f" | FDV: ${info['fdv_usd']:,.0f}" if info.get("fdv_usd") else ""
@@ -1831,11 +1844,23 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
     if info["hidden_owner"]:  warnings.append("⚠️ Hidden owner")
     if _recent_swaps >= 1 and _recent_swaps <= 3:
         warnings.append(f"⚠️ Всего {_recent_swaps} покупок до тебя — токен очень новый")
+
+    _collusion_b = await _check_buyer_collusion(
+        pair_address, w3_base,
+        from_block       = max(1, creation_block or (_cur_block_b - 500)),
+        to_block         = _cur_block_b,
+        deployer_address = info.get("deployer"),
+        bscscan_api_key  = config.BSCSCAN_API_KEY,
+        explorer_url     = "https://api.basescan.org/api",
+    )
+    if _collusion_b.get("suspicious"):
+        warnings.append(_collusion_b["label"])
+
     warn_block = "\n".join(warnings) if warnings else "✅ Дополнительных угроз нет"
 
     fdv_str = f" | FDV: ${info['fdv_usd']:,.0f}" if info.get("fdv_usd") else ""
     text = (
-        f"🔵 *[Base] Новый токен прошёл все проверки*\n\n"
+        f"🔵 *[Base] {'Подозрительные покупатели' if _collusion_b.get('suspicious') else 'Новый токен прошёл все проверки'}*\n\n"
         f"🪙 *{info['name']}* (`{info['symbol']}`)\n"
         f"📄 `{token_address}`\n\n"
         f"💧 Ликвидность: *${info['liquidity_usd']:,.0f}*{fdv_str}\n"
@@ -2053,11 +2078,22 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
     if info["hidden_owner"]: warnings.append("⚠️ Hidden owner")
     if _recent_swaps >= 1 and _recent_swaps <= 3:
         warnings.append(f"⚠️ Всего {_recent_swaps} покупок до тебя — токен очень новый")
+
+    _collusion_bi = await _check_buyer_collusion(
+        pair_address, w3,
+        from_block       = max(1, creation_block or (_cur_block_bi - 500)),
+        to_block         = _cur_block_bi,
+        deployer_address = info.get("deployer"),
+        bscscan_api_key  = config.BSCSCAN_API_KEY,
+    )
+    if _collusion_bi.get("suspicious"):
+        warnings.append(_collusion_bi["label"])
+
     warn_block = "\n".join(warnings) if warnings else "✅ Дополнительных угроз нет"
 
     fdv_str = f" | FDV: ${info['fdv_usd']:,.0f}" if info.get("fdv_usd") else ""
     text = (
-        f"🟠 *[BiSwap] Новый токен прошёл все проверки*\n\n"
+        f"🟠 *[BiSwap] {'Подозрительные покупатели' if _collusion_bi.get('suspicious') else 'Новый токен прошёл все проверки'}*\n\n"
         f"🪙 *{info['name']}* (`{info['symbol']}`)\n"
         f"📄 `{token_address}`\n\n"
         f"💧 Ликвидность: *${info['liquidity_usd']:,.0f}*{fdv_str}\n"
@@ -2278,11 +2314,23 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
     if info["hidden_owner"]: warnings.append("⚠️ Hidden owner")
     if _recent_swaps >= 1 and _recent_swaps <= 3:
         warnings.append(f"⚠️ Всего {_recent_swaps} покупок до тебя — токен очень новый")
+
+    _collusion_bs = await _check_buyer_collusion(
+        pair_address, w3_base,
+        from_block       = max(1, creation_block or (_cur_block_bs - 500)),
+        to_block         = _cur_block_bs,
+        deployer_address = info.get("deployer"),
+        bscscan_api_key  = config.BSCSCAN_API_KEY,
+        explorer_url     = "https://api.basescan.org/api",
+    )
+    if _collusion_bs.get("suspicious"):
+        warnings.append(_collusion_bs["label"])
+
     warn_block = "\n".join(warnings) if warnings else "✅ Дополнительных угроз нет"
 
     fdv_str = f" | FDV: ${info['fdv_usd']:,.0f}" if info.get("fdv_usd") else ""
     text = (
-        f"🔷 *[BaseSwap] Новый токен прошёл все проверки*\n\n"
+        f"🔷 *[BaseSwap] {'Подозрительные покупатели' if _collusion_bs.get('suspicious') else 'Новый токен прошёл все проверки'}*\n\n"
         f"🪙 *{info['name']}* (`{info['symbol']}`)\n"
         f"📄 `{token_address}`\n\n"
         f"💧 Ликвидность: *${info['liquidity_usd']:,.0f}*{fdv_str}\n"
