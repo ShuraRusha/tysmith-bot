@@ -3593,6 +3593,7 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
     # Deployer block
     deployer_addr = data.get("deployer")
     deploy_count  = data.get("deploy_count_30d")
+    deployer_pct  = data.get("deployer_pct")
     explorer_name = "Basescan" if is_base else "BSCScan"
     explorer_key  = config.BASESCAN_API_KEY if is_base else config.BSCSCAN_API_KEY
     if deployer_addr:
@@ -3609,6 +3610,19 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
         deployer_line = f"❓ Деплоер: не найден в {explorer_name}"
     else:
         deployer_line = f"➖ Деплоер: {explorer_name} API ключ не задан"
+
+    if deployer_pct is not None:
+        dep_pct_icon = "✅" if deployer_pct <= 20 else ("⚠️" if deployer_pct <= 50 else "🚨")
+        dep_pct_label = "" if deployer_pct <= 20 else (" — высокая концентрация" if deployer_pct <= 50 else " — очень высокая концентрация")
+        deployer_pct_line = f"{dep_pct_icon} Деплоер держит: *{deployer_pct:.1f}%* суплая{dep_pct_label}"
+    else:
+        deployer_pct_line = "➖ Баланс деплоера: не определён"
+
+    # Collusion check summary for the security section
+    if _analyze_collusion.get("suspicious"):
+        collusion_line = f"🚨 Покупатели: {_analyze_collusion['label']}"
+    else:
+        collusion_line = "✅ Покупатели: координация не обнаружена"
 
     chain_badge = "🔵 Base" if is_base else "🟡 BSC"
     text = (
@@ -3633,7 +3647,9 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
         f"{sell_sim_icon} Sell-симуляция: {'Не проверена (пул пустой — проверка будет при покупке)' if data.get('sim_sell_skipped') else ('OK' if data['sim_sell_ok'] else data['sim_sell_reason'])}\n"
         f"{hp_icon} Honeypot.is: {'OK' if data['hp_is_ok'] else data['hp_is_reason']}\n"
         f"{gp_icon} GoPlus: {'доступен' if data['goplus_ok'] else 'недоступен'}\n"
-        f"{deployer_line}\n\n"
+        f"{deployer_line}\n"
+        f"{deployer_pct_line}\n"
+        f"{collusion_line}\n\n"
         f"*🚩 GoPlus флаги:*\n{flags_block}\n\n"
         f"*⚠️ Предупреждения:*\n{warn_block}\n\n"
         f"━━━━━━━━━━━━━━\n"
