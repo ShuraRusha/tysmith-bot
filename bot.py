@@ -922,6 +922,9 @@ _LIQ_WAIT_TTL           = 900          # give up after 15 minutes (was 5)
 _sell_sim_waiting: set[str] = set()    # tokens tracked until sell sim can be verified
 _SELL_SIM_WAIT_TTL = 180               # give up if pair_balance never appears (3 min)
 
+_zero_buyers_waiting: set[str] = set()  # tokens tracked until the first swap appears
+_ZERO_BUYERS_WAIT_TTL = 300             # give up if no buyer appears within 5 min
+
 # Minimum liquidity to TRIGGER the retry check (lower than MIN_LIQUIDITY_USD).
 # Allows simulation to run when $25+ is present; buy decision still uses MIN_LIQUIDITY_USD.
 _LIQ_WAIT_TRIGGER_USD   = 25.0
@@ -1196,6 +1199,56 @@ async def _wait_for_sell_sim(
         _sell_sim_waiting.discard(key)
 
 
+async def _wait_for_first_buyer(
+    token_address: str, base_token: str, pair_address: str, creation_block: int,
+    w3_instance=None, callback=None,
+):
+    """
+    Poll pair Swap events every 5s until at least one external buyer appears.
+    Then re-trigger the full analysis flow so the user gets a clean notification
+    without the 'you're the first buyer' dump risk.
+    Token is silently dropped if no buyer appears within _ZERO_BUYERS_WAIT_TTL.
+    """
+    key = token_address.lower()
+    if key in _zero_buyers_waiting:
+        return
+    _zero_buyers_waiting.add(key)
+    _w3  = w3_instance or w3
+    _cb  = callback or on_pair_found
+    sym  = token_address[:10] + "…"
+    deadline  = time.time() + _ZERO_BUYERS_WAIT_TTL
+    start_ts  = time.time()
+    attempt   = 0
+    log.info(f"[ZeroBuyers] {sym} — waiting for first buyer (TTL={_ZERO_BUYERS_WAIT_TTL}s)")
+    try:
+        while time.time() < deadline:
+            await asyncio.sleep(5)
+            attempt += 1
+            try:
+                cur_block = await asyncio.to_thread(lambda: _w3.eth.block_number)
+                swaps = await _count_prior_buyers(pair_address, max(1, cur_block - 500), cur_block)
+            except Exception as e:
+                log.debug(f"[ZeroBuyers] {sym} poll error: {e}")
+                continue
+            if swaps > 0:
+                elapsed = int(time.time() - start_ts)
+                log.info(
+                    f"[ZeroBuyers] {sym} — {swaps} buyer(s) detected after {elapsed}s "
+                    f"({attempt} polls) — re-triggering full flow"
+                )
+                _liq_retry_bypass.add(key)
+                await _cb(token_address, base_token, pair_address, creation_block)
+                return
+        log.info(
+            f"[ZeroBuyers] {sym} — TTL {_ZERO_BUYERS_WAIT_TTL}s expired "
+            f"after {attempt} polls, no buyers — dropping"
+        )
+    except Exception as e:
+        log.error(f"[ZeroBuyers] {sym} error: {e}")
+    finally:
+        _zero_buyers_waiting.discard(key)
+
+
 async def on_pending_pair_found(token_address: str, base_token: str, pair_address: str):
     """
     Called from mempool watcher when a pending createPair tx is detected.
@@ -1447,6 +1500,21 @@ async def _on_pair_found_inner(
         ))
         return
 
+    # Check buyer count — track token silently until first swap appears
+    try:
+        _cur_block    = await asyncio.to_thread(lambda: w3.eth.block_number)
+        _recent_swaps = await _count_prior_buyers(pair_address, max(1, _cur_block - 100), _cur_block)
+    except Exception:
+        _recent_swaps = -1
+
+    if _recent_swaps == 0:
+        log.info(f"[PancakeSwap] {token_address[:10]}… — no buyers yet, deferring notification")
+        asyncio.create_task(_wait_for_first_buyer(
+            token_address, base_token, pair_address, creation_block,
+            w3_instance=w3, callback=on_pair_found,
+        ))
+        return
+
     bnb_price = info["bnb_price"]
 
     balance    = await asyncio.to_thread(lambda: w3.eth.get_balance(trader.wallet) / 1e18)
@@ -1462,16 +1530,8 @@ async def _on_pair_found_inner(
     if info["is_proxy"]:      warnings.append("⚠️ Proxy контракт")
     if info["external_call"]: warnings.append("⚠️ External call в коде")
 
-    # Warn if no one has traded yet — first buyer = highest dump risk
-    try:
-        _cur_block = await asyncio.to_thread(lambda: w3.eth.block_number)
-        _recent_swaps = await _count_prior_buyers(pair_address, max(1, _cur_block - 100), _cur_block)
-        if _recent_swaps == 0:
-            warnings.append("🚨 Покупок ещё не было — ты первый! Риск дампа максимальный")
-        elif _recent_swaps <= 3:
-            warnings.append(f"⚠️ Всего {_recent_swaps} покупок до тебя — токен очень новый")
-    except Exception:
-        pass
+    if _recent_swaps >= 1 and _recent_swaps <= 3:
+        warnings.append(f"⚠️ Всего {_recent_swaps} покупок до тебя — токен очень новый")
 
     warn_block = "\n".join(warnings) if warnings else "✅ Дополнительных угроз нет"
 
@@ -1736,6 +1796,21 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
         ))
         return
 
+    # Check buyer count — track token silently until first swap appears
+    try:
+        _cur_block_b  = await asyncio.to_thread(lambda: w3_base.eth.block_number)
+        _recent_swaps = await _count_prior_buyers(pair_address, max(1, _cur_block_b - 100), _cur_block_b)
+    except Exception:
+        _recent_swaps = -1
+
+    if _recent_swaps == 0:
+        log.info(f"[Base] {token_address[:10]}… — no buyers yet, deferring notification")
+        asyncio.create_task(_wait_for_first_buyer(
+            token_address, base_token, pair_address, creation_block,
+            w3_instance=w3_base, callback=on_base_pair_found,
+        ))
+        return
+
     eth_price  = info["bnb_price"]
     balance    = await asyncio.to_thread(lambda: w3_base.eth.get_balance(trader_base.wallet) / 1e18)
     buy_amount = calculate_buy_amount(balance)
@@ -1748,6 +1823,8 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
     warnings = info.get("extra_warnings", [])
     if info["is_mintable"]:   warnings.append("⚠️ Mintable")
     if info["hidden_owner"]:  warnings.append("⚠️ Hidden owner")
+    if _recent_swaps >= 1 and _recent_swaps <= 3:
+        warnings.append(f"⚠️ Всего {_recent_swaps} покупок до тебя — токен очень новый")
     warn_block = "\n".join(warnings) if warnings else "✅ Дополнительных угроз нет"
 
     fdv_str = f" | FDV: ${info['fdv_usd']:,.0f}" if info.get("fdv_usd") else ""
@@ -1936,6 +2013,21 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
         ))
         return
 
+    # Check buyer count — track token silently until first swap appears
+    try:
+        _cur_block_bi  = await asyncio.to_thread(lambda: w3.eth.block_number)
+        _recent_swaps  = await _count_prior_buyers(pair_address, max(1, _cur_block_bi - 100), _cur_block_bi)
+    except Exception:
+        _recent_swaps  = -1
+
+    if _recent_swaps == 0:
+        log.info(f"[BiSwap] {token_address[:10]}… — no buyers yet, deferring notification")
+        asyncio.create_task(_wait_for_first_buyer(
+            token_address, base_token, pair_address, creation_block,
+            w3_instance=w3, callback=on_biswap_pair_found,
+        ))
+        return
+
     bnb_price = info["bnb_price"]
     balance    = await asyncio.to_thread(lambda: w3.eth.get_balance(trader_biswap.wallet) / 1e18)
     buy_amount = calculate_buy_amount(balance)
@@ -1947,6 +2039,8 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
     warnings = info.get("extra_warnings", [])
     if info["is_mintable"]:  warnings.append("⚠️ Mintable")
     if info["hidden_owner"]: warnings.append("⚠️ Hidden owner")
+    if _recent_swaps >= 1 and _recent_swaps <= 3:
+        warnings.append(f"⚠️ Всего {_recent_swaps} покупок до тебя — токен очень новый")
     warn_block = "\n".join(warnings) if warnings else "✅ Дополнительных угроз нет"
 
     fdv_str = f" | FDV: ${info['fdv_usd']:,.0f}" if info.get("fdv_usd") else ""
@@ -2138,6 +2232,21 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
         ))
         return
 
+    # Check buyer count — track token silently until first swap appears
+    try:
+        _cur_block_bs  = await asyncio.to_thread(lambda: w3_base.eth.block_number)
+        _recent_swaps  = await _count_prior_buyers(pair_address, max(1, _cur_block_bs - 100), _cur_block_bs)
+    except Exception:
+        _recent_swaps  = -1
+
+    if _recent_swaps == 0:
+        log.info(f"[BaseSwap] {token_address[:10]}… — no buyers yet, deferring notification")
+        asyncio.create_task(_wait_for_first_buyer(
+            token_address, base_token, pair_address, creation_block,
+            w3_instance=w3_base, callback=on_baseswap_pair_found,
+        ))
+        return
+
     eth_price  = info["bnb_price"]
     balance    = await asyncio.to_thread(lambda: w3_base.eth.get_balance(trader_baseswap.wallet) / 1e18)
     buy_amount = calculate_buy_amount(balance)
@@ -2149,6 +2258,8 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
     warnings = info.get("extra_warnings", [])
     if info["is_mintable"]:  warnings.append("⚠️ Mintable")
     if info["hidden_owner"]: warnings.append("⚠️ Hidden owner")
+    if _recent_swaps >= 1 and _recent_swaps <= 3:
+        warnings.append(f"⚠️ Всего {_recent_swaps} покупок до тебя — токен очень новый")
     warn_block = "\n".join(warnings) if warnings else "✅ Дополнительных угроз нет"
 
     fdv_str = f" | FDV: ${info['fdv_usd']:,.0f}" if info.get("fdv_usd") else ""
