@@ -919,6 +919,9 @@ _LIQ_WAIT_FAST_COUNT    = 15
 _LIQ_WAIT_SLOW_INTERVAL = 3.0          # then every BSC block (~3s)
 _LIQ_WAIT_TTL           = 900          # give up after 15 minutes (was 5)
 
+_sell_sim_waiting: set[str] = set()    # tokens tracked until sell sim can be verified
+_SELL_SIM_WAIT_TTL = 180               # give up if pair_balance never appears (3 min)
+
 # Minimum liquidity to TRIGGER the retry check (lower than MIN_LIQUIDITY_USD).
 # Allows simulation to run when $25+ is present; buy decision still uses MIN_LIQUIDITY_USD.
 _LIQ_WAIT_TRIGGER_USD   = 25.0
@@ -1110,6 +1113,87 @@ async def _wait_for_liquidity_and_retry(
     finally:
         _liquidity_waiting.discard(key)
         _liq_security_cache.pop(key, None)   # clean up on timeout
+
+
+async def _wait_for_sell_sim(
+    token_address: str,
+    base_token: str,
+    pair_address: str,
+    creation_block: int,
+    w3_instance=None,
+    callback=None,
+):
+    """
+    Track a token whose sell simulation was skipped because pair_balance==0
+    at analysis time (race: bot ran simulation before deployer's addLiquidity
+    transaction was mined).
+
+    Polls _simulate_sell_sync every 2 s until the pair has tokens, then:
+      - sim OK    → re-trigger the full on_pair_found flow (notification / auto-buy)
+      - sim FAILS → honeypot; add to blacklist, send alert, discard silently
+      - TTL       → give up, log warning
+    """
+    key = token_address.lower()
+    if key in _sell_sim_waiting:
+        return
+    _sell_sim_waiting.add(key)
+
+    _w3      = w3_instance or w3
+    _cb      = callback or on_pair_found
+    sym      = token_address[:10] + "…"
+    deadline = time.time() + _SELL_SIM_WAIT_TTL
+    start_ts = time.time()
+    attempt  = 0
+    log.info(f"[SellSimWait] {sym} — tracking until pair_balance > 0 (TTL={_SELL_SIM_WAIT_TTL}s)")
+
+    try:
+        while time.time() < deadline:
+            await asyncio.sleep(2)
+            attempt += 1
+
+            sim = await asyncio.to_thread(
+                _simulate_sell_sync, _w3, token_address, pair_address
+            )
+
+            if sim.get("skipped"):
+                continue   # pair still empty — deployer hasn't added tokens yet
+
+            elapsed = int(time.time() - start_ts)
+
+            if sim.get("ok"):
+                log.info(
+                    f"[SellSimWait] {sym} — sell sim PASSED after {elapsed}s "
+                    f"({attempt} polls) — re-triggering full flow"
+                )
+                # Bypass the dedup TTL so on_pair_found processes this token again
+                _liq_retry_bypass.add(key)
+                await _cb(token_address, base_token, pair_address, creation_block)
+            else:
+                reason = sim.get("reason", "неизвестно")
+                log.warning(
+                    f"[SellSimWait] {sym} — HONEYPOT detected after {elapsed}s: {reason}"
+                )
+                blacklist.add(
+                    token_address,
+                    reason=f"Honeypot (sell sim after liq): {sym}",
+                )
+                await tg_send(
+                    f"🚫 *{sym}* — honeypot, уведомление заблокировано\n\n"
+                    f"`{token_address}`\n"
+                    f"Sell-симуляция провалилась после добавления ликвидности:\n"
+                    f"_{reason}_\n\n"
+                    f"Токен добавлен в чёрный список. Уведомление не отправлено."
+                )
+            return  # done — either re-triggered or rejected
+
+        log.info(
+            f"[SellSimWait] {sym} — TTL {_SELL_SIM_WAIT_TTL}s expired "
+            f"after {attempt} polls, pair_balance never appeared — dropping"
+        )
+    except Exception as e:
+        log.error(f"[SellSimWait] {sym} error: {e}")
+    finally:
+        _sell_sim_waiting.discard(key)
 
 
 async def on_pending_pair_found(token_address: str, base_token: str, pair_address: str):
@@ -1354,6 +1438,15 @@ async def _on_pair_found_inner(
         return
 
     info      = result["info"]
+
+    if info.get("sim_sell_skipped"):
+        log.info(f"[PancakeSwap] {token_address[:10]}… — sell sim unverified, deferring notification")
+        asyncio.create_task(_wait_for_sell_sim(
+            token_address, base_token, pair_address, creation_block,
+            w3_instance=w3, callback=on_pair_found,
+        ))
+        return
+
     bnb_price = info["bnb_price"]
 
     balance    = await asyncio.to_thread(lambda: w3.eth.get_balance(trader.wallet) / 1e18)
@@ -1634,6 +1727,15 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
         return
 
     info       = result["info"]
+
+    if info.get("sim_sell_skipped"):
+        log.info(f"[Base] {token_address[:10]}… — sell sim unverified, deferring notification")
+        asyncio.create_task(_wait_for_sell_sim(
+            token_address, base_token, pair_address, creation_block,
+            w3_instance=w3_base, callback=on_base_pair_found,
+        ))
+        return
+
     eth_price  = info["bnb_price"]
     balance    = await asyncio.to_thread(lambda: w3_base.eth.get_balance(trader_base.wallet) / 1e18)
     buy_amount = calculate_buy_amount(balance)
@@ -1825,6 +1927,15 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
         return
 
     info      = result["info"]
+
+    if info.get("sim_sell_skipped"):
+        log.info(f"[BiSwap] {token_address[:10]}… — sell sim unverified, deferring notification")
+        asyncio.create_task(_wait_for_sell_sim(
+            token_address, base_token, pair_address, creation_block,
+            w3_instance=w3, callback=on_biswap_pair_found,
+        ))
+        return
+
     bnb_price = info["bnb_price"]
     balance    = await asyncio.to_thread(lambda: w3.eth.get_balance(trader_biswap.wallet) / 1e18)
     buy_amount = calculate_buy_amount(balance)
@@ -2018,6 +2129,15 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
         return
 
     info       = result["info"]
+
+    if info.get("sim_sell_skipped"):
+        log.info(f"[BaseSwap] {token_address[:10]}… — sell sim unverified, deferring notification")
+        asyncio.create_task(_wait_for_sell_sim(
+            token_address, base_token, pair_address, creation_block,
+            w3_instance=w3_base, callback=on_baseswap_pair_found,
+        ))
+        return
+
     eth_price  = info["bnb_price"]
     balance    = await asyncio.to_thread(lambda: w3_base.eth.get_balance(trader_baseswap.wallet) / 1e18)
     buy_amount = calculate_buy_amount(balance)
