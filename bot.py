@@ -3591,12 +3591,16 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
         explorer  = "https://bscscan.com/token"
 
     # Deployer block
-    deployer_addr = data.get("deployer")
-    deploy_count  = data.get("deploy_count_30d")
-    deployer_pct  = data.get("deployer_pct")
+    deployer_addr      = data.get("deployer")
+    deploy_count       = data.get("deploy_count_30d")
+    deployer_pct       = data.get("deployer_pct")
+    deployer_renounced = data.get("deployer_renounced", False)
     explorer_name = "Basescan" if is_base else "BSCScan"
     explorer_key  = config.BASESCAN_API_KEY if is_base else config.BSCSCAN_API_KEY
-    if deployer_addr:
+
+    if deployer_renounced:
+        deployer_line = "🔓 Деплоер: ownership renounced (address(0)) — ✅ хороший знак"
+    elif deployer_addr:
         deployer_short = deployer_addr[:6] + "…" + deployer_addr[-4:]
         if deploy_count is not None:
             deploy_icon = "❌" if not data.get("deployer_ok", True) else ("⚠️" if deploy_count >= 2 else "✅")
@@ -3605,18 +3609,20 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
                 f"| {deploy_count} контракт(ов) за 30 дн."
             )
         else:
-            deployer_line = f"✅ Деплоер: `{deployer_short}`"
+            deployer_line = f"✅ Деплоер: `{deployer_short}` _(через owner())_"
     elif explorer_key:
-        deployer_line = f"❓ Деплоер: не найден в {explorer_name}"
+        deployer_line = f"❓ Деплоер: не найден в {explorer_name} и owner() недоступен"
     else:
         deployer_line = f"➖ Деплоер: {explorer_name} API ключ не задан"
 
-    if deployer_pct is not None:
+    if deployer_renounced:
+        deployer_pct_line = "🔓 Баланс деплоера: 0% (ownership renounced)"
+    elif deployer_pct is not None:
         dep_pct_icon = "✅" if deployer_pct <= 20 else ("⚠️" if deployer_pct <= 50 else "🚨")
         dep_pct_label = "" if deployer_pct <= 20 else (" — высокая концентрация" if deployer_pct <= 50 else " — очень высокая концентрация")
         deployer_pct_line = f"{dep_pct_icon} Деплоер держит: *{deployer_pct:.1f}%* суплая{dep_pct_label}"
     else:
-        deployer_pct_line = "➖ Баланс деплоера: не определён"
+        deployer_pct_line = "❓ Баланс деплоера: адрес не определён (BSCScan не проиндексировал, owner() недоступен)"
 
     # Collusion check summary for the security section
     if _analyze_collusion.get("suspicious"):

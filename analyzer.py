@@ -205,6 +205,34 @@ def _get_token_info_sync(w3: Web3, token_address: str) -> dict:
         return {"name": "Unknown", "symbol": "???", "decimals": 18}
 
 
+_OWNER_ABI = [
+    {"inputs": [], "name": "owner",    "outputs": [{"type": "address"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "getOwner", "outputs": [{"type": "address"}], "stateMutability": "view", "type": "function"},
+]
+_ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+
+
+def _get_token_owner_sync(w3: Web3, token_address: str) -> str | None:
+    """
+    On-chain fallback: try owner() / getOwner() from the Ownable pattern.
+    Returns the owner address (lowercased), "renounced" if address(0), or None.
+    """
+    try:
+        token = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=_OWNER_ABI)
+        for fn_name in ("owner", "getOwner"):
+            try:
+                addr = token.functions[fn_name]().call()
+                addr_l = addr.lower()
+                if addr_l == _ZERO_ADDRESS:
+                    return "renounced"
+                return addr_l
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
 def _get_deployer_holdings_sync(w3: Web3, token_address: str, deployer_address: str) -> dict:
     """Return deployer wallet balance as % of total token supply."""
     try:
@@ -917,8 +945,17 @@ async def analyze_token(
         symbol       = token_meta["symbol"]
         holder_count = "?"
 
-    # ── Deployer holdings (on-chain, non-blocking) ────────────────────────────
+    # ── Deployer address: BSCScan result or on-chain owner() fallback ───────────
     _deployer_addr = deployer_result.get("deployer")
+    _deployer_renounced = False
+    if not _deployer_addr:
+        _owner_fb = await asyncio.to_thread(_get_token_owner_sync, w3, token_address)
+        if _owner_fb == "renounced":
+            _deployer_renounced = True
+        elif _owner_fb:
+            _deployer_addr = _owner_fb
+            log.info(f"[OwnerFallback] {token_address[:10]}… deployer via owner(): {_deployer_addr[:10]}…")
+
     deployer_pct: float | None = None
     if _deployer_addr:
         _dh = await asyncio.to_thread(_get_deployer_holdings_sync, w3, token_address, _deployer_addr)
@@ -1025,12 +1062,13 @@ async def analyze_token(
         "lp_locked":          lp_locked,
         "age_days":           age_days,
         "vol_5m":             vol_5m,
-        # Deployer history (requires BSCSCAN_API_KEY)
-        "deployer":           deployer_result.get("deployer"),
-        "deploy_count_30d":   deployer_result.get("deploy_count_30d"),
-        "deployer_ok":        deployer_result["ok"],
-        "deployer_reason":    deployer_result.get("reason", ""),
-        "deployer_pct":       deployer_pct,
+        # Deployer (BSCScan or on-chain owner() fallback)
+        "deployer":              _deployer_addr,
+        "deployer_renounced":    _deployer_renounced,
+        "deploy_count_30d":      deployer_result.get("deploy_count_30d"),
+        "deployer_ok":           deployer_result["ok"],
+        "deployer_reason":       deployer_result.get("reason", ""),
+        "deployer_pct":          deployer_pct,
     }
 
 
@@ -1312,6 +1350,13 @@ async def check_token(
         holder_count = "?"
 
     _dep_addr = deployer_result.get("deployer")
+    _dep_renounced = False
+    if not _dep_addr:
+        _owner_fb = await asyncio.to_thread(_get_token_owner_sync, w3, token_address)
+        if _owner_fb == "renounced":
+            _dep_renounced = True
+        elif _owner_fb:
+            _dep_addr = _owner_fb
     deployer_pct: float | None = None
     if _dep_addr:
         _dh = await asyncio.to_thread(_get_deployer_holdings_sync, w3, token_address, _dep_addr)
@@ -1333,9 +1378,10 @@ async def check_token(
         "goplus_ok":      goplus_data is not None,
         "extra_warnings":    warnings_from_goplus,
         "sim_sell_skipped":  sell_sim.get("skipped", False),
-        # Deployer info — used by bot.py to auto-blacklist on honeypot
-        "deployer":          _dep_addr,
-        "deployer_pct":      deployer_pct,
+        # Deployer info (BSCScan or on-chain owner() fallback)
+        "deployer":              _dep_addr,
+        "deployer_renounced":    _dep_renounced,
+        "deployer_pct":          deployer_pct,
     }
     return {"ok": True, "info": info}
 
@@ -1454,6 +1500,13 @@ async def check_token_fast(
         holder_count = "?"
 
     _dep_addr_f = deployer_result.get("deployer")
+    _dep_renounced_f = False
+    if not _dep_addr_f:
+        _owner_fb_f = await asyncio.to_thread(_get_token_owner_sync, w3, token_address)
+        if _owner_fb_f == "renounced":
+            _dep_renounced_f = True
+        elif _owner_fb_f:
+            _dep_addr_f = _owner_fb_f
     deployer_pct_f: float | None = None
     if _dep_addr_f:
         _dh_f = await asyncio.to_thread(_get_deployer_holdings_sync, w3, token_address, _dep_addr_f)
@@ -1475,8 +1528,9 @@ async def check_token_fast(
         "goplus_ok":      goplus_data is not None,
         "extra_warnings":    warnings_from_goplus,
         "sim_sell_skipped":  sell_sim.get("skipped", False),
-        "deployer":          _dep_addr_f,
-        "deployer_pct":      deployer_pct_f,
+        "deployer":              _dep_addr_f,
+        "deployer_renounced":    _dep_renounced_f,
+        "deployer_pct":          deployer_pct_f,
     }
     return {"ok": True, "info": info}
 
