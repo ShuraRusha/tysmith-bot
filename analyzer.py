@@ -230,7 +230,10 @@ def _simulate_sell_sync(w3: Web3, token_address: str, pair_address: str,
 
         pair_balance = token.functions.balanceOf(pair_cs).call()
         if pair_balance == 0:
-            return {"ok": True}  # brand-new pair — can't simulate yet
+            # Pair has no tokens yet — deployer hasn't added liquidity.
+            # We cannot simulate; mark as skipped so callers can warn the user.
+            return {"ok": True, "skipped": True,
+                    "reason": "Пул пустой при анализе — sell-симуляция не выполнена, проверка будет при покупке"}
 
         # ── Check 1: transfer TO pair FROM pair ──────────────────────────────
         # Catches honeypots that check: if (recipient == pair) revert
@@ -860,7 +863,8 @@ async def analyze_token(
         "hp_sell_tax":        hp_sell_tax,
         "sim_buy_ok":         sim_result["ok"],
         "sim_buy_reason":     sim_result.get("reason", ""),
-        "sim_sell_ok":        sell_sim["ok"],
+        "sim_sell_ok":        False if sell_sim.get("skipped") else sell_sim["ok"],
+        "sim_sell_skipped":   sell_sim.get("skipped", False),
         "sim_sell_reason":    sell_sim.get("reason", ""),
         "hp_is_ok":           hp_result["ok"],
         "hp_is_reason":       hp_result.get("reason", ""),
@@ -1030,6 +1034,14 @@ async def check_token(
     sell_tax = 0.0
     warnings_from_goplus = []
 
+    # Sell simulation was skipped (pair had no tokens when analysis ran).
+    # The pre-buy check will re-run it when liquidity exists, but warn the user now.
+    if sell_sim.get("skipped"):
+        warnings_from_goplus.append(
+            "🚨 Sell-симуляция НЕ ПРОВЕРЕНА — пул был пустым при анализе. "
+            "Проверка выполнится перед покупкой"
+        )
+
     if goplus_data:
         CRITICAL = {
             "is_honeypot":          "Honeypot (GoPlus)",
@@ -1162,9 +1174,10 @@ async def check_token(
         "is_proxy":       bool(goplus_data and goplus_data.get("is_proxy")      == "1"),
         "external_call":  bool(goplus_data and goplus_data.get("external_call") == "1"),
         "goplus_ok":      goplus_data is not None,
-        "extra_warnings": warnings_from_goplus,
+        "extra_warnings":    warnings_from_goplus,
+        "sim_sell_skipped":  sell_sim.get("skipped", False),
         # Deployer info — used by bot.py to auto-blacklist on honeypot
-        "deployer":       deployer_result.get("deployer"),
+        "deployer":          deployer_result.get("deployer"),
     }
     return {"ok": True, "info": info}
 
@@ -1251,6 +1264,12 @@ async def check_token_fast(
     buy_tax  = 0.0
     sell_tax = 0.0
 
+    if sell_sim.get("skipped"):
+        warnings_from_goplus.append(
+            "🚨 Sell-симуляция НЕ ПРОВЕРЕНА — пул был пустым при анализе. "
+            "Проверка выполнится перед покупкой"
+        )
+
     if goplus_data:
         if goplus_data.get("transfer_pausable")    == "1": warnings_from_goplus.append("⚠️ Паузируемые переводы")
         if goplus_data.get("is_blacklisted")       == "1": warnings_from_goplus.append("⚠️ Blacklist функция")
@@ -1290,8 +1309,9 @@ async def check_token_fast(
         "is_proxy":       bool(goplus_data and goplus_data.get("is_proxy")      == "1"),
         "external_call":  bool(goplus_data and goplus_data.get("external_call") == "1"),
         "goplus_ok":      goplus_data is not None,
-        "extra_warnings": warnings_from_goplus,
-        "deployer":       deployer_result.get("deployer"),
+        "extra_warnings":    warnings_from_goplus,
+        "sim_sell_skipped":  sell_sim.get("skipped", False),
+        "deployer":          deployer_result.get("deployer"),
     }
     return {"ok": True, "info": info}
 

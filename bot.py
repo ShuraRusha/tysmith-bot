@@ -1382,9 +1382,16 @@ async def _on_pair_found_inner(
 
     warn_block = "\n".join(warnings) if warnings else "✅ Дополнительных угроз нет"
 
+    sell_sim_unverified = info.get("sim_sell_skipped", False)
+    header = (
+        "⚠️ *Новый токен — sell-симуляция НЕ проверена*"
+        if sell_sim_unverified else
+        "🎯 *Новый токен прошёл все проверки*"
+    )
+
     fdv_str = f" | FDV: ${info['fdv_usd']:,.0f}" if info.get("fdv_usd") else ""
     text = (
-        f"🎯 *Новый токен прошёл все проверки*\n\n"
+        f"{header}\n\n"
         f"🪙 *{info['name']}* (`{info['symbol']}`)\n"
         f"📄 `{token_address}`\n\n"
         f"💧 Ликвидность: *${info['liquidity_usd']:,.0f}*{fdv_str}\n"
@@ -3174,7 +3181,12 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
 
     # Simulation checks
     buy_sim_icon  = "✅" if data["sim_buy_ok"]  else "❌"
-    sell_sim_icon = "✅" if data["sim_sell_ok"] else "❌"
+    if data.get("sim_sell_skipped"):
+        sell_sim_icon = "❓"
+    elif data["sim_sell_ok"]:
+        sell_sim_icon = "✅"
+    else:
+        sell_sim_icon = "❌"
     hp_icon       = "✅" if data["hp_is_ok"]    else "❌"
     gp_icon       = "✅" if data["goplus_ok"]   else "⚠️"
 
@@ -3196,7 +3208,9 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
         red_flags.append(f"критические GoPlus-флаги: {', '.join(data['critical_flags'].values())}")
     if not data["sim_buy_ok"]:
         red_flags.append(f"покупка отклонена симуляцией: {data['sim_buy_reason']}")
-    if not data["sim_sell_ok"]:
+    if data.get("sim_sell_skipped"):
+        red_flags.append("sell-симуляция не проверена — пул был пустым при анализе")
+    elif not data["sim_sell_ok"]:
         red_flags.append(f"продажа отклонена симуляцией: {data['sim_sell_reason']}")
     if not data["hp_is_ok"]:
         red_flags.append(f"honeypot.is: {data['hp_is_reason']}")
@@ -3291,7 +3305,7 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
         f"🔒 LP: {lp_str}\n\n"
         f"*🛡 Безопасность:*\n"
         f"{buy_sim_icon} Buy-симуляция: {'OK' if data['sim_buy_ok'] else data['sim_buy_reason']}\n"
-        f"{sell_sim_icon} Sell-симуляция: {'OK' if data['sim_sell_ok'] else data['sim_sell_reason']}\n"
+        f"{sell_sim_icon} Sell-симуляция: {'Не проверена (пул пустой — проверка будет при покупке)' if data.get('sim_sell_skipped') else ('OK' if data['sim_sell_ok'] else data['sim_sell_reason'])}\n"
         f"{hp_icon} Honeypot.is: {'OK' if data['hp_is_ok'] else data['hp_is_reason']}\n"
         f"{gp_icon} GoPlus: {'доступен' if data['goplus_ok'] else 'недоступен'}\n"
         f"{deployer_line}\n\n"
