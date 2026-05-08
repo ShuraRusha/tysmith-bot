@@ -167,6 +167,8 @@ def calculate_buy_amount(balance_bnb: float) -> float:
     Returns BNB amount to spend on a single trade based on current balance.
     Returns 0.0 if trade should be skipped (balance too low or gas would dominate).
 
+    In DEMO_MODE: ignores real balance, uses configured virtual amount.
+
     Auto-tier logic (when BUY_PCT_OF_BALANCE == 0):
       balance ≤ 1 BNB  → 5%  (small account, grow faster)
       balance 1–5 BNB  → 3%  (balanced)
@@ -174,6 +176,23 @@ def calculate_buy_amount(balance_bnb: float) -> float:
 
     Manual override: set BUY_PCT_OF_BALANCE > 0 to bypass tiers.
     """
+    if config.DEMO_MODE:
+        # In demo mode use real balance for sizing, but skip the minimum check —
+        # gas cost is irrelevant when no real tx is sent.
+        available = balance_bnb - config.GAS_RESERVE_BNB
+        if available <= 0:
+            available = 1.0  # fallback: virtual 1 BNB if wallet empty
+        if config.BUY_PCT_OF_BALANCE > 0:
+            pct = config.BUY_PCT_OF_BALANCE
+        elif balance_bnb <= 1.0:
+            pct = 5.0
+        elif balance_bnb <= 5.0:
+            pct = 3.0
+        else:
+            pct = 2.0
+        amount = available * pct / 100.0
+        return round(min(max(amount, 0.005), config.BUY_MAX_BNB), 4)
+
     available = balance_bnb - config.GAS_RESERVE_BNB
     if available <= 0:
         return 0.0
