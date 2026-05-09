@@ -384,7 +384,7 @@ def _is_token_duplicate(token_address: str, dex_label: str = "") -> bool:
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 24
+SETTINGS_VERSION = 25
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -401,6 +401,8 @@ _PERSISTENT_SETTINGS = [
     "MAX_DEPLOYER_TOKENS_30D",
     # Added in v24:
     "DEMO_MODE",
+    # Added in v25:
+    "MAX_DEPLOYER_LP_PCT",
 ]
 
 
@@ -650,6 +652,11 @@ def _load_settings():
             config.MAX_SELL_TAX  = 20.0
             config.TAKE_PROFIT_1 = 75.0
             log.info("Settings migration v22→v23: MAX_BUY_TAX/SELL_TAX 10→20%, TAKE_PROFIT_1 50→75%")
+
+        # Migration v24 → v25: add MAX_DEPLOYER_LP_PCT hard-block filter (default 30%)
+        if saved_version < 25:
+            config.MAX_DEPLOYER_LP_PCT = 30.0
+            log.info("Settings migration v24→v25: MAX_DEPLOYER_LP_PCT=30% added")
 
         # Restore bot mode (after migrations so v10 override above takes effect)
         if "__is_auto" in data and saved_version >= 10:
@@ -1417,6 +1424,7 @@ async def _on_pair_found_inner(
                     min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
                     max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
                     lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
+                    max_deployer_lp_pct=config.MAX_DEPLOYER_LP_PCT,
                     min_holder_count=config.MIN_HOLDER_COUNT,
                     bscscan_api_key=config.BSCSCAN_API_KEY,
                     max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
@@ -1749,6 +1757,7 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
             min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
             max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
             lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
+            max_deployer_lp_pct=config.MAX_DEPLOYER_LP_PCT,
             min_holder_count=config.MIN_HOLDER_COUNT,
             bscscan_api_key=config.BASESCAN_API_KEY,
             max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
@@ -2004,6 +2013,7 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
             min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
             max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
             lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
+            max_deployer_lp_pct=config.MAX_DEPLOYER_LP_PCT,
             min_holder_count=config.MIN_HOLDER_COUNT,
             bscscan_api_key=config.BSCSCAN_API_KEY,
             max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
@@ -2236,6 +2246,7 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
             min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
             max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
             lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
+            max_deployer_lp_pct=config.MAX_DEPLOYER_LP_PCT,
             min_holder_count=config.MIN_HOLDER_COUNT,
             bscscan_api_key=config.BASESCAN_API_KEY,
             max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
@@ -2724,6 +2735,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/set age 30` — макс. возраст токена (дней)\n"
         "`/set top10 30` — макс. топ-10 холдеры % (excl. DEX)\n"
         "`/set lp 30` — макс. % LP в одном незаблокированном кошельке\n"
+        "`/set deplp 30` — макс. % незаблокированного LP у деплоера (hard block)\n"
         "`/set holders 50` — мин. кол-во холдеров токена\n"
         "`/set tax 5` — макс. налог buy+sell в %\n"
         "`/set max 5` — макс. кол-во позиций\n"
@@ -3093,6 +3105,7 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "age":    ("MAX_TOKEN_AGE_DAYS",  1,     365,   "Макс. возраст токена (дней)"),
         "top10":  ("MAX_TOP10_HOLDER_PCT",1.0,   99.0,  "Макс. топ-10 холдеры % (excl. DEX)"),
         "lp":     ("LP_HOLDER_MAX_PCT",  1.0,   100.0, "Макс. % LP в одном незаблокированном кошельке (100 = выкл.)"),
+        "deplp":  ("MAX_DEPLOYER_LP_PCT", 1.0,  100.0, "Макс. % незаблокированного LP у деплоера (hard block, 30 рекоменд.)"),
         "holders":("MIN_HOLDER_COUNT",   1,     10000, "Мин. кол-во холдеров токена"),
         "deployer":("MAX_DEPLOYER_TOKENS_30D", 1, 200, "Макс. контрактов деплоера за 30 дней"),
         # Taxes and limits
@@ -3316,6 +3329,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Холдеры: {config.MIN_HOLDER_COUNT} мин\n"
         f"Топ-10 холдеры: {config.MAX_TOP10_HOLDER_PCT:.0f}% макс\n"
         f"LP незаблокирован: {config.LP_HOLDER_MAX_PCT:.0f}% макс на кошелёк\n"
+        f"🛡 Деплоер LP блок: {config.MAX_DEPLOYER_LP_PCT:.0f}% макс незаблокированного\n"
         f"Max tax: {config.MAX_BUY_TAX}% buy / {config.MAX_SELL_TAX}% sell\n"
         f"Деплоер: макс {config.MAX_DEPLOYER_TOKENS_30D} контракт(ов) за 30 дн. "
         f"{'BSCScan OK' if config.BSCSCAN_API_KEY else 'BSCScan нет ключа'}"

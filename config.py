@@ -131,6 +131,7 @@ DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
 TOP_HOLDER_MAX_PCT   = float(os.getenv("TOP_HOLDER_MAX_PCT",   "90"))  # deployer holds 80-90% at T+0 — 90 = practical limit
 MAX_TOP10_HOLDER_PCT = float(os.getenv("MAX_TOP10_HOLDER_PCT", "60"))  # top-10 combined (excl. DEX/locked) > X% → reject (was 30)
 LP_HOLDER_MAX_PCT    = float(os.getenv("LP_HOLDER_MAX_PCT",    "100")) # 100 = disabled for sniper (deployer always holds LP at T+0)
+MAX_DEPLOYER_LP_PCT  = float(os.getenv("MAX_DEPLOYER_LP_PCT",  "30"))  # max % of unlocked LP deployer can hold — hard block if exceeded
 MIN_HOLDER_COUNT     = int(os.getenv("MIN_HOLDER_COUNT",       "0"))   # 0 = disabled — sniper enters first, 1-3 holders is normal at launch
 
 # ── Token quality filters ─────────────────────────────────────────────────────

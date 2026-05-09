@@ -1184,8 +1184,9 @@ async def check_token(
     max_buy_tax:          float,
     max_sell_tax:         float,
     wallet_address:       str   = "0x0000000000000000000000000000000000000001",
-    lp_holder_max_pct:    float = 30.0,
-    min_market_cap_usd:   float = 30_000,
+    lp_holder_max_pct:       float = 30.0,
+    max_deployer_lp_pct:     float = 30.0,
+    min_market_cap_usd:      float = 30_000,
     min_fdv_usd:          float = 200_000,
     max_fdv_usd:          float = 10_000_000,
     max_top10_holder_pct: float = 30.0,
@@ -1275,9 +1276,10 @@ async def check_token(
             "max_buy_tax":    max_buy_tax,
             "max_sell_tax":   max_sell_tax,
             "min_holder_count": min_holder_count,
-            "max_top10_holder_pct": max_top10_holder_pct,
-            "max_token_age_days": max_token_age_days,
-            "min_volume_5m_usd":  min_volume_5m_usd,
+            "max_top10_holder_pct":  max_top10_holder_pct,
+            "max_token_age_days":    max_token_age_days,
+            "min_volume_5m_usd":     min_volume_5m_usd,
+            "max_deployer_lp_pct":   max_deployer_lp_pct,
         }
 
     # Buy simulation — catches: trading not enabled, honeypot on entry
@@ -1472,6 +1474,20 @@ async def check_token(
         deployer_pct   = _dh_c.get("pct")
         deployer_lp_c  = _dlp_c
 
+    # ── Hard block: deployer holds unlocked LP → rug pull risk ────────────────
+    _dep_lp_pct    = deployer_lp_c.get("pct")
+    _dep_lp_locked = deployer_lp_c.get("locked_pct") or 0.0
+    if _dep_lp_pct is not None:
+        _dep_unlocked = _dep_lp_pct - _dep_lp_locked
+        if _dep_unlocked > max_deployer_lp_pct:
+            _lock_note = f" (из них {_dep_lp_locked:.0f}% в локере)" if _dep_lp_locked > 0 else ""
+            return {"ok": False, "reason": f"Деплоер держит {_dep_lp_pct:.0f}% LP незаблокированными{_lock_note} — rug pull риск"}
+    elif not _dep_addr:
+        # Deployer unknown — use tight LP concentration check to catch unlocked LP holders
+        _lp_tight = await asyncio.to_thread(_check_lp_onchain_sync, w3, pair_address, max_deployer_lp_pct)
+        if not _lp_tight["ok"]:
+            return {"ok": False, "reason": _lp_tight["reason"]}
+
     info = {
         "name":           name,
         "symbol":         symbol,
@@ -1538,6 +1554,7 @@ async def check_token_fast(
     max_top10_holder_pct  = security.get("max_top10_holder_pct", 60.0)
     max_token_age_days    = security.get("max_token_age_days", 7)
     min_volume_5m_usd     = security.get("min_volume_5m_usd", 0.0)
+    max_deployer_lp_pct   = security.get("max_deployer_lp_pct", 30.0)
 
     # Re-run only the on-chain checks that depend on liquidity being present.
     # All three run in parallel — total ~200-300ms.
@@ -1633,6 +1650,20 @@ async def check_token_fast(
         )
         deployer_pct_f = _dh_f.get("pct")
         deployer_lp_f  = _dlp_f
+
+    # ── Hard block: deployer holds unlocked LP → rug pull risk ────────────────
+    _dep_lp_pct_f    = deployer_lp_f.get("pct")
+    _dep_lp_locked_f = deployer_lp_f.get("locked_pct") or 0.0
+    if _dep_lp_pct_f is not None:
+        _dep_unlocked_f = _dep_lp_pct_f - _dep_lp_locked_f
+        if _dep_unlocked_f > max_deployer_lp_pct:
+            _lock_note_f = f" (из них {_dep_lp_locked_f:.0f}% в локере)" if _dep_lp_locked_f > 0 else ""
+            return {"ok": False, "reason": f"Деплоер держит {_dep_lp_pct_f:.0f}% LP незаблокированными{_lock_note_f} — rug pull риск"}
+    elif not _dep_addr_f:
+        # Deployer unknown — use tight LP concentration check
+        _lp_tight_f = await asyncio.to_thread(_check_lp_onchain_sync, w3, pair_address, max_deployer_lp_pct)
+        if not _lp_tight_f["ok"]:
+            return {"ok": False, "reason": _lp_tight_f["reason"]}
 
     info = {
         "name":           name,
