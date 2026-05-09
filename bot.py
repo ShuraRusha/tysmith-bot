@@ -3616,9 +3616,9 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
                 f"| {deploy_count} контракт(ов) за 30 дн."
             )
         else:
-            deployer_line = f"✅ Деплоер: `{deployer_short}` _(через owner())_"
+            deployer_line = f"✅ Деплоер: `{deployer_short}` _(on-chain, BSCScan не успел)_"
     elif explorer_key:
-        deployer_line = f"❓ Деплоер: не найден в {explorer_name} и owner() недоступен"
+        deployer_line = f"❓ Деплоер: все методы не дали результат (BSCScan / owner() / mint scan)"
     else:
         deployer_line = f"➖ Деплоер: {explorer_name} API ключ не задан"
 

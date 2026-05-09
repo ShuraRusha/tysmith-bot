@@ -233,6 +233,39 @@ def _get_token_owner_sync(w3: Web3, token_address: str) -> str | None:
     return None
 
 
+def _get_deployer_from_mint_sync(w3: Web3, token_address: str) -> str | None:
+    """
+    Find deployer via the first mint event: Transfer(from=0x0, to=deployer).
+    Works for any ERC20 even when BSCScan is unindexed and owner() is absent.
+    Scans last 200 000 blocks (~7 days on BSC) — always covers fresh tokens.
+    """
+    try:
+        token_cs  = Web3.to_checksum_address(token_address)
+        cur_block = w3.eth.block_number
+        # Try narrow window first (fast), widen on miss
+        for lookback in (5_000, 200_000):
+            from_block = max(0, cur_block - lookback)
+            logs = w3.eth.get_logs({
+                "address":   token_cs,
+                "topics":    [_TRANSFER_TOPIC, _ZERO_TOPIC],
+                "fromBlock": from_block,
+                "toBlock":   cur_block,
+            })
+            if not logs:
+                continue
+            first = sorted(logs, key=lambda l: (l["blockNumber"], l["logIndex"]))[0]
+            topics = first.get("topics", [])
+            if len(topics) < 3:
+                continue
+            addr = "0x" + first["topics"][2].hex()[-40:]
+            if addr.lower() != _ZERO_ADDRESS:
+                return addr.lower()
+        return None
+    except Exception as e:
+        log.debug(f"Mint deployer lookup failed for {token_address}: {e}")
+        return None
+
+
 def _get_deployer_holdings_sync(w3: Web3, token_address: str, deployer_address: str) -> dict:
     """Return deployer wallet balance as % of total token supply."""
     try:
@@ -993,7 +1026,7 @@ async def analyze_token(
         symbol       = token_meta["symbol"]
         holder_count = "?"
 
-    # ── Deployer address: BSCScan result or on-chain owner() fallback ───────────
+    # ── Deployer address: BSCScan → owner() → first mint fallback ───────────────
     _deployer_addr = deployer_result.get("deployer")
     _deployer_renounced = False
     if not _deployer_addr:
@@ -1003,6 +1036,11 @@ async def analyze_token(
         elif _owner_fb:
             _deployer_addr = _owner_fb
             log.info(f"[OwnerFallback] {token_address[:10]}… deployer via owner(): {_deployer_addr[:10]}…")
+    if not _deployer_addr and not _deployer_renounced:
+        _mint_fb = await asyncio.to_thread(_get_deployer_from_mint_sync, w3, token_address)
+        if _mint_fb:
+            _deployer_addr = _mint_fb
+            log.info(f"[MintFallback] {token_address[:10]}… deployer via first mint: {_deployer_addr[:10]}…")
 
     deployer_pct: float | None = None
     deployer_lp: dict = {}
@@ -1420,6 +1458,10 @@ async def check_token(
             _dep_renounced = True
         elif _owner_fb:
             _dep_addr = _owner_fb
+    if not _dep_addr and not _dep_renounced:
+        _mint_fb = await asyncio.to_thread(_get_deployer_from_mint_sync, w3, token_address)
+        if _mint_fb:
+            _dep_addr = _mint_fb
     deployer_pct: float | None = None
     deployer_lp_c: dict = {}
     if _dep_addr:
@@ -1578,6 +1620,10 @@ async def check_token_fast(
             _dep_renounced_f = True
         elif _owner_fb_f:
             _dep_addr_f = _owner_fb_f
+    if not _dep_addr_f and not _dep_renounced_f:
+        _mint_fb_f = await asyncio.to_thread(_get_deployer_from_mint_sync, w3, token_address)
+        if _mint_fb_f:
+            _dep_addr_f = _mint_fb_f
     deployer_pct_f: float | None = None
     deployer_lp_f: dict = {}
     if _dep_addr_f:
