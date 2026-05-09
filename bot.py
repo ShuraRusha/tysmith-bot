@@ -3555,14 +3555,21 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
         red_flags.append("ликвидность не заблокирована")
     if not data.get("deployer_ok", True):
         red_flags.append(data.get("deployer_reason", "серийный деплоер"))
+    _dep_lp_rf = data.get("deployer_lp_pct")
+    if _dep_lp_rf is not None and _dep_lp_rf > 30:
+        red_flags.append(f"деплоер держит {_dep_lp_rf:.0f}% LP — высокий риск rug pull")
 
     caution_flags = list(data["warnings"])
-    if lp_locked is None:
+    if lp_locked is None and not data.get("lp_onchain_ok", True) is False:
+        caution_flags.append("LP статус не подтверждён GoPlus (проверено on-chain)")
+    elif lp_locked is None:
         caution_flags.append("LP-холдеры не проиндексированы")
     if not data["goplus_ok"]:
         caution_flags.append("GoPlus недоступен")
     if _analyze_collusion.get("suspicious"):
         caution_flags.append(_analyze_collusion["label"])
+    if _dep_lp_rf is not None and 5 < _dep_lp_rf <= 30:
+        caution_flags.append(f"деплоер держит {_dep_lp_rf:.0f}% LP")
 
     if red_flags:
         rec_icon = "🔴"
@@ -3630,6 +3637,31 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
     else:
         collusion_line = "✅ Покупатели: координация не обнаружена"
 
+    # ── LP display (GoPlus + on-chain LP check + deployer LP balance) ──────────
+    dep_lp_pct    = data.get("deployer_lp_pct")
+    dep_lp_locked = data.get("deployer_lp_locked_pct", 0.0) or 0.0
+    dep_lp_locker = data.get("deployer_lp_locker")
+
+    if lp_locked is True:
+        lp_str = "✅ Заблокирован (GoPlus)"
+    elif lp_locked is False:
+        lp_str = "❌ Не заблокирован — rug risk!"
+    elif not data.get("lp_onchain_ok", True):
+        lp_str = f"❌ {data.get('lp_onchain_reason', 'высокая концентрация on-chain')}"
+    else:
+        lp_str = "❓ Статус неизвестен (GoPlus не проиндексировал)"
+
+    if dep_lp_pct is None:
+        dep_lp_line = "➖ LP баланс деплоера: адрес неизвестен"
+    elif dep_lp_locked >= 80.0:
+        dep_lp_line = f"✅ LP деплоера: *{dep_lp_pct:.1f}%* заблокировано в {dep_lp_locker}"
+    elif dep_lp_pct <= 5.0:
+        dep_lp_line = f"✅ LP деплоера: *{dep_lp_pct:.1f}%* — риск минимальный"
+    elif dep_lp_pct <= 30.0:
+        dep_lp_line = f"⚠️ LP деплоера: *{dep_lp_pct:.1f}%* — может забрать часть ликвидности"
+    else:
+        dep_lp_line = f"🚨 LP деплоера: *{dep_lp_pct:.1f}%* — высокий риск rug pull!"
+
     chain_badge = "🔵 Base" if is_base else "🟡 BSC"
     text = (
         f"🔍 *Анализ токена* {chain_badge}\n\n"
@@ -3647,7 +3679,8 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
         f"{tax_sell_icon} Sell tax: *{eff_sell_tax:.1f}%* (макс {config.MAX_SELL_TAX}%)\n\n"
         f"*🧑‍🤝‍🧑 Концентрация:*\n"
         f"{top10_icon} Топ-10 холдеры: *{top10:.1f}%* (макс {config.MAX_TOP10_HOLDER_PCT}%)\n"
-        f"🔒 LP: {lp_str}\n\n"
+        f"🔒 LP статус: {lp_str}\n"
+        f"{dep_lp_line}\n\n"
         f"*🛡 Безопасность:*\n"
         f"{buy_sim_icon} Buy-симуляция: {'OK' if data['sim_buy_ok'] else data['sim_buy_reason']}\n"
         f"{sell_sim_icon} Sell-симуляция: {'Не проверена (пул пустой — проверка будет при покупке)' if data.get('sim_sell_skipped') else ('OK' if data['sim_sell_ok'] else data['sim_sell_reason'])}\n"

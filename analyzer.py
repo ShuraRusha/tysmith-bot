@@ -248,6 +248,55 @@ def _get_deployer_holdings_sync(w3: Web3, token_address: str, deployer_address: 
         return {"pct": None}
 
 
+def _get_deployer_lp_pct_sync(w3: Web3, pair_address: str, deployer_address: str) -> dict:
+    """
+    Return deployer's LP token balance as % of total LP supply.
+    Also checks if LP is held by a known locker contract.
+
+    Returns:
+      {"pct": float, "locked": bool, "locker": str|None}
+      {"pct": None}  on error
+    """
+    try:
+        pair_cs  = Web3.to_checksum_address(pair_address)
+        lp       = w3.eth.contract(address=pair_cs, abi=LP_ABI)
+        total    = lp.functions.totalSupply().call()
+        if total == 0:
+            return {"pct": 0.0, "locked": None, "locker": None}
+        dep_cs  = Web3.to_checksum_address(deployer_address)
+        dep_bal = lp.functions.balanceOf(dep_cs).call()
+        dep_pct = dep_bal / total * 100
+
+        # Check what fraction is in known lockers
+        locked_pct = 0.0
+        locker_name = None
+        _LOCKER_NAMES = {
+            "0xc765bddb93b0d1c1a88282ba0fa6b2d00e3e0c83": "Unicrypt",
+            "0x407993575c91ce7643a4d4ccacc9a98c36ee1bb": "PinkSale",
+            "0xe2fe530c047f2d85298b07d9333c05737f1435fb": "Team Finance",
+            "0xa5e0829caced8ffdd4de3c43696c57f7d7a678ff": "DxLock",
+            "0x000000000000000000000000000000000000dead": "Burned",
+        }
+        for addr, name in _LOCKER_NAMES.items():
+            try:
+                bal = lp.functions.balanceOf(Web3.to_checksum_address(addr)).call()
+                pct = bal / total * 100
+                if pct > 1.0:
+                    locked_pct += pct
+                    locker_name = name
+            except Exception:
+                continue
+
+        return {
+            "pct":    round(dep_pct, 1),
+            "locked_pct": round(locked_pct, 1),
+            "locker": locker_name,
+            "locked": locked_pct >= 80.0,
+        }
+    except Exception:
+        return {"pct": None}
+
+
 def _simulate_sell_sync(w3: Web3, token_address: str, pair_address: str,
                         router_address: str = None) -> dict:
     """
@@ -927,11 +976,10 @@ async def analyze_token(
     )
 
     # ── On-chain metrics ──────────────────────────────────────────────────────
-    liquidity_usd = await asyncio.to_thread(
-        _get_liquidity_usd_sync, w3, pair_address, base_token, bnb_price, native_token
-    )
-    fdv_usd = await asyncio.to_thread(
-        _get_fdv_usd_sync, w3, token_address, bnb_price, router_address, native_token
+    liquidity_usd, fdv_usd, lp_onchain = await asyncio.gather(
+        asyncio.to_thread(_get_liquidity_usd_sync, w3, pair_address, base_token, bnb_price, native_token),
+        asyncio.to_thread(_get_fdv_usd_sync, w3, token_address, bnb_price, router_address, native_token),
+        asyncio.to_thread(_check_lp_onchain_sync, w3, pair_address, 95.0),  # 95% threshold for display only
     )
 
     # ── Token identity ────────────────────────────────────────────────────────
@@ -957,9 +1005,14 @@ async def analyze_token(
             log.info(f"[OwnerFallback] {token_address[:10]}… deployer via owner(): {_deployer_addr[:10]}…")
 
     deployer_pct: float | None = None
+    deployer_lp: dict = {}
     if _deployer_addr:
-        _dh = await asyncio.to_thread(_get_deployer_holdings_sync, w3, token_address, _deployer_addr)
+        _dh, _dlp = await asyncio.gather(
+            asyncio.to_thread(_get_deployer_holdings_sync, w3, token_address, _deployer_addr),
+            asyncio.to_thread(_get_deployer_lp_pct_sync, w3, pair_address, _deployer_addr),
+        )
         deployer_pct = _dh.get("pct")
+        deployer_lp  = _dlp
 
     # ── honeypot.is taxes (works before GoPlus indexes the token) ────────────
     hp_buy_tax  = hp_result.get("buy_tax")   # None if API unavailable
@@ -1006,7 +1059,7 @@ async def analyze_token(
             if not is_safe:
                 top10_pct += pct
 
-        # LP lock
+        # LP lock — try GoPlus first, then on-chain fallback
         lp_holders = goplus_data.get("lp_holders") or []
         if lp_holders:
             lp_locked = True
@@ -1018,7 +1071,11 @@ async def analyze_token(
                 if not is_safe and lp_pct > 50:
                     lp_locked = False
                     break
-        # else: lp_locked stays None (not indexed)
+        else:
+            # GoPlus hasn't indexed LP holders yet — use on-chain result
+            if lp_onchain.get("ok") is False:
+                lp_locked = False   # high concentration detected on-chain
+            # lp_locked stays None only if on-chain returned ok=True (can't distinguish locked vs unlocked)
 
     # ── DexScreener data ──────────────────────────────────────────────────────
     age_days = None
@@ -1069,6 +1126,12 @@ async def analyze_token(
         "deployer_ok":           deployer_result["ok"],
         "deployer_reason":       deployer_result.get("reason", ""),
         "deployer_pct":          deployer_pct,
+        "deployer_lp_pct":       deployer_lp.get("pct"),
+        "deployer_lp_locked_pct": deployer_lp.get("locked_pct"),
+        "deployer_lp_locker":    deployer_lp.get("locker"),
+        # LP on-chain check result (for display in /analyze)
+        "lp_onchain_ok":         lp_onchain.get("ok", True),
+        "lp_onchain_reason":     lp_onchain.get("reason", ""),
     }
 
 
@@ -1358,9 +1421,14 @@ async def check_token(
         elif _owner_fb:
             _dep_addr = _owner_fb
     deployer_pct: float | None = None
+    deployer_lp_c: dict = {}
     if _dep_addr:
-        _dh = await asyncio.to_thread(_get_deployer_holdings_sync, w3, token_address, _dep_addr)
-        deployer_pct = _dh.get("pct")
+        _dh_c, _dlp_c = await asyncio.gather(
+            asyncio.to_thread(_get_deployer_holdings_sync, w3, token_address, _dep_addr),
+            asyncio.to_thread(_get_deployer_lp_pct_sync, w3, pair_address, _dep_addr),
+        )
+        deployer_pct   = _dh_c.get("pct")
+        deployer_lp_c  = _dlp_c
 
     info = {
         "name":           name,
@@ -1382,6 +1450,9 @@ async def check_token(
         "deployer":              _dep_addr,
         "deployer_renounced":    _dep_renounced,
         "deployer_pct":          deployer_pct,
+        "deployer_lp_pct":       deployer_lp_c.get("pct"),
+        "deployer_lp_locked_pct": deployer_lp_c.get("locked_pct"),
+        "deployer_lp_locker":    deployer_lp_c.get("locker"),
     }
     return {"ok": True, "info": info}
 
@@ -1508,9 +1579,14 @@ async def check_token_fast(
         elif _owner_fb_f:
             _dep_addr_f = _owner_fb_f
     deployer_pct_f: float | None = None
+    deployer_lp_f: dict = {}
     if _dep_addr_f:
-        _dh_f = await asyncio.to_thread(_get_deployer_holdings_sync, w3, token_address, _dep_addr_f)
+        _dh_f, _dlp_f = await asyncio.gather(
+            asyncio.to_thread(_get_deployer_holdings_sync, w3, token_address, _dep_addr_f),
+            asyncio.to_thread(_get_deployer_lp_pct_sync, w3, pair_address, _dep_addr_f),
+        )
         deployer_pct_f = _dh_f.get("pct")
+        deployer_lp_f  = _dlp_f
 
     info = {
         "name":           name,
@@ -1531,6 +1607,9 @@ async def check_token_fast(
         "deployer":              _dep_addr_f,
         "deployer_renounced":    _dep_renounced_f,
         "deployer_pct":          deployer_pct_f,
+        "deployer_lp_pct":       deployer_lp_f.get("pct"),
+        "deployer_lp_locked_pct": deployer_lp_f.get("locked_pct"),
+        "deployer_lp_locker":    deployer_lp_f.get("locker"),
     }
     return {"ok": True, "info": info}
 
