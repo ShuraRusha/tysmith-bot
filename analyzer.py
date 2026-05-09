@@ -1036,7 +1036,7 @@ async def analyze_token(
         elif _owner_fb:
             _deployer_addr = _owner_fb
             log.info(f"[OwnerFallback] {token_address[:10]}… deployer via owner(): {_deployer_addr[:10]}…")
-    if not _deployer_addr and not _deployer_renounced:
+    if not _deployer_addr:  # also run when renounced — original deployer may still hold LP
         _mint_fb = await asyncio.to_thread(_get_deployer_from_mint_sync, w3, token_address)
         if _mint_fb:
             _deployer_addr = _mint_fb
@@ -1458,7 +1458,7 @@ async def check_token(
             _dep_renounced = True
         elif _owner_fb:
             _dep_addr = _owner_fb
-    if not _dep_addr and not _dep_renounced:
+    if not _dep_addr:  # also run when renounced — original deployer may still hold LP
         _mint_fb = await asyncio.to_thread(_get_deployer_from_mint_sync, w3, token_address)
         if _mint_fb:
             _dep_addr = _mint_fb
@@ -1620,7 +1620,7 @@ async def check_token_fast(
             _dep_renounced_f = True
         elif _owner_fb_f:
             _dep_addr_f = _owner_fb_f
-    if not _dep_addr_f and not _dep_renounced_f:
+    if not _dep_addr_f:  # also run when renounced — original deployer may still hold LP
         _mint_fb_f = await asyncio.to_thread(_get_deployer_from_mint_sync, w3, token_address)
         if _mint_fb_f:
             _dep_addr_f = _mint_fb_f

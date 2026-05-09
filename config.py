@@ -114,7 +114,7 @@ MEMPOOL_ENABLED = os.getenv("MEMPOOL_ENABLED", "false").lower() == "true"
 
 # ── Bot behaviour ─────────────────────────────────────────────────────────────
 MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS",     "3"))    # manual mode cap
-PENDING_TTL       = int(os.getenv("PENDING_TTL",       "60"))   # seconds before alert expires
+PENDING_TTL       = int(os.getenv("PENDING_TTL",       "300"))  # seconds before alert expires (5 min)
 
 # Auto-buy mode: bot buys immediately without user confirmation
 # DEFAULT=true — bot starts in auto mode; set AUTO_BUY=false to start in manual mode
