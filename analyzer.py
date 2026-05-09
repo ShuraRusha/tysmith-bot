@@ -266,6 +266,43 @@ def _get_deployer_from_mint_sync(w3: Web3, token_address: str) -> str | None:
         return None
 
 
+def _get_lp_adder_sync(w3: Web3, pair_address: str) -> str | None:
+    """
+    Find who added initial liquidity by scanning LP-token mint events on the PAIR contract.
+
+    When addLiquidity() is called, PancakeSwap V2 pair emits:
+      Transfer(from=0x0, to=<LP adder>, value=<LP amount>)
+    This is 100% on-chain data — available immediately, no external API needed.
+
+    Returns lowercased address of the first LP recipient, or None.
+    """
+    try:
+        pair_cs = Web3.to_checksum_address(pair_address)
+        cur_block = w3.eth.block_number
+        for lookback in (5_000, 200_000):
+            from_block = max(0, cur_block - lookback)
+            logs = w3.eth.get_logs({
+                "address":   pair_cs,
+                "topics":    [_TRANSFER_TOPIC, _ZERO_TOPIC],  # LP mint = Transfer from 0x0
+                "fromBlock": from_block,
+                "toBlock":   cur_block,
+            })
+            if not logs:
+                continue
+            for log_entry in sorted(logs, key=lambda l: (l["blockNumber"], l["logIndex"])):
+                topics = log_entry.get("topics", [])
+                if len(topics) < 3:
+                    continue
+                addr_l = ("0x" + log_entry["topics"][2].hex()[-40:]).lower()
+                if addr_l != _ZERO_ADDRESS:
+                    log.debug(f"[LPAdderFallback] {pair_address[:10]}… LP adder via pair mint: {addr_l[:10]}…")
+                    return addr_l
+        return None
+    except Exception as e:
+        log.debug(f"LP adder lookup failed for {pair_address}: {e}")
+        return None
+
+
 def _get_deployer_holdings_sync(w3: Web3, token_address: str, deployer_address: str) -> dict:
     """Return deployer wallet balance as % of total token supply."""
     try:
@@ -1041,6 +1078,11 @@ async def analyze_token(
         if _mint_fb:
             _deployer_addr = _mint_fb
             log.info(f"[MintFallback] {token_address[:10]}… deployer via first mint: {_deployer_addr[:10]}…")
+    if not _deployer_addr:  # LP mint scan on pair contract — most reliable for fresh tokens
+        _lp_adder_fb = await asyncio.to_thread(_get_lp_adder_sync, w3, pair_address)
+        if _lp_adder_fb:
+            _deployer_addr = _lp_adder_fb
+            log.info(f"[LPAdderFallback] {token_address[:10]}… deployer via LP mint: {_deployer_addr[:10]}…")
 
     deployer_pct: float | None = None
     deployer_lp: dict = {}
@@ -1464,6 +1506,10 @@ async def check_token(
         _mint_fb = await asyncio.to_thread(_get_deployer_from_mint_sync, w3, token_address)
         if _mint_fb:
             _dep_addr = _mint_fb
+    if not _dep_addr:  # LP mint scan on pair contract — most reliable for fresh tokens
+        _lp_adder_fb = await asyncio.to_thread(_get_lp_adder_sync, w3, pair_address)
+        if _lp_adder_fb:
+            _dep_addr = _lp_adder_fb
     deployer_pct: float | None = None
     deployer_lp_c: dict = {}
     if _dep_addr:
@@ -1641,6 +1687,10 @@ async def check_token_fast(
         _mint_fb_f = await asyncio.to_thread(_get_deployer_from_mint_sync, w3, token_address)
         if _mint_fb_f:
             _dep_addr_f = _mint_fb_f
+    if not _dep_addr_f:  # LP mint scan on pair contract — most reliable for fresh tokens
+        _lp_adder_fb_f = await asyncio.to_thread(_get_lp_adder_sync, w3, pair_address)
+        if _lp_adder_fb_f:
+            _dep_addr_f = _lp_adder_fb_f
     deployer_pct_f: float | None = None
     deployer_lp_f: dict = {}
     if _dep_addr_f:

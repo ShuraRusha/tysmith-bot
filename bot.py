@@ -1574,10 +1574,19 @@ async def _on_pair_found_inner(
         + (
             f"🏦 Деплоер держит: *{info['deployer_pct']:.1f}%* суплая"
             + (" ✅" if info['deployer_pct'] <= 20 else " ⚠️ Высокая концентрация" if info['deployer_pct'] <= 50 else " 🚨 Очень высокая концентрация")
-            + "\n\n"
-            if info.get("deployer_pct") is not None else "\n"
-        ) +
-        f"{warn_block}\n\n"
+            + "\n"
+            if info.get("deployer_pct") is not None else ""
+        )
+        + (
+            (lambda lp, lk, lo: (
+                f"🔒 LP деплоера: *{lp:.1f}%*"
+                + (f" (залочено {lk:.0f}% в {lo})" if lk and lk >= 80 else (" ⚠️ частично залочено" if lk else " 🚨 не залочено!"))
+                + "\n"
+            ))(info['deployer_lp_pct'], info.get('deployer_lp_locked_pct', 0) or 0, info.get('deployer_lp_locker'))
+            if info.get("deployer_lp_pct") is not None else ""
+        )
+        + "\n"
+        + f"{warn_block}\n\n"
         f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
         f"| Trailing: -{config.TRAILING_STOP_PCT}% от пика  "
         f"| SL: -{config.STOP_LOSS}%\n"
@@ -1878,10 +1887,19 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
         + (
             f"🏦 Деплоер держит: *{info['deployer_pct']:.1f}%* суплая"
             + (" ✅" if info['deployer_pct'] <= 20 else " ⚠️ Высокая концентрация" if info['deployer_pct'] <= 50 else " 🚨 Очень высокая концентрация")
-            + "\n\n"
-            if info.get("deployer_pct") is not None else "\n"
-        ) +
-        f"{warn_block}\n\n"
+            + "\n"
+            if info.get("deployer_pct") is not None else ""
+        )
+        + (
+            (lambda lp, lk, lo: (
+                f"🔒 LP деплоера: *{lp:.1f}%*"
+                + (f" (залочено {lk:.0f}% в {lo})" if lk and lk >= 80 else (" ⚠️ частично залочено" if lk else " 🚨 не залочено!"))
+                + "\n"
+            ))(info['deployer_lp_pct'], info.get('deployer_lp_locked_pct', 0) or 0, info.get('deployer_lp_locker'))
+            if info.get("deployer_lp_pct") is not None else ""
+        )
+        + "\n"
+        + f"{warn_block}\n\n"
         f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
         f"| Trailing: -{config.TRAILING_STOP_PCT}%  | SL: -{config.STOP_LOSS}%\n"
         f"💰 Покупка: *{buy_amount} ETH* (~${buy_amount * eth_price:.0f}) "
@@ -2112,10 +2130,19 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
         + (
             f"🏦 Деплоер держит: *{info['deployer_pct']:.1f}%* суплая"
             + (" ✅" if info['deployer_pct'] <= 20 else " ⚠️ Высокая концентрация" if info['deployer_pct'] <= 50 else " 🚨 Очень высокая концентрация")
-            + "\n\n"
-            if info.get("deployer_pct") is not None else "\n"
-        ) +
-        f"{warn_block}\n\n"
+            + "\n"
+            if info.get("deployer_pct") is not None else ""
+        )
+        + (
+            (lambda lp, lk, lo: (
+                f"🔒 LP деплоера: *{lp:.1f}%*"
+                + (f" (залочено {lk:.0f}% в {lo})" if lk and lk >= 80 else (" ⚠️ частично залочено" if lk else " 🚨 не залочено!"))
+                + "\n"
+            ))(info['deployer_lp_pct'], info.get('deployer_lp_locked_pct', 0) or 0, info.get('deployer_lp_locker'))
+            if info.get("deployer_lp_pct") is not None else ""
+        )
+        + "\n"
+        + f"{warn_block}\n\n"
         f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
         f"| Trailing: -{config.TRAILING_STOP_PCT}%  | SL: -{config.STOP_LOSS}%\n"
         f"💰 Покупка: *{buy_amount} BNB* (~${buy_amount * bnb_price:.0f}) "
@@ -2350,10 +2377,19 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
         + (
             f"🏦 Деплоер держит: *{info['deployer_pct']:.1f}%* суплая"
             + (" ✅" if info['deployer_pct'] <= 20 else " ⚠️ Высокая концентрация" if info['deployer_pct'] <= 50 else " 🚨 Очень высокая концентрация")
-            + "\n\n"
-            if info.get("deployer_pct") is not None else "\n"
-        ) +
-        f"{warn_block}\n\n"
+            + "\n"
+            if info.get("deployer_pct") is not None else ""
+        )
+        + (
+            (lambda lp, lk, lo: (
+                f"🔒 LP деплоера: *{lp:.1f}%*"
+                + (f" (залочено {lk:.0f}% в {lo})" if lk and lk >= 80 else (" ⚠️ частично залочено" if lk else " 🚨 не залочено!"))
+                + "\n"
+            ))(info['deployer_lp_pct'], info.get('deployer_lp_locked_pct', 0) or 0, info.get('deployer_lp_locker'))
+            if info.get("deployer_lp_pct") is not None else ""
+        )
+        + "\n"
+        + f"{warn_block}\n\n"
         f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
         f"| Trailing: -{config.TRAILING_STOP_PCT}%  | SL: -{config.STOP_LOSS}%\n"
         f"💰 Покупка: *{buy_amount} ETH* (~${buy_amount * eth_price:.0f}) "
@@ -3619,8 +3655,11 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
     explorer_name = "Basescan" if is_base else "BSCScan"
     explorer_key  = config.BASESCAN_API_KEY if is_base else config.BSCSCAN_API_KEY
 
-    if deployer_renounced:
-        deployer_line = "🔓 Деплоер: ownership renounced (address(0)) — ✅ хороший знак"
+    if deployer_renounced and not deployer_addr:
+        deployer_line = "🔓 Деплоер: ownership renounced (address(0)) — LP adder не найден ⚠️"
+    elif deployer_renounced and deployer_addr:
+        deployer_short = deployer_addr[:6] + "…" + deployer_addr[-4:]
+        deployer_line = f"🔓 Ownership renounced | LP adder: `{deployer_short}` _(on-chain via pair)_"
     elif deployer_addr:
         deployer_short = deployer_addr[:6] + "…" + deployer_addr[-4:]
         if deploy_count is not None:
@@ -3632,18 +3671,18 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
         else:
             deployer_line = f"✅ Деплоер: `{deployer_short}` _(on-chain, BSCScan не успел)_"
     elif explorer_key:
-        deployer_line = f"❓ Деплоер: все методы не дали результат (BSCScan / owner() / mint scan)"
+        deployer_line = f"❓ Деплоер: не найден (BSCScan / owner() / mint scan / LP mint — все методы не дали результат)"
     else:
         deployer_line = f"➖ Деплоер: {explorer_name} API ключ не задан"
 
-    if deployer_renounced:
-        deployer_pct_line = "🔓 Баланс деплоера: 0% (ownership renounced)"
-    elif deployer_pct is not None:
+    if deployer_addr and deployer_pct is not None:
         dep_pct_icon = "✅" if deployer_pct <= 20 else ("⚠️" if deployer_pct <= 50 else "🚨")
         dep_pct_label = "" if deployer_pct <= 20 else (" — высокая концентрация" if deployer_pct <= 50 else " — очень высокая концентрация")
         deployer_pct_line = f"{dep_pct_icon} Деплоер держит: *{deployer_pct:.1f}%* суплая{dep_pct_label}"
+    elif deployer_renounced and not deployer_addr:
+        deployer_pct_line = "🔓 Баланс деплоера: 0% (ownership renounced, адрес не найден)"
     else:
-        deployer_pct_line = "❓ Баланс деплоера: адрес не определён (BSCScan не проиндексировал, owner() недоступен)"
+        deployer_pct_line = "❓ Баланс деплоера: адрес не определён"
 
     # Collusion check summary for the security section
     if _analyze_collusion.get("suspicious"):
