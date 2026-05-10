@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - claude/improve-bot-zQpBF
 
 jobs:
   deploy:
@@ -17,7 +18,9 @@ jobs:
           password: ${{ secrets.SERVER_PASSWORD }}
           script: |
             cd /root/tysmith-bot
-            git pull origin main
+            git fetch origin
+            git checkout claude/improve-bot-zQpBF
+            git pull origin claude/improve-bot-zQpBF
             pip install -r requirements.txt -q
             systemctl restart tysmith-bot
             echo "Deploy done: $(date)"
