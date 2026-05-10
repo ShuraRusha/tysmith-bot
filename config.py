@@ -134,6 +134,15 @@ LP_HOLDER_MAX_PCT    = float(os.getenv("LP_HOLDER_MAX_PCT",    "100")) # 100 = d
 MAX_DEPLOYER_LP_PCT  = float(os.getenv("MAX_DEPLOYER_LP_PCT",  "30"))  # max % of unlocked LP deployer can hold — hard block if exceeded
 MIN_HOLDER_COUNT     = int(os.getenv("MIN_HOLDER_COUNT",       "0"))   # 0 = disabled — sniper enters first, 1-3 holders is normal at launch
 
+# ── Quality scoring system ────────────────────────────────────────────────────
+# Score 0-10: LP lock (3) + verified contract (2) + social (2) + deployer age (1) + listing age (1) + buyers (1)
+# MIN_TOKEN_SCORE: 0=disabled, 3=require LP lock only, 5=require LP+social OR LP+verified, 7=strict
+MIN_TOKEN_SCORE       = int(os.getenv("MIN_TOKEN_SCORE",       "5"))
+MIN_LP_LOCK_PCT_SCORE = float(os.getenv("MIN_LP_LOCK_PCT_SCORE","80"))  # LP locked % for full 3 pts
+MIN_LISTING_AGE_MIN   = float(os.getenv("MIN_LISTING_AGE_MIN", "0"))    # 0=disabled (always +1)
+MIN_BUYERS_SCORE      = int(os.getenv("MIN_BUYERS_SCORE",     "10"))    # 0=disabled (always +1)
+MIN_DEPLOYER_AGE_DAYS = float(os.getenv("MIN_DEPLOYER_AGE_DAYS","30"))  # days for deployer wallet age
+
 # ── Token quality filters ─────────────────────────────────────────────────────
 MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD",   "0"))        # 0 = выкл. — market cap на T+0 не отличает хорошее от скама
 MIN_FDV_USD        = float(os.getenv("MIN_FDV_USD",          "0"))        # 0 = отключён — реальная защита = симуляция buy/sell + LP check

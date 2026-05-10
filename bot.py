@@ -384,7 +384,7 @@ def _is_token_duplicate(token_address: str, dex_label: str = "") -> bool:
 
 # Increment when adding new persistent params or changing hardcoded defaults.
 # Used to migrate old settings files that pre-date a change.
-SETTINGS_VERSION = 25
+SETTINGS_VERSION = 26
 
 _PERSISTENT_SETTINGS = [
     "BUY_PCT_OF_BALANCE", "BUY_MIN_BNB", "BUY_MAX_BNB",
@@ -403,6 +403,9 @@ _PERSISTENT_SETTINGS = [
     "DEMO_MODE",
     # Added in v25:
     "MAX_DEPLOYER_LP_PCT",
+    # Added in v26 (quality scoring system):
+    "MIN_TOKEN_SCORE", "MIN_LP_LOCK_PCT_SCORE",
+    "MIN_LISTING_AGE_MIN", "MIN_BUYERS_SCORE", "MIN_DEPLOYER_AGE_DAYS",
 ]
 
 
@@ -657,6 +660,15 @@ def _load_settings():
         if saved_version < 25:
             config.MAX_DEPLOYER_LP_PCT = 30.0
             log.info("Settings migration v24→v25: MAX_DEPLOYER_LP_PCT=30% added")
+
+        # Migration v25 → v26: quality scoring system (default MIN_TOKEN_SCORE=5)
+        if saved_version < 26:
+            config.MIN_TOKEN_SCORE       = 5
+            config.MIN_LP_LOCK_PCT_SCORE = 80.0
+            config.MIN_LISTING_AGE_MIN   = 0.0
+            config.MIN_BUYERS_SCORE      = 10
+            config.MIN_DEPLOYER_AGE_DAYS = 30.0
+            log.info("Settings migration v25→v26: quality scoring system added (MIN_TOKEN_SCORE=5)")
 
         # Restore bot mode (after migrations so v10 override above takes effect)
         if "__is_auto" in data and saved_version >= 10:
@@ -1050,6 +1062,11 @@ async def _wait_for_liquidity_and_retry(
                         min_fdv_usd=config.MIN_FDV_USD,
                         max_fdv_usd=config.MAX_FDV_USD,
                         security=cached_sec["security"],
+                        min_token_score=config.MIN_TOKEN_SCORE,
+                        min_lp_lock_pct_score=config.MIN_LP_LOCK_PCT_SCORE,
+                        min_listing_age_min=config.MIN_LISTING_AGE_MIN,
+                        min_buyers_score=config.MIN_BUYERS_SCORE,
+                        min_deployer_age_days=config.MIN_DEPLOYER_AGE_DAYS,
                     )
                     if fast_result["ok"]:
                         elapsed = int(time.time() - start_time)
@@ -1428,6 +1445,11 @@ async def _on_pair_found_inner(
                     min_holder_count=config.MIN_HOLDER_COUNT,
                     bscscan_api_key=config.BSCSCAN_API_KEY,
                     max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
+                    min_token_score=config.MIN_TOKEN_SCORE,
+                    min_lp_lock_pct_score=config.MIN_LP_LOCK_PCT_SCORE,
+                    min_listing_age_min=config.MIN_LISTING_AGE_MIN,
+                    min_buyers_score=config.MIN_BUYERS_SCORE,
+                    min_deployer_age_days=config.MIN_DEPLOYER_AGE_DAYS,
                 )
             except Exception as e:
                 log.error(f"[PancakeSwap] check_token error for {token_address[:10]}…: {e}")
@@ -1587,7 +1609,11 @@ async def _on_pair_found_inner(
         )
         + "\n"
         + f"{warn_block}\n\n"
-        f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
+        + (
+            (lambda s: f"🏆 Рейтинг токена: *{s['score']}/{s['max_score']}* {s['grade']} ({s['pct']:.0f}%)\n")(info["token_score"])
+            if info.get("token_score") else ""
+        )
+        + f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
         f"| Trailing: -{config.TRAILING_STOP_PCT}% от пика  "
         f"| SL: -{config.STOP_LOSS}%\n"
         f"💰 Покупка: *{buy_amount} BNB* (~${buy_amount * bnb_price:.0f}) "
@@ -1776,6 +1802,11 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
             stable_token=config.USDC_BASE,
             dex_chain="base",
             explorer_url="https://api.basescan.org/api",
+            min_token_score=config.MIN_TOKEN_SCORE,
+            min_lp_lock_pct_score=config.MIN_LP_LOCK_PCT_SCORE,
+            min_listing_age_min=config.MIN_LISTING_AGE_MIN,
+            min_buyers_score=config.MIN_BUYERS_SCORE,
+            min_deployer_age_days=config.MIN_DEPLOYER_AGE_DAYS,
         )
     except Exception as e:
         log.error(f"[Base] check_token error for {token_address[:10]}…: {e}")
@@ -1900,7 +1931,11 @@ async def on_base_pair_found(token_address: str, base_token: str, pair_address: 
         )
         + "\n"
         + f"{warn_block}\n\n"
-        f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
+        + (
+            (lambda s: f"🏆 Рейтинг токена: *{s['score']}/{s['max_score']}* {s['grade']} ({s['pct']:.0f}%)\n")(info["token_score"])
+            if info.get("token_score") else ""
+        )
+        + f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
         f"| Trailing: -{config.TRAILING_STOP_PCT}%  | SL: -{config.STOP_LOSS}%\n"
         f"💰 Покупка: *{buy_amount} ETH* (~${buy_amount * eth_price:.0f}) "
         f"| Баланс: {balance:.3f} ETH"
@@ -2037,6 +2072,11 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
             max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
             router_address=config.BISWAP_ROUTER,
             native_token=config.WBNB,
+            min_token_score=config.MIN_TOKEN_SCORE,
+            min_lp_lock_pct_score=config.MIN_LP_LOCK_PCT_SCORE,
+            min_listing_age_min=config.MIN_LISTING_AGE_MIN,
+            min_buyers_score=config.MIN_BUYERS_SCORE,
+            min_deployer_age_days=config.MIN_DEPLOYER_AGE_DAYS,
         )
     except Exception as e:
         log.error(f"[BiSwap] check_token error for {token_address[:10]}…: {e}")
@@ -2143,7 +2183,11 @@ async def on_biswap_pair_found(token_address: str, base_token: str, pair_address
         )
         + "\n"
         + f"{warn_block}\n\n"
-        f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
+        + (
+            (lambda s: f"🏆 Рейтинг токена: *{s['score']}/{s['max_score']}* {s['grade']} ({s['pct']:.0f}%)\n")(info["token_score"])
+            if info.get("token_score") else ""
+        )
+        + f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
         f"| Trailing: -{config.TRAILING_STOP_PCT}%  | SL: -{config.STOP_LOSS}%\n"
         f"💰 Покупка: *{buy_amount} BNB* (~${buy_amount * bnb_price:.0f}) "
         f"| Баланс: {balance:.3f} BNB"
@@ -2283,6 +2327,11 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
             stable_token=config.USDC_BASE,
             dex_chain="base",
             explorer_url="https://api.basescan.org/api",
+            min_token_score=config.MIN_TOKEN_SCORE,
+            min_lp_lock_pct_score=config.MIN_LP_LOCK_PCT_SCORE,
+            min_listing_age_min=config.MIN_LISTING_AGE_MIN,
+            min_buyers_score=config.MIN_BUYERS_SCORE,
+            min_deployer_age_days=config.MIN_DEPLOYER_AGE_DAYS,
         )
     except Exception as e:
         log.error(f"[BaseSwap] check_token error for {token_address[:10]}…: {e}")
@@ -2390,7 +2439,11 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
         )
         + "\n"
         + f"{warn_block}\n\n"
-        f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
+        + (
+            (lambda s: f"🏆 Рейтинг токена: *{s['score']}/{s['max_score']}* {s['grade']} ({s['pct']:.0f}%)\n")(info["token_score"])
+            if info.get("token_score") else ""
+        )
+        + f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
         f"| Trailing: -{config.TRAILING_STOP_PCT}%  | SL: -{config.STOP_LOSS}%\n"
         f"💰 Покупка: *{buy_amount} ETH* (~${buy_amount * eth_price:.0f}) "
         f"| Баланс: {balance:.3f} ETH"
@@ -2775,7 +2828,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/set holders 50` — мин. кол-во холдеров токена\n"
         "`/set tax 5` — макс. налог buy+sell в %\n"
         "`/set max 5` — макс. кол-во позиций\n"
-        "`/set gwei 3` — gas для покупки в gwei (0 = авто)",
+        "`/set gwei 3` — gas для покупки в gwei (0 = авто)\n"
+        "`/set score 5` — мин. рейтинг качества 0-10 (0 = выкл.)\n"
+        "`/set scorelp 80` — мин. % залочённого LP для 3 очков рейтинга\n"
+        "`/set scoredeploy 30` — мин. возраст кошелька деплоера (дней) для балла",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -3144,6 +3200,12 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "deplp":  ("MAX_DEPLOYER_LP_PCT", 1.0,  100.0, "Макс. % незаблокированного LP у деплоера (hard block, 30 рекоменд.)"),
         "holders":("MIN_HOLDER_COUNT",   1,     10000, "Мин. кол-во холдеров токена"),
         "deployer":("MAX_DEPLOYER_TOKENS_30D", 1, 200, "Макс. контрактов деплоера за 30 дней"),
+        # Quality scoring system
+        "score":       ("MIN_TOKEN_SCORE",       0,   10,    "Мин. рейтинг токена 0-10 (0 = выкл., 5 рекоменд.)"),
+        "scorelp":     ("MIN_LP_LOCK_PCT_SCORE",  1.0, 100.0, "Мин. % залочённого LP для получения 3 очков рейтинга"),
+        "scoreage":    ("MIN_LISTING_AGE_MIN",    0.0, 1440.0,"Мин. возраст листинга (мин) для балла рейтинга (0 = выкл.)"),
+        "scorebuyers": ("MIN_BUYERS_SCORE",       0,   10000, "Мин. покупателей для балла рейтинга (0 = выкл.)"),
+        "scoredeploy": ("MIN_DEPLOYER_AGE_DAYS",  0.0, 3650.0,"Мин. возраст кошелька деплоера (дней) для балла рейтинга"),
         # Taxes and limits
         "tax":    ("MAX_BUY_TAX",         1.0,   50.0,  "Макс. налог %"),
         "max":    ("MAX_POSITIONS",       1,     20,    "Макс. позиций"),
@@ -3167,7 +3229,8 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     old_value = getattr(config, attr)
     # Integer params
-    if attr in ("MAX_POSITIONS", "MAX_TOKEN_AGE_DAYS", "MIN_HOLDER_COUNT"):
+    if attr in ("MAX_POSITIONS", "MAX_TOKEN_AGE_DAYS", "MIN_HOLDER_COUNT",
+                "MIN_TOKEN_SCORE", "MIN_BUYERS_SCORE", "MAX_DEPLOYER_TOKENS_30D"):
         value = int(value)
     setattr(config, attr, value)
 
@@ -3369,7 +3432,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Max tax: {config.MAX_BUY_TAX}% buy / {config.MAX_SELL_TAX}% sell\n"
         f"Деплоер: макс {config.MAX_DEPLOYER_TOKENS_30D} контракт(ов) за 30 дн. "
         f"{'BSCScan OK' if config.BSCSCAN_API_KEY else 'BSCScan нет ключа'}"
-        f"{' | Basescan OK' if config.BASESCAN_API_KEY else ' | Basescan нет ключа'}\n\n"
+        f"{' | Basescan OK' if config.BASESCAN_API_KEY else ' | Basescan нет ключа'}\n"
+        f"🏆 Рейтинг токена: мин {config.MIN_TOKEN_SCORE}/10"
+        f"{' (выкл.)' if config.MIN_TOKEN_SCORE == 0 else ''}"
+        f" | LP-замок: ≥{config.MIN_LP_LOCK_PCT_SCORE:.0f}% | Деплоер: ≥{config.MIN_DEPLOYER_AGE_DAYS:.0f} дн.\n\n"
         f"Исполнение:\n"
         f"Gas buy: {gas_mode}\n"
         f"Slip buy/sell: {config.SLIPPAGE_BUY}%/{config.SLIPPAGE_SELL}%\n"
@@ -3715,6 +3781,19 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
     else:
         dep_lp_line = f"🚨 LP деплоера: *{dep_lp_pct:.1f}%* — высокий риск rug pull!"
 
+    # ── Quality score block ────────────────────────────────────────────────────
+    _score_data = data.get("token_score")
+    if _score_data:
+        _score_factors = "\n".join(f"  {f}" for f in _score_data.get("factors", []))
+        score_block = (
+            f"*🏆 Рейтинг качества: {_score_data['score']}/{_score_data['max_score']} "
+            f"{_score_data['grade']} ({_score_data['pct']:.0f}%)*\n"
+            f"_(мин для покупки: {config.MIN_TOKEN_SCORE}/10)_\n"
+            + (_score_factors + "\n" if _score_factors else "")
+        )
+    else:
+        score_block = ""
+
     chain_badge = "🔵 Base" if is_base else "🟡 BSC"
     text = (
         f"🔍 *Анализ токена* {chain_badge}\n\n"
@@ -3744,7 +3823,8 @@ async def _do_analyze(update, raw_address: str, chain: str = "bsc"):
         f"{collusion_line}\n\n"
         f"*🚩 GoPlus флаги:*\n{flags_block}\n\n"
         f"*⚠️ Предупреждения:*\n{warn_block}\n\n"
-        f"━━━━━━━━━━━━━━\n"
+        + (score_block + "\n" if score_block else "")
+        + f"━━━━━━━━━━━━━━\n"
         f"{rec_icon} *Рекомендация: {rec_text}*\n"
         f"_{rec_detail}_"
     )

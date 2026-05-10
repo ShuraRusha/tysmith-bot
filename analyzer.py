@@ -1094,6 +1094,33 @@ async def analyze_token(
         deployer_pct = _dh.get("pct")
         deployer_lp  = _dlp
 
+    # ── Quality scoring for /analyze display ──────────────────────────────────
+    _exp_url_a  = explorer_url or ""
+    # get social from dex variable (already fetched)
+    _dex_a = locals().get("dex")
+    _social_a = bool(
+        _dex_a and (
+            (_dex_a.get("info") or {}).get("socials") or
+            (_dex_a.get("info") or {}).get("websites")
+        )
+    )
+    _pair_age_min_a: float | None = None
+    if _dex_a and _dex_a.get("pairCreatedAt"):
+        _pair_age_min_a = (time.time() * 1000 - _dex_a["pairCreatedAt"]) / 60000
+    _contract_verified_a, _deployer_age_days_a = await asyncio.gather(
+        _check_contract_verified(token_address, bscscan_api_key, _exp_url_a),
+        _get_deployer_wallet_age(_deployer_addr, bscscan_api_key, _exp_url_a) if _deployer_addr else _null_async(),
+    )
+    _score_a = _calculate_token_score(
+        lp_locked_pct          = deployer_lp.get("locked_pct"),
+        lp_locker               = deployer_lp.get("locker"),
+        contract_verified       = _contract_verified_a,
+        social_present          = _social_a,
+        deployer_wallet_age_days= _deployer_age_days_a,
+        pair_age_minutes        = _pair_age_min_a,
+        buyer_count             = holder_count,
+    )
+
     # ── honeypot.is taxes (works before GoPlus indexes the token) ────────────
     hp_buy_tax  = hp_result.get("buy_tax")   # None if API unavailable
     hp_sell_tax = hp_result.get("sell_tax")
@@ -1212,6 +1239,172 @@ async def analyze_token(
         # LP on-chain check result (for display in /analyze)
         "lp_onchain_ok":         lp_onchain.get("ok", True),
         "lp_onchain_reason":     lp_onchain.get("reason", ""),
+        "token_score":           _score_a,
+        "contract_verified":     _contract_verified_a,
+        "social_present":        _social_a,
+        "deployer_age_days":     _deployer_age_days_a,
+        "pair_age_min":          _pair_age_min_a,
+    }
+
+
+# ── Quality scoring helpers ───────────────────────────────────────────────────
+
+async def _check_contract_verified(
+    token_address: str, bscscan_api_key: str, explorer_url: str = ""
+) -> bool | None:
+    """Returns True=verified, False=not verified, None=API unavailable."""
+    if not bscscan_api_key:
+        return None
+    base = explorer_url or "https://api.bscscan.com/api"
+    url = (
+        f"{base}?module=contract&action=getsourcecode"
+        f"&address={token_address}&apikey={bscscan_api_key}"
+    )
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3.0)) as s:
+            async with s.get(url) as resp:
+                data = await resp.json(content_type=None)
+        if data.get("status") == "1":
+            abi = (data.get("result") or [{}])[0].get("ABI", "")
+            return bool(abi and abi != "Contract source code not verified")
+    except Exception:
+        pass
+    return None
+
+
+async def _get_deployer_wallet_age(
+    deployer_address: str, bscscan_api_key: str, explorer_url: str = ""
+) -> float | None:
+    """Returns deployer wallet age in days (since first tx), or None."""
+    if not bscscan_api_key or not deployer_address:
+        return None
+    base = explorer_url or "https://api.bscscan.com/api"
+    url = (
+        f"{base}?module=account&action=txlist"
+        f"&address={deployer_address}"
+        f"&startblock=0&endblock=99999999&page=1&offset=1&sort=asc"
+        f"&apikey={bscscan_api_key}"
+    )
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3.0)) as s:
+            async with s.get(url) as resp:
+                data = await resp.json(content_type=None)
+        if data.get("status") == "1" and data.get("result"):
+            first_ts = int(data["result"][0]["timeStamp"])
+            return (time.time() - first_ts) / 86400
+    except Exception:
+        pass
+    return None
+
+
+async def _null_async() -> None:
+    """Placeholder coroutine for asyncio.gather when a task is optional."""
+    return None
+
+
+def _calculate_token_score(
+    lp_locked_pct:         float | None,
+    lp_locker:             str   | None,
+    contract_verified:     bool  | None,
+    social_present:        bool  | None,
+    deployer_wallet_age_days: float | None,
+    pair_age_minutes:      float | None,
+    buyer_count,
+    min_lp_lock_pct:       float = 80.0,
+    min_deployer_age_days: float = 30.0,
+    min_listing_age_min:   float = 0.0,
+    min_buyers_score:      int   = 10,
+) -> dict:
+    """
+    Quality score 0-10 for a token.
+    LP lock (3) + verified (2) + social (2) + deployer age (1) + listing age (1) + buyers (1).
+    """
+    score = 0
+    factors = []
+
+    # ── 1. LP lock (3 pts) ────────────────────────────────────────────────────
+    lp_pct = lp_locked_pct if lp_locked_pct is not None else 0.0
+    if lp_locked_pct is not None:
+        locker_str = f" в {lp_locker}" if lp_locker else ""
+        if lp_pct >= min_lp_lock_pct:
+            score += 3
+            factors.append(f"✅ LP заблокирована {lp_pct:.0f}%{locker_str}: +3")
+        elif lp_pct >= 50:
+            score += 1
+            factors.append(f"⚠️ LP частично {lp_pct:.0f}%{locker_str}: +1 (нужно ≥{min_lp_lock_pct:.0f}%)")
+        else:
+            factors.append(f"❌ LP заблокирована лишь {lp_pct:.0f}%: +0 (rug risk)")
+    else:
+        factors.append("❌ LP не заблокирована / неизвестно: +0")
+
+    # ── 2. Contract verified (2 pts) ─────────────────────────────────────────
+    if contract_verified is True:
+        score += 2
+        factors.append("✅ Контракт верифицирован на BSCScan: +2")
+    elif contract_verified is False:
+        factors.append("❌ Контракт НЕ верифицирован: +0")
+    else:
+        factors.append("❓ Верификация контракта: неизвестно: +0")
+
+    # ── 3. Social presence (2 pts) ────────────────────────────────────────────
+    if social_present is True:
+        score += 2
+        factors.append("✅ Социальные сети / сайт найдены: +2")
+    elif social_present is False:
+        factors.append("❌ Нет сайта/Twitter/Telegram: +0")
+    else:
+        factors.append("❓ Социальные сети: не проверено: +0")
+
+    # ── 4. Deployer wallet age (1 pt) ─────────────────────────────────────────
+    if deployer_wallet_age_days is not None:
+        if deployer_wallet_age_days >= min_deployer_age_days:
+            score += 1
+            factors.append(f"✅ Деплоер активен {deployer_wallet_age_days:.0f} дн.: +1")
+        else:
+            factors.append(f"⚠️ Деплоер новый кошелёк ({deployer_wallet_age_days:.1f} дн.): +0")
+    else:
+        factors.append("❓ Возраст кошелька деплоера: неизвестно: +0")
+
+    # ── 5. Listing age (1 pt) ─────────────────────────────────────────────────
+    if min_listing_age_min <= 0:
+        score += 1
+        factors.append("✅ Возраст листинга: проверка отключена: +1")
+    elif pair_age_minutes is not None:
+        if pair_age_minutes >= min_listing_age_min:
+            score += 1
+            factors.append(f"✅ Листинг {pair_age_minutes:.1f} мин. назад: +1")
+        else:
+            factors.append(f"⚠️ Листинг {pair_age_minutes:.1f} мин. (мин. {min_listing_age_min:.0f}): +0")
+    else:
+        factors.append("❓ Возраст листинга: неизвестно: +0")
+
+    # ── 6. Buyer count (1 pt) ─────────────────────────────────────────────────
+    if min_buyers_score <= 0:
+        score += 1
+        factors.append("✅ Покупатели: проверка отключена: +1")
+    else:
+        bc = None
+        if buyer_count is not None and buyer_count != "?":
+            try:
+                bc = int(buyer_count)
+            except (ValueError, TypeError):
+                pass
+        if bc is not None:
+            if bc >= min_buyers_score:
+                score += 1
+                factors.append(f"✅ {bc} покупателей: +1")
+            else:
+                factors.append(f"⚠️ Только {bc} покупателей (мин. {min_buyers_score}): +0")
+        else:
+            factors.append(f"❓ Покупателей: неизвестно: +0")
+
+    grade = "🟢" if score >= 8 else ("🟡" if score >= 5 else "🔴")
+    return {
+        "score":     score,
+        "max_score": 10,
+        "grade":     grade,
+        "pct":       score * 10,
+        "factors":   factors,
     }
 
 
@@ -1244,6 +1437,11 @@ async def check_token(
     stable_token:   str = None,
     dex_chain:      str = "bsc",
     explorer_url:   str = None,   # override block explorer (default = BSCScan)
+    min_token_score:        int   = 0,
+    min_lp_lock_pct_score:  float = 80.0,
+    min_listing_age_min:    float = 0.0,
+    min_buyers_score:       int   = 10,
+    min_deployer_age_days:  float = 30.0,
 ) -> dict:
     """
     Two-track security check running in parallel:
@@ -1322,6 +1520,13 @@ async def check_token(
             "max_token_age_days":    max_token_age_days,
             "min_volume_5m_usd":     min_volume_5m_usd,
             "max_deployer_lp_pct":   max_deployer_lp_pct,
+            "min_token_score":        min_token_score,
+            "min_lp_lock_pct_score":  min_lp_lock_pct_score,
+            "min_listing_age_min":    min_listing_age_min,
+            "min_buyers_score":       min_buyers_score,
+            "min_deployer_age_days":  min_deployer_age_days,
+            "bscscan_api_key":        bscscan_api_key,
+            "explorer_url":           explorer_url or "",
         }
 
     # Buy simulation — catches: trading not enabled, honeypot on entry
@@ -1534,6 +1739,49 @@ async def check_token(
         if not _lp_tight["ok"]:
             return {"ok": False, "reason": _lp_tight["reason"]}
 
+    # ── Quality scoring ────────────────────────────────────────────────────────
+    # Social presence from DexScreener (already fetched in Stage 2 — no new API call)
+    _social_present = bool(
+        dex and (
+            (dex.get("info") or {}).get("socials") or
+            (dex.get("info") or {}).get("websites")
+        )
+    )
+    # Pair age from DexScreener pairCreatedAt (milliseconds)
+    _pair_age_min: float | None = None
+    if dex and dex.get("pairCreatedAt"):
+        _pair_age_min = (time.time() * 1000 - dex["pairCreatedAt"]) / 60000
+
+    # Contract verification + deployer wallet age in parallel (BSCScan calls, ~1-2s each)
+    _exp_url = explorer_url or ""
+    _contract_verified, _deployer_age_days = await asyncio.gather(
+        _check_contract_verified(token_address, bscscan_api_key, _exp_url),
+        _get_deployer_wallet_age(_dep_addr, bscscan_api_key, _exp_url) if _dep_addr else _null_async(),
+    )
+
+    _score = _calculate_token_score(
+        lp_locked_pct          = deployer_lp_c.get("locked_pct"),
+        lp_locker               = deployer_lp_c.get("locker"),
+        contract_verified       = _contract_verified,
+        social_present          = _social_present,
+        deployer_wallet_age_days= _deployer_age_days,
+        pair_age_minutes        = _pair_age_min,
+        buyer_count             = holder_count,
+        min_lp_lock_pct         = min_lp_lock_pct_score,
+        min_deployer_age_days   = min_deployer_age_days,
+        min_listing_age_min     = min_listing_age_min,
+        min_buyers_score        = min_buyers_score,
+    )
+    if min_token_score > 0 and _score["score"] < min_token_score:
+        return {
+            "ok": False,
+            "reason": (
+                f"Рейтинг {_score['score']}/{_score['max_score']} {_score['grade']}"
+                f" — ниже минимума {min_token_score}. "
+                + "; ".join(f for f in _score["factors"] if "+0" in f or "❌" in f)[:120]
+            ),
+        }
+
     info = {
         "name":           name,
         "symbol":         symbol,
@@ -1557,6 +1805,11 @@ async def check_token(
         "deployer_lp_pct":       deployer_lp_c.get("pct"),
         "deployer_lp_locked_pct": deployer_lp_c.get("locked_pct"),
         "deployer_lp_locker":    deployer_lp_c.get("locker"),
+        "token_score":           _score,
+        "contract_verified":     _contract_verified,
+        "social_present":        _social_present,
+        "deployer_age_days":     _deployer_age_days,
+        "pair_age_min":          _pair_age_min,
     }
     return {"ok": True, "info": info}
 
@@ -1601,6 +1854,13 @@ async def check_token_fast(
     max_token_age_days    = security.get("max_token_age_days", 7)
     min_volume_5m_usd     = security.get("min_volume_5m_usd", 0.0)
     max_deployer_lp_pct   = security.get("max_deployer_lp_pct", 30.0)
+    min_token_score       = security.get("min_token_score",       0)
+    min_lp_lock_pct_score = security.get("min_lp_lock_pct_score", 80.0)
+    min_listing_age_min   = security.get("min_listing_age_min",   0.0)
+    min_buyers_score      = security.get("min_buyers_score",      10)
+    min_deployer_age_days = security.get("min_deployer_age_days", 30.0)
+    bscscan_api_key       = security.get("bscscan_api_key",       "")
+    contract_verified_c   = security.get("contract_verified")     # None if not cached
 
     # Re-run only the on-chain checks that depend on liquidity being present.
     # All three run in parallel — total ~200-300ms.
@@ -1715,6 +1975,45 @@ async def check_token_fast(
         if not _lp_tight_f["ok"]:
             return {"ok": False, "reason": _lp_tight_f["reason"]}
 
+    # ── Quality scoring (fast path) ────────────────────────────────────────────
+    _social_present_f = bool(
+        dex and (
+            (dex.get("info") or {}).get("socials") or
+            (dex.get("info") or {}).get("websites")
+        )
+    )
+    _pair_age_min_f: float | None = None
+    if dex and dex.get("pairCreatedAt"):
+        _pair_age_min_f = (time.time() * 1000 - dex["pairCreatedAt"]) / 60000
+    _exp_url_f = security.get("explorer_url") or ""
+    if contract_verified_c is None and bscscan_api_key:
+        contract_verified_c = await _check_contract_verified(token_address, bscscan_api_key, _exp_url_f)
+    _deployer_age_days_f: float | None = None
+    if _dep_addr_f:
+        _deployer_age_days_f = await _get_deployer_wallet_age(_dep_addr_f, bscscan_api_key, _exp_url_f)
+    _score_f = _calculate_token_score(
+        lp_locked_pct           = deployer_lp_f.get("locked_pct"),
+        lp_locker                = deployer_lp_f.get("locker"),
+        contract_verified        = contract_verified_c,
+        social_present           = _social_present_f,
+        deployer_wallet_age_days = _deployer_age_days_f,
+        pair_age_minutes         = _pair_age_min_f,
+        buyer_count              = holder_count,
+        min_lp_lock_pct          = min_lp_lock_pct_score,
+        min_deployer_age_days    = min_deployer_age_days,
+        min_listing_age_min      = min_listing_age_min,
+        min_buyers_score         = min_buyers_score,
+    )
+    if min_token_score > 0 and _score_f["score"] < min_token_score:
+        return {
+            "ok": False,
+            "reason": (
+                f"Рейтинг {_score_f['score']}/{_score_f['max_score']} {_score_f['grade']}"
+                f" — ниже минимума {min_token_score}. "
+                + "; ".join(f for f in _score_f["factors"] if "+0" in f or "❌" in f)[:120]
+            ),
+        }
+
     info = {
         "name":           name,
         "symbol":         symbol,
@@ -1737,6 +2036,11 @@ async def check_token_fast(
         "deployer_lp_pct":       deployer_lp_f.get("pct"),
         "deployer_lp_locked_pct": deployer_lp_f.get("locked_pct"),
         "deployer_lp_locker":    deployer_lp_f.get("locker"),
+        "token_score":           _score_f,
+        "contract_verified":     contract_verified_c,
+        "social_present":        _social_present_f,
+        "deployer_age_days":     _deployer_age_days_f,
+        "pair_age_min":          _pair_age_min_f,
     }
     return {"ok": True, "info": info}
 
