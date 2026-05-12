@@ -1096,8 +1096,7 @@ async def analyze_token(
 
     # ── Quality scoring for /analyze display ──────────────────────────────────
     _exp_url_a  = explorer_url or ""
-    # get social from dex variable (already fetched)
-    _dex_a = locals().get("dex")
+    _dex_a = dex  # already fetched in asyncio.gather above
     _social_a = bool(
         _dex_a and (
             (_dex_a.get("info") or {}).get("socials") or
