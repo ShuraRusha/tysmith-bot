@@ -3773,10 +3773,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dex_lines.append(
             f"  🔵 Base/BaseSwap: {len(pos_manager_baseswap.positions)}/{_max_pos_global} позиций"
         )
-    if config.AERODROME_ENABLED and pos_manager_aerodrome:
-        dex_lines.append(
-            f"  🟣 Base/Aerodrome: {len(pos_manager_aerodrome.positions)}/{_max_pos_global} позиций"
-        )
+    if _base_active:
+        if config.AERODROME_ENABLED and pos_manager_aerodrome:
+            dex_lines.append(
+                f"  🟣 Base/Aerodrome: {len(pos_manager_aerodrome.positions)}/{_max_pos_global} позиций"
+            )
+        else:
+            dex_lines.append(
+                f"  🟣 Base/Aerodrome: ❌ выкл — установи AERODROME_ENABLED=true"
+            )
     dexes_block = "Активные DEX:\n" + "\n".join(dex_lines) + "\n"
 
     # Buy amount for Base chains (ETH equivalent)
