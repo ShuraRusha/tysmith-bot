@@ -3755,12 +3755,45 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             balance_lines += f" [Uniswap+{'+'.join(_base_dexes)}]"
         balance_lines += "\n"
 
+    # ── Active DEXes / positions per chain ────────────────────────────────────
+    _max_pos_global = calculate_max_positions(balance) if is_auto else config.MAX_POSITIONS
+    dex_lines = []
+    dex_lines.append(
+        f"  🟡 BSC/PancakeSwap: {len(pos_manager.positions)}/{_max_pos_global} позиций"
+    )
+    if config.BISWAP_ENABLED and pos_manager_biswap:
+        dex_lines.append(
+            f"  🟡 BSC/BiSwap: {len(pos_manager_biswap.positions)}/{_max_pos_global} позиций"
+        )
+    if _base_active and pos_manager_base:
+        dex_lines.append(
+            f"  🔵 Base/Uniswap V2: {len(pos_manager_base.positions)}/{_max_pos_global} позиций"
+        )
+    if config.BASESWAP_ENABLED and pos_manager_baseswap:
+        dex_lines.append(
+            f"  🔵 Base/BaseSwap: {len(pos_manager_baseswap.positions)}/{_max_pos_global} позиций"
+        )
+    if config.AERODROME_ENABLED and pos_manager_aerodrome:
+        dex_lines.append(
+            f"  🟣 Base/Aerodrome: {len(pos_manager_aerodrome.positions)}/{_max_pos_global} позиций"
+        )
+    dexes_block = "Активные DEX:\n" + "\n".join(dex_lines) + "\n"
+
+    # Buy amount for Base chains (ETH equivalent)
+    base_buy_line = ""
+    if _base_active and eth_price > 0:
+        eth_buy_amount = calculate_buy_amount(eth_balance) if eth_balance > 0 else 0.0
+        if eth_buy_amount > 0:
+            base_buy_line = (
+                f"Следующая сделка (Base): {eth_buy_amount} ETH (~${eth_buy_amount * eth_price:.0f})\n"
+            )
+
     msg = (
         f"Статус Sniper Bot — {status_icon}\n\n"
         f"RPC: {'✅' if connected else '❌'} {rpc_label} | WS: {ws_count} | Poll RPCs: {len(_poll_w3s)}\n"
         f"Кошелёк: {trader.wallet}\n"
         f"Балансы:\n{balance_lines}"
-        f"Позиций: {len(pos_manager.positions)}/{calculate_max_positions(balance) if is_auto else config.MAX_POSITIONS}\n"
+        f"{dexes_block}"
         f"Сделок в истории: {len(trade_history)}\n\n"
         f"{activity_str}"
         f"{speed_status}"
@@ -3770,7 +3803,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{f' | saved: {_mp_stats_saved_s:.0f}s' if _mp_stats_hits else ''}\n\n"
         f"Размер позиции:\n"
         f"Режим: {size_mode}\n"
-        f"Следующая сделка: {buy_amount} BNB (~${buy_amount * bnb_price:.0f})\n"
+        f"Следующая сделка (BSC): {buy_amount} BNB (~${buy_amount * bnb_price:.0f})\n"
+        f"{base_buy_line}"
         f"Мин: {config.BUY_MIN_BNB} BNB | Макс: {config.BUY_MAX_BNB} BNB | Газ-резерв: {config.GAS_RESERVE_BNB} BNB\n\n"
         f"Выход:\n"
         f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции\n"
