@@ -3248,7 +3248,7 @@ async def _apply_demo_mode(new_demo: bool, reply_fn):
         )
     else:
         open_demo = sum(
-            1 for pm in [pos_manager, pos_manager_base, pos_manager_biswap, pos_manager_baseswap]
+            1 for pm in [pos_manager, pos_manager_base, pos_manager_biswap, pos_manager_baseswap, pos_manager_aerodrome]
             if pm for p in (pm.get_all() if pm else []) if p.demo
         )
         demo_warn = (
@@ -3689,8 +3689,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _base_active:
         eth_usd = eth_balance * eth_price if eth_price else 0.0
         balance_lines += f"  Base (ETH): {eth_balance:.4f} ETH (~${eth_usd:.0f})"
+        _base_dexes = []
         if config.BASESWAP_ENABLED:
-            balance_lines += " [Uniswap+BaseSwap]"
+            _base_dexes.append("BaseSwap")
+        if config.AERODROME_ENABLED:
+            _base_dexes.append("Aerodrome")
+        if _base_dexes:
+            balance_lines += f" [Uniswap+{'+'.join(_base_dexes)}]"
         balance_lines += "\n"
 
     msg = (
@@ -4936,6 +4941,151 @@ async def _poll_new_pairs():
                 log.warning(f"Poll: log parse error: {e}")
 
 
+# ── Base HTTP polling: catch pairs Base WebSocket might miss ─────────────────
+
+_last_polled_block_base: int = 0
+# Reuse Base HTTP RPCs — create w3 instances once
+_poll_base_w3s: list = []
+
+
+def _init_poll_base_w3s():
+    global _poll_base_w3s
+    if _poll_base_w3s or not config.BASE_CHAIN_ENABLED:
+        return
+    _poll_base_w3s = [_make_w3(url) for url in config.BASE_HTTP_RPCS]
+    log.info(f"Base poll w3 pool: {len(_poll_base_w3s)} HTTP RPC endpoints")
+
+
+async def _poll_base_pairs():
+    """
+    Polls eth_getLogs every 5 seconds across all Base HTTP RPCs for pair/pool creation events.
+    Covers Uniswap V2 (BASE_CHAIN_ENABLED), BaseSwap (BASESWAP_ENABLED),
+    and Aerodrome V2 (AERODROME_ENABLED).
+    Acts as fallback when WebSocket nodes miss events.
+    """
+    global _last_polled_block_base
+
+    _init_poll_base_w3s()
+    if not _poll_base_w3s:
+        log.warning("Base poll: no w3 instances available — skipping")
+        return
+
+    POLL_INTERVAL    = 5
+    LOOK_BACK_BLOCKS = 200
+    poll_rpc_idx     = 0
+    log.info(f"Base poll task started — {len(_poll_base_w3s)} RPC(s), interval {POLL_INTERVAL}s")
+
+    # Build list of (factory, topic, callback, label) to poll
+    def _factories():
+        items = []
+        if config.BASE_CHAIN_ENABLED:
+            items.append((
+                config.UNISWAP_V2_FACTORY_BASE, PAIR_CREATED_TOPIC,
+                on_base_pair_found, config.BASE_TOKENS_BASE, "UniV2Base",
+            ))
+        if config.BASESWAP_ENABLED and pos_manager_baseswap:
+            items.append((
+                config.BASESWAP_FACTORY_BASE, PAIR_CREATED_TOPIC,
+                on_baseswap_pair_found, config.BASE_TOKENS_BASE, "BaseSwap",
+            ))
+        if config.AERODROME_ENABLED and pos_manager_aerodrome:
+            items.append((
+                config.AERODROME_FACTORY_BASE, AERODROME_POOL_CREATED_TOPIC,
+                on_aerodrome_pair_found, config.BASE_TOKENS_BASE, "Aerodrome",
+            ))
+        return items
+
+    while True:
+        await asyncio.sleep(POLL_INTERVAL)
+        if is_paused:
+            continue
+
+        factories = _factories()
+        if not factories:
+            continue
+
+        n = len(_poll_base_w3s)
+        latest = None
+        for i in range(n):
+            idx = (poll_rpc_idx + i) % n
+            pw3 = _poll_base_w3s[idx]
+            try:
+                latest = await asyncio.to_thread(lambda _w=pw3: _w.eth.block_number)
+                poll_rpc_idx = idx
+                break
+            except Exception as e:
+                log.debug(f"Base poll[{idx}] block_number failed: {e}")
+
+        if latest is None:
+            log.warning("Base poll: all RPCs failed to get block number")
+            continue
+
+        from_block = (_last_polled_block_base + 1) if _last_polled_block_base > 0 else max(0, latest - LOOK_BACK_BLOCKS)
+        if from_block > latest:
+            _last_polled_block_base = latest
+            continue
+
+        pw3 = _poll_base_w3s[poll_rpc_idx]
+
+        for (factory_addr, topic, callback_fn, base_token_set, label) in factories:
+            try:
+                logs = await asyncio.to_thread(
+                    pw3.eth.get_logs,
+                    {
+                        "address":   Web3.to_checksum_address(factory_addr),
+                        "fromBlock": from_block,
+                        "toBlock":   latest,
+                        "topics":    [topic],
+                    },
+                )
+                if logs:
+                    log.info(f"Base poll[{label}]: {len(logs)} events (blocks {from_block}–{latest})")
+                for log_entry in logs:
+                    try:
+                        topics = log_entry.get("topics", [])
+                        # Aerodrome: need 4 topics (topic[3] = stable), skip stable pools
+                        if topic == AERODROME_POOL_CREATED_TOPIC:
+                            if len(topics) < 4:
+                                continue
+                            if topics[3] != "0x" + "0" * 64:
+                                continue  # skip stable pools
+                        else:
+                            if len(topics) < 3:
+                                continue
+
+                        token0 = Web3.to_checksum_address("0x" + topics[1][-40:])
+                        token1 = Web3.to_checksum_address("0x" + topics[2][-40:])
+                        raw_data = log_entry.get("data", "")
+                        if len(raw_data) < 66:
+                            continue
+                        pair = Web3.to_checksum_address("0x" + raw_data[26:66])
+
+                        creation_block = log_entry.get("blockNumber", 0)
+                        if isinstance(creation_block, str):
+                            creation_block = int(creation_block, 16)
+
+                        t0, t1 = token0.lower(), token1.lower()
+                        if t0 in base_token_set and t1 not in base_token_set:
+                            new_token, base_tkn = token1, token0
+                        elif t1 in base_token_set and t0 not in base_token_set:
+                            new_token, base_tkn = token0, token1
+                        else:
+                            continue
+
+                        async with _ws_seen_lock:
+                            if pair in _ws_seen_pairs:
+                                continue
+                            _ws_seen_pairs.add(pair)
+
+                        asyncio.create_task(callback_fn(new_token, base_tkn, pair, creation_block))
+                    except Exception as pe:
+                        log.warning(f"Base poll[{label}] log parse error: {pe}")
+            except Exception as e:
+                log.warning(f"Base poll[{label}] get_logs failed: {e}")
+
+        _last_polled_block_base = latest
+
+
 async def main(need_polling_grace: bool = False):
     _load_history()
     _load_settings()
@@ -5080,6 +5230,10 @@ async def main(need_polling_grace: bool = False):
         ))
         log.info(f"Aerodrome watcher started (factory={config.AERODROME_FACTORY_BASE[:10]}…)")
 
+    # Base HTTP polling — covers all Base DEXes (Uniswap V2, BaseSwap, Aerodrome)
+    if config.BASE_CHAIN_ENABLED and w3_base:
+        asyncio.create_task(_resilient_task(_poll_base_pairs, "poll_base_pairs"))
+
     asyncio.create_task(_lock_refresher(app))
 
     # Graceful shutdown on SIGTERM (Railway zero-downtime deploys) and SIGINT.
@@ -5134,6 +5288,8 @@ async def main(need_polling_grace: bool = False):
         chains_parts.append("Uniswap V2 (Base)")
     if config.BASESWAP_ENABLED and pos_manager_baseswap:
         chains_parts.append("BaseSwap V2 (Base)")
+    if config.AERODROME_ENABLED and pos_manager_aerodrome:
+        chains_parts.append("Aerodrome V2 (Base)")
     chains_str = " + ".join(chains_parts)
     startup_msg = (
         "🚀 *Sniper Bot запущен*\n"
