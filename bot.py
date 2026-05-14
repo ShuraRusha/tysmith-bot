@@ -2833,8 +2833,22 @@ async def on_aerodrome_pair_found(token_address: str, base_token: str, pair_addr
             _buying_tokens.discard(token_address)
         return
 
-    # Manual mode: send notification
-    await tg_send(text)
+    # Manual mode: send notification with buttons (same as BSC)
+    cb_id = token_address[:10]
+    pending[cb_id] = {
+        "token_address": token_address,
+        "base_token":    base_token,
+        "pair_address":  pair_address,
+        "info":          info,
+        "ts":            time.time(),
+        "buy_amount":    buy_amount,
+        "chain":         "aerodrome",
+    }
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ КУПИТЬ",     callback_data=f"buy_{cb_id}"),
+        InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_{cb_id}"),
+    ]])
+    await tg_send(text, reply_markup=keyboard)
 
 
 # ── Callback handler ──────────────────────────────────────────────────────────
@@ -2854,6 +2868,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         sym           = token_info["info"]["symbol"]
         token_address = token_info["token_address"]
+        _chain        = token_info.get("chain", "bsc")
+
+        # Выбираем правильный трейдер/pos_manager/w3 по цепи
+        if _chain == "aerodrome":
+            _pm, _tr, _w3_cb, _native = pos_manager_aerodrome, trader_aerodrome, w3_base, "ETH"
+        else:
+            _pm, _tr, _w3_cb, _native = pos_manager, trader, w3, "BNB"
 
         if time.time() - token_info["ts"] > config.PENDING_TTL:
             await query.edit_message_text(
@@ -2862,11 +2883,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if token_address in pos_manager.positions:
+        if token_address in _pm.positions:
             await query.edit_message_text(f"⚠️ Позиция по {sym} уже открыта.")
             return
 
-        if len(pos_manager.positions) >= config.MAX_POSITIONS:
+        if len(_pm.positions) >= config.MAX_POSITIONS:
             await query.edit_message_text(
                 f"🚫 Достигнут лимит позиций ({config.MAX_POSITIONS}).\n"
                 f"Закрой одну из текущих перед новой покупкой."
@@ -2874,13 +2895,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Recalculate at buy time — balance may have changed since notification
-        current_balance = await asyncio.to_thread(lambda: w3.eth.get_balance(trader.wallet) / 1e18)
+        current_balance = await asyncio.to_thread(lambda: _w3_cb.eth.get_balance(_tr.wallet) / 1e18)
         buy_amount = calculate_buy_amount(current_balance)
         if buy_amount == 0.0:
             await query.edit_message_text(
                 f"💸 Баланс слишком мал для покупки {sym}.\n"
-                f"Нужно минимум {config.BUY_MIN_BNB + config.GAS_RESERVE_BNB:.3f} BNB "
-                f"(торговля + газ). Текущий баланс: {current_balance:.4f} BNB."
+                f"Нужно минимум {config.BUY_MIN_BNB + config.GAS_RESERVE_BNB:.3f} {_native} "
+                f"(торговля + газ). Текущий баланс: {current_balance:.4f} {_native}."
             )
             return
 
@@ -2888,7 +2909,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ Одобряю и покупаю *{sym}*...", parse_mode=ParseMode.MARKDOWN
         )
 
-        approve_result = await asyncio.to_thread(trader.approve_token, token_address)
+        approve_result = await asyncio.to_thread(_tr.approve_token, token_address)
         if not approve_result["ok"]:
             await query.edit_message_text(
                 f"❌ Не удалось одобрить *{sym}*\n`{approve_result['reason']}`",
@@ -2901,7 +2922,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pair_address_cb = token_info.get("pair_address", "")
         if pair_address_cb:
             sim = await asyncio.to_thread(
-                _simulate_sell_sync, w3, token_address, pair_address_cb
+                _simulate_sell_sync, _w3_cb, token_address, pair_address_cb
             )
             if not sim.get("ok"):
                 sim_reason = sim.get("reason", "Симуляция продажи не прошла")
@@ -2915,11 +2936,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         price_before = await asyncio.to_thread(
-            trader.get_price, token_address, token_info["base_token"]
+            _tr.get_price, token_address, token_info["base_token"]
         )
 
         result = await asyncio.to_thread(
-            trader.buy, token_address, buy_amount
+            _tr.buy, token_address, buy_amount
         )
 
         if result["ok"]:
@@ -2949,9 +2970,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 moon_bag_tokens    = moon_bag,
                 deployer_address   = token_info["info"].get("deployer") or "",
                 buy_gas_bnb        = result.get("gas_bnb", 0.0),
+                chain              = "base" if _chain == "aerodrome" else "bsc",
                 demo               = config.DEMO_MODE,
             )
-            pos_manager.add(pos)
+            _pm.add(pos)
             _record_buy(pos, result["tx_hash"])
 
             amount_fmt = result["tokens_received"] / 10 ** result["decimals"]
@@ -2963,7 +2985,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ *Куплено!* — {sym}\n"
                 f"`{token_address}`\n\n"
                 f"Получено: {amount_fmt:.4f} {sym}\n"
-                f"Цена входа: {entry_price:.8f} BNB\n"
+                f"Цена входа: {entry_price:.8f} {_native}\n"
                 f"Tx: `{result['tx_hash']}`\n\n"
                 f"TP1: +{config.TAKE_PROFIT_1}% → продать {config.TAKE_PROFIT_1_PCT:.0f}%\n"
                 f"Trailing stop: -{config.TRAILING_STOP_PCT}% от пика  |  SL: -{config.STOP_LOSS}%"
@@ -2986,7 +3008,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── SELL (manual from /positions) ─────────────────────────────────────────
     elif data.startswith("sell_"):
         token_address = data[5:]
-        pos = pos_manager.positions.get(token_address)
+        # Find position across all chains
+        pos, _sell_pm, _sell_tr = None, None, None
+        for _pm_c, _tr_c in [
+            (pos_manager, trader),
+            (pos_manager_aerodrome, trader_aerodrome),
+            (pos_manager_base, trader_base),
+            (pos_manager_biswap, trader_biswap),
+            (pos_manager_baseswap, trader_baseswap),
+        ]:
+            if _pm_c and token_address in _pm_c.positions:
+                pos, _sell_pm, _sell_tr = _pm_c.positions[token_address], _pm_c, _tr_c
+                break
         if not pos:
             await query.edit_message_text("⚠️ Позиция не найдена или уже закрыта.")
             return
@@ -2995,17 +3028,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ Продаю *{pos.symbol}*...", parse_mode=ParseMode.MARKDOWN
         )
         result = await asyncio.to_thread(
-            trader.sell_escalating, token_address, pos.tokens_amount
+            _sell_tr.sell_escalating, token_address, pos.tokens_amount
         )
 
         if result["ok"]:
-            sell_price = await asyncio.to_thread(trader.get_price, token_address)
+            sell_price = await asyncio.to_thread(_sell_tr.get_price, token_address)
             pnl_pct = (
                 (sell_price - pos.buy_price_bnb) / pos.buy_price_bnb * 100
                 if pos.buy_price_bnb and sell_price else 0
             )
             _record_trade(pos, pnl_pct, "Manual", sell_price)
-            pos_manager.remove(token_address)
+            _sell_pm.remove(token_address)
             await query.edit_message_text(
                 f"✅ *Продано вручную* — {pos.symbol}\n"
                 f"P&L: {pnl_pct:+.1f}%\n"
@@ -3035,21 +3068,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── WRITE-OFF (remove to history without selling) ─────────────────────────
     elif data.startswith("writeoff_"):
         token_address = data[9:]
-        pos = pos_manager.positions.get(token_address)
+        # Find position across all chains
+        pos, _wo_pm, _wo_tr = None, None, None
+        for _pm_c, _tr_c in [
+            (pos_manager, trader),
+            (pos_manager_aerodrome, trader_aerodrome),
+            (pos_manager_base, trader_base),
+            (pos_manager_biswap, trader_biswap),
+            (pos_manager_baseswap, trader_baseswap),
+        ]:
+            if _pm_c and token_address in _pm_c.positions:
+                pos, _wo_pm, _wo_tr = _pm_c.positions[token_address], _pm_c, _tr_c
+                break
         if not pos:
             await query.edit_message_text("⚠️ Позиция не найдена или уже закрыта.")
             return
 
-        current_price = await asyncio.to_thread(trader.get_price, pos.token_address)
+        current_price = await asyncio.to_thread(_wo_tr.get_price, pos.token_address)
         pnl_pct = (
             (current_price - pos.buy_price_bnb) / pos.buy_price_bnb * 100
             if pos.buy_price_bnb > 0 and current_price > 0 else -100.0
         )
         _record_trade(pos, pnl_pct, "Списана вручную", current_price)
-        pos_manager.remove(token_address)
+        _wo_pm.remove(token_address)
+        native = "ETH" if (pos.chain or "bsc") == "base" else "BNB"
         await query.edit_message_text(
             f"🗑 *{pos.symbol}* убрана в историю\n"
-            f"P&L: {pnl_pct:+.1f}% | Потрачено: {pos.buy_bnb} BNB\n"
+            f"P&L: {pnl_pct:+.1f}% | Потрачено: {pos.buy_bnb} {native}\n"
             f"Слот позиции освобождён.",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -3545,13 +3590,25 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    positions = pos_manager.get_all()
-    if not positions:
+    # Gather positions from all active chains
+    all_entries = []
+    for _pm_c, _tr_c, _label, _native in [
+        (pos_manager,           trader,           "BSC/PancakeSwap", "BNB"),
+        (pos_manager_biswap,    trader_biswap,    "BSC/BiSwap",      "BNB"),
+        (pos_manager_base,      trader_base,      "Base/Uniswap",    "ETH"),
+        (pos_manager_baseswap,  trader_baseswap,  "Base/BaseSwap",   "ETH"),
+        (pos_manager_aerodrome, trader_aerodrome, "Base/Aerodrome",  "ETH"),
+    ]:
+        if _pm_c:
+            for pos in _pm_c.get_all():
+                all_entries.append((pos, _pm_c, _tr_c, _label, _native))
+
+    if not all_entries:
         await update.message.reply_text("Нет открытых позиций.")
         return
 
-    for pos in positions:
-        price   = await asyncio.to_thread(trader.get_price, pos.token_address)
+    for pos, _pm_c, _tr_c, _label, _native in all_entries:
+        price   = await asyncio.to_thread(_tr_c.get_price, pos.token_address)
         pnl_pct = (
             (price - pos.buy_price_bnb) / pos.buy_price_bnb * 100
             if pos.buy_price_bnb and price else 0
@@ -3563,9 +3620,9 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             phase = f"TP1: +{pos.take_profit_1}%  |  SL: -{pos.stop_loss}%"
         text = (
-            f"*{pos.name}* ({pos.symbol})\n"
-            f"Вход: {pos.buy_price_bnb:.8f} BNB\n"
-            f"Сейчас: {price:.8f} BNB\n"
+            f"*{pos.name}* ({pos.symbol}) [{_label}]\n"
+            f"Вход: {pos.buy_price_bnb:.8f} {_native}\n"
+            f"Сейчас: {price:.8f} {_native}\n"
             f"P&L: {pnl_pct:+.1f}%\n"
             f"{phase}"
         )
