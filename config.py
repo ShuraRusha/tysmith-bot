@@ -172,6 +172,12 @@ BASESWAP_ROUTER_BASE  = "0x327Df1E6de05895d2ab08513aaDD9313Fe505d86"
 # BaseSwap init code hash (Uniswap V2 fork, different bytecode from UniswapV2)
 BASESWAP_INIT_CODE_HASH_BASE = "b618a2730fae167f5f8ac7bd659dd8436d571872655bcb6fd11f2158c8a64a3b"
 
+# ── Aerodrome V2 (Base) ───────────────────────────────────────────────────────
+# Enable via AERODROME_ENABLED=true; requires BASE_CHAIN_ENABLED=true
+AERODROME_ENABLED      = os.getenv("AERODROME_ENABLED", "false").lower() == "true"
+AERODROME_FACTORY_BASE = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da"
+AERODROME_ROUTER_BASE  = "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"
+
 # ── BSC contract addresses ────────────────────────────────────────────────────
 WBNB  = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
 BUSD  = "0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56"

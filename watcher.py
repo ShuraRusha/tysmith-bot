@@ -13,6 +13,9 @@ log = logging.getLogger(__name__)
 # keccak256("PairCreated(address,address,address,uint256)")
 PAIR_CREATED_TOPIC = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
 
+# keccak256("PoolCreated(address,address,bool,address,uint256)") — Aerodrome V2
+AERODROME_POOL_CREATED_TOPIC = "0x2128d88d14c80cb081c7252935b7e6a14609e6d5f8a62da55a4276cbf4ab8ea4"
+
 # Per-endpoint connection status — read by /debug command in bot.py
 # key: ws_url (first 60 chars), value: {connected, last_event_ts, events_total, reconnects, last_error}
 _ws_endpoint_status: dict[str, dict] = {}
@@ -82,8 +85,9 @@ def _ep_init(ws_url: str):
     return key
 
 
-async def _watch_single(ws_url: str, callback, factory_address: str = None, base_tokens: set = None):
-    """Connect to one WS endpoint and stream PairCreated events."""
+async def _watch_single(ws_url: str, callback, factory_address: str = None, base_tokens: set = None,
+                        event_topic: str = PAIR_CREATED_TOPIC, volatile_only: bool = False):
+    """Connect to one WS endpoint and stream PairCreated/PoolCreated events."""
     factory = factory_address or PANCAKE_FACTORY_V2
     tokens  = base_tokens or BASE_TOKENS
     backoff = 2
@@ -109,7 +113,7 @@ async def _watch_single(ws_url: str, callback, factory_address: str = None, base
                         "logs",
                         {
                             "address": factory,
-                            "topics":  [PAIR_CREATED_TOPIC],
+                            "topics":  [event_topic],
                         },
                     ],
                 }))
@@ -141,8 +145,13 @@ async def _watch_single(ws_url: str, callback, factory_address: str = None, base
 
                         log_entry = msg["params"]["result"]
                         topics    = log_entry.get("topics", [])
-                        if len(topics) < 3:
+                        min_topics = 4 if volatile_only else 3
+                        if len(topics) < min_topics:
                             continue
+                        if volatile_only:
+                            # topics[3] = stable bool; all zeros = volatile (False) = what we want
+                            if topics[3] != "0x" + "0" * 64:
+                                continue  # skip stable pools
 
                         # Verify the event is from the expected factory.
                         # Some public BSC nodes ignore the address filter in eth_subscribe
@@ -220,9 +229,11 @@ async def watch_pairs(
     factory_address: str = None,
     base_tokens: set = None,
     ws_rpcs: list = None,
+    event_topic: str = PAIR_CREATED_TOPIC,
+    volatile_only: bool = False,
 ):
     """
-    Subscribe to Uniswap V2 / PancakeSwap V2 PairCreated events.
+    Subscribe to Uniswap V2 / PancakeSwap V2 PairCreated events (or Aerodrome PoolCreated).
 
     If multiple WS endpoints are configured, connects to all in parallel
     for redundancy — first event wins (deduped).
@@ -232,7 +243,8 @@ async def watch_pairs(
     )
 
     if len(urls) == 1:
-        await _watch_single(urls[0], callback, factory_address, base_tokens)
+        await _watch_single(urls[0], callback, factory_address, base_tokens,
+                            event_topic=event_topic, volatile_only=volatile_only)
     else:
         log.info(f"Multi-WS mode: {len(urls)} endpoints for redundancy")
 
@@ -240,7 +252,8 @@ async def watch_pairs(
             await _dedup_callback(callback, new_token, base_token, pair, creation_block)
 
         tasks = [
-            asyncio.create_task(_watch_single(u, dedup_cb, factory_address, base_tokens))
+            asyncio.create_task(_watch_single(u, dedup_cb, factory_address, base_tokens,
+                                              event_topic=event_topic, volatile_only=volatile_only))
             for u in urls
         ]
         await asyncio.gather(*tasks)

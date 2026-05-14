@@ -31,8 +31,8 @@ from position import (
     Position, PositionManager,
     POSITIONS_FILE_BASE, POSITIONS_FILE_BISWAP, POSITIONS_FILE_BASESWAP,
 )
-from trader import Trader
-from watcher import watch_pairs, watch_pending_pairs, PAIR_CREATED_TOPIC, MemPoolNotSupportedError, _seen_pairs as _ws_seen_pairs, _seen_lock as _ws_seen_lock, _ws_endpoint_status
+from trader import Trader, AerodromeTrader
+from watcher import watch_pairs, watch_pending_pairs, PAIR_CREATED_TOPIC, AERODROME_POOL_CREATED_TOPIC, MemPoolNotSupportedError, _seen_pairs as _ws_seen_pairs, _seen_lock as _ws_seen_lock, _ws_endpoint_status
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,6 +133,18 @@ if config.BASESWAP_ENABLED and config.BASE_CHAIN_ENABLED and w3_base:
         native_token=config.WETH_BASE,
     )
     log.info(f"BaseSwap trader ready. Router: {config.BASESWAP_ROUTER_BASE[:10]}…")
+
+# ── Aerodrome V2 (Base) setup (optional) ──────────────────────────────────────
+trader_aerodrome = None
+if config.AERODROME_ENABLED and config.BASE_CHAIN_ENABLED and w3_base:
+    trader_aerodrome = AerodromeTrader(
+        w3_base, config.PRIVATE_KEY, config.GAS_MULTIPLIER,
+        chain_id=config.BASE_CHAIN_ID,
+        router_address=config.AERODROME_ROUTER_BASE,
+        native_token=config.WETH_BASE,
+        factory_address=config.AERODROME_FACTORY_BASE,
+    )
+    log.info(f"Aerodrome trader ready. Router: {config.AERODROME_ROUTER_BASE[:10]}…")
 
 # callback_id (first 10 chars of token address) → token info
 # cleaned up after user action (buy or skip)
@@ -904,6 +916,15 @@ if config.BASESWAP_ENABLED and trader_baseswap:
         positions_file=POSITIONS_FILE_BASESWAP,
     )
     pos_manager_baseswap.on_close = _record_trade
+
+pos_manager_aerodrome = None
+if config.AERODROME_ENABLED and trader_aerodrome:
+    _POSITIONS_FILE_AERODROME = os.path.join(DATA_DIR, "tysmith_positions_aerodrome.json")
+    pos_manager_aerodrome = PositionManager(
+        trader_aerodrome, tg_send,
+        positions_file=_POSITIONS_FILE_AERODROME,
+    )
+    pos_manager_aerodrome.on_close = _record_trade
 
 
 # ── Owner-only guard ──────────────────────────────────────────────────────────
@@ -2539,6 +2560,280 @@ async def on_baseswap_pair_found(token_address: str, base_token: str, pair_addre
             _buying_tokens.discard(token_address)
         return
 
+    await tg_send(text)
+
+
+# ── Aerodrome pair handler ────────────────────────────────────────────────────
+
+async def on_aerodrome_pair_found(token_address: str, base_token: str, pair_address: str, creation_block: int = 0):
+    """Mirror of on_base_pair_found for Aerodrome V2 (Base)."""
+    global _stats_seen, _stats_rejected, _last_seen_ts, _last_reject, _last_pair_token
+
+    if is_paused or not trader_aerodrome or not pos_manager_aerodrome:
+        return
+
+    if _is_token_duplicate(token_address, "[Aerodrome]"):
+        return
+
+    _stats_seen  += 1
+    _analytics["total_seen"] = _analytics.get("total_seen", 0) + 1
+    _last_seen_ts = time.time()
+    _last_pair_token = token_address
+    _pair_event_times.append(_last_seen_ts)
+
+    log.info(f"[Aerodrome] Analyzing: {token_address}")
+    try:
+        result = await check_token(
+            token_address, pair_address, base_token, w3_base,
+            config.MIN_LIQUIDITY_USD, config.MAX_BUY_TAX, config.MAX_SELL_TAX,
+            wallet_address=trader_aerodrome.wallet,
+            min_market_cap_usd=config.MIN_MARKET_CAP_USD,
+            min_fdv_usd=config.MIN_FDV_USD,
+            max_fdv_usd=config.MAX_FDV_USD,
+            max_top10_holder_pct=config.MAX_TOP10_HOLDER_PCT,
+            min_volume_5m_usd=config.MIN_VOLUME_5M_USD,
+            max_token_age_days=config.MAX_TOKEN_AGE_DAYS,
+            lp_holder_max_pct=config.LP_HOLDER_MAX_PCT,
+            max_deployer_lp_pct=config.MAX_DEPLOYER_LP_PCT,
+            min_holder_count=config.MIN_HOLDER_COUNT,
+            bscscan_api_key=config.BASESCAN_API_KEY,
+            max_deployer_tokens_30d=config.MAX_DEPLOYER_TOKENS_30D,
+            chain_id=config.BASE_CHAIN_ID,
+            router_address=config.AERODROME_ROUTER_BASE,
+            native_token=config.WETH_BASE,
+            stable_token=config.USDC_BASE,
+            dex_chain="base",
+            explorer_url="https://api.basescan.org/api",
+            min_token_score=config.MIN_TOKEN_SCORE,
+            min_lp_lock_pct_score=config.MIN_LP_LOCK_PCT_SCORE,
+            min_listing_age_min=config.MIN_LISTING_AGE_MIN,
+            min_buyers_score=config.MIN_BUYERS_SCORE,
+            min_deployer_age_days=config.MIN_DEPLOYER_AGE_DAYS,
+        )
+    except Exception as e:
+        log.error(f"[Aerodrome] check_token error for {token_address[:10]}…: {e}")
+        return
+
+    if not result["ok"]:
+        _stats_rejected += 1
+        _last_reject     = result["reason"]
+        _track_rejection(result["reason"])
+        sym = (result.get("info") or {}).get("symbol") or token_address[:10]
+        entry = {
+            "ts":     datetime.now(MOSCOW_TZ).strftime("%H:%M:%S"),
+            "token":  token_address,
+            "symbol": f"[Aerodrome] {sym}",
+            "reason": result["reason"],
+        }
+        _reject_log.append(entry)
+        if len(_reject_log) > _MAX_REJECT_LOG:
+            _reject_log.pop(0)
+        log.info(f"[Aerodrome] Rejected {sym}: {result['reason']}")
+
+        _rlc_aero = result["reason"].lower()
+        if any(r in _rlc_aero for r in _LIQUIDITY_REASONS) or any(r in _rlc_aero for r in _TRADING_NOT_READY_REASONS):
+            asyncio.create_task(
+                _wait_for_liquidity_and_retry(
+                    token_address, base_token, pair_address, creation_block,
+                    w3_instance=w3_base, callback=on_aerodrome_pair_found, label="Aerodrome",
+                )
+            )
+            return
+
+        _THRESHOLD_REASONS = (
+            "Ликвидность:", "FDV:", "Market cap:", "Объём за 5 мин:",
+            "Токен слишком старый", "Холдеров слишком мало",
+        )
+        if any(result["reason"].startswith(r) for r in _THRESHOLD_REASONS):
+            _nm_key = token_address.lower()
+            _nm_now = time.time()
+            if _nm_now - _near_miss_sent.get(_nm_key, 0) > _NEAR_MISS_TTL:
+                _near_miss_sent[_nm_key] = _nm_now
+                await tg_send(
+                    f"🟣 *[Aerodrome] Близко, не прошёл фильтр*\n"
+                    f"`{token_address}`\n"
+                    f"❌ {result['reason']}"
+                )
+        return
+
+    info = result["info"]
+
+    if info.get("sim_sell_skipped"):
+        log.info(f"[Aerodrome] {token_address[:10]}… — sell sim unverified, deferring notification")
+        asyncio.create_task(_wait_for_sell_sim(
+            token_address, base_token, pair_address, creation_block,
+            w3_instance=w3_base, callback=on_aerodrome_pair_found,
+        ))
+        return
+
+    # Check buyer count — track token silently until first swap appears
+    try:
+        _cur_block_a  = await asyncio.to_thread(lambda: w3_base.eth.block_number)
+        _recent_swaps = await _count_prior_buyers(pair_address, max(1, _cur_block_a - 100), _cur_block_a)
+    except Exception:
+        _recent_swaps = -1
+
+    if _recent_swaps == 0:
+        log.info(f"[Aerodrome] {token_address[:10]}… — no buyers yet, deferring notification")
+        asyncio.create_task(_wait_for_first_buyer(
+            token_address, base_token, pair_address, creation_block,
+            w3_instance=w3_base, callback=on_aerodrome_pair_found,
+        ))
+        return
+
+    eth_price  = info["bnb_price"]
+    balance    = await asyncio.to_thread(lambda: w3_base.eth.get_balance(trader_aerodrome.wallet) / 1e18)
+    buy_amount = calculate_buy_amount(balance)
+
+    if buy_amount == 0.0:
+        log.info(f"[Aerodrome] Skipping {token_address}: balance too low")
+        await _maybe_alert_low_balance(balance, "Base/Aerodrome")
+        return
+
+    warnings = info.get("extra_warnings", [])
+    if info["is_mintable"]:   warnings.append("⚠️ Mintable")
+    if info["hidden_owner"]:  warnings.append("⚠️ Hidden owner")
+    if _recent_swaps >= 1 and _recent_swaps <= 3:
+        warnings.append(f"⚠️ Всего {_recent_swaps} покупок до тебя — токен очень новый")
+
+    _collusion_a = await _check_buyer_collusion(
+        pair_address, w3_base,
+        from_block       = max(1, creation_block or (_cur_block_a - 500)),
+        to_block         = _cur_block_a,
+        deployer_address = info.get("deployer"),
+        bscscan_api_key  = config.BSCSCAN_API_KEY,
+        explorer_url     = "https://api.basescan.org/api",
+    )
+    if _collusion_a.get("suspicious"):
+        warnings.append(_collusion_a["label"])
+
+    warn_block = "\n".join(warnings) if warnings else "✅ Дополнительных угроз нет"
+
+    fdv_str = f" | FDV: ${info['fdv_usd']:,.0f}" if info.get("fdv_usd") else ""
+    text = (
+        f"🟣 *[Aerodrome] {'Подозрительные покупатели' if _collusion_a.get('suspicious') else 'Новый токен прошёл все проверки'}*\n\n"
+        f"🪙 *{info['name']}* (`{info['symbol']}`)\n"
+        f"📄 `{token_address}`\n\n"
+        f"💧 Ликвидность: *${info['liquidity_usd']:,.0f}*{fdv_str}\n"
+        f"💸 Buy tax: *{info['buy_tax']:.1f}%*  |  Sell tax: *{info['sell_tax']:.1f}%*\n"
+        f"👥 Холдеры: {info['holder_count']}\n"
+        + (
+            f"🏦 Деплоер держит: *{info['deployer_pct']:.1f}%* суплая"
+            + (" ✅" if info['deployer_pct'] <= 20 else " ⚠️ Высокая концентрация" if info['deployer_pct'] <= 50 else " 🚨 Очень высокая концентрация")
+            + "\n"
+            if info.get("deployer_pct") is not None else ""
+        )
+        + (
+            (lambda lp, lk, lo: (
+                f"🔒 LP деплоера: *{lp:.1f}%*"
+                + (f" (залочено {lk:.0f}% в {lo})" if lk and lk >= 80 else (" ⚠️ частично залочено" if lk else " 🚨 не залочено!"))
+                + "\n"
+            ))(info['deployer_lp_pct'], info.get('deployer_lp_locked_pct', 0) or 0, info.get('deployer_lp_locker'))
+            if info.get("deployer_lp_pct") is not None else ""
+        )
+        + "\n"
+        + f"{warn_block}\n\n"
+        + (
+            (lambda s: f"🏆 Рейтинг токена: *{s['score']}/{s['max_score']}* {s['grade']} ({s['pct']:.0f}%)\n")(info["token_score"])
+            if info.get("token_score") else ""
+        )
+        + f"📊 TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}% позиции  "
+        f"| Trailing: -{config.TRAILING_STOP_PCT}%  | SL: -{config.STOP_LOSS}%\n"
+        f"💰 Покупка: *{buy_amount} ETH* (~${buy_amount * eth_price:.0f}) "
+        f"| Баланс: {balance:.3f} ETH"
+    )
+
+    if is_auto:
+        max_pos = calculate_max_positions(balance)
+        if len(pos_manager_aerodrome.positions) >= max_pos:
+            log.info(f"[Aerodrome] Auto: max positions ({max_pos}) reached, skipping {info['symbol']}")
+            await tg_send(
+                f"🟣📌 *[Aerodrome] {info['symbol']}* прошёл все фильтры, но слот занят\n"
+                f"Открыто позиций: *{len(pos_manager_aerodrome.positions)}/{max_pos}*\n"
+                f"💧 Ликвидность: ${info['liquidity_usd']:,.0f}{fdv_str}\n"
+                f"`{token_address}`"
+            )
+            return
+        if token_address in pos_manager_aerodrome.positions:
+            return
+        if token_address in _buying_tokens:
+            return
+        _buying_tokens.add(token_address)
+
+        try:
+            await tg_send(
+                f"🟣⚡ *[Aerodrome] Авто-покупка* — {info['name']} (`{info['symbol']}`)\n"
+                f"💰 {buy_amount} ETH (~${buy_amount * eth_price:.0f}) | "
+                f"Ликвидность: ${info['liquidity_usd']:,.0f}\n"
+                f"{warn_block}"
+            )
+
+            approve_task    = asyncio.to_thread(trader_aerodrome.approve_token, token_address)
+            price_task      = asyncio.to_thread(trader_aerodrome.get_price, token_address, base_token)
+            approve_result, price_before = await asyncio.gather(approve_task, price_task)
+
+            if not approve_result["ok"]:
+                await tg_send(
+                    f"❌ [Aerodrome] Авто: не удалось одобрить *{info['symbol']}*\n"
+                    f"`{approve_result['reason']}`"
+                )
+                return
+
+            if not await _pre_buy_sell_check(w3_base, token_address, pair_address, info["symbol"]):
+                return
+
+            buy_result = await asyncio.to_thread(trader_aerodrome.buy, token_address, buy_amount)
+
+            if buy_result["ok"]:
+                _qty        = buy_result["tokens_received"] / 10 ** buy_result["decimals"]
+                entry_price = price_before if price_before > 0 else (
+                    buy_amount / _qty if _qty > 0 else buy_amount
+                )
+                moon_bag  = _calc_moon_bag(buy_result["tokens_received"], buy_amount, eth_price)
+                tradeable = buy_result["tokens_received"] - moon_bag
+                pos = Position(
+                    token_address     = token_address,
+                    symbol            = info["symbol"],
+                    name              = info["name"],
+                    pair_address      = pair_address,
+                    buy_price_bnb     = entry_price,
+                    tokens_amount     = tradeable,
+                    decimals          = buy_result["decimals"],
+                    buy_bnb           = buy_amount,
+                    take_profit_1     = config.TAKE_PROFIT_1,
+                    take_profit_1_pct = config.TAKE_PROFIT_1_PCT,
+                    trailing_stop_pct = config.TRAILING_STOP_PCT,
+                    stop_loss         = config.STOP_LOSS,
+                    liquidity_usd     = info["liquidity_usd"],
+                    buy_tax           = info["buy_tax"],
+                    sell_tax          = info["sell_tax"],
+                    moon_bag_tokens   = moon_bag,
+                    deployer_address  = info.get("deployer") or "",
+                    chain             = "base",
+                    buy_gas_bnb       = buy_result.get("gas_bnb", 0.0),
+                    demo              = config.DEMO_MODE,
+                )
+                pos_manager_aerodrome.add(pos)
+                _record_buy(pos, buy_result["tx_hash"])
+                amount_fmt = buy_result["tokens_received"] / 10 ** buy_result["decimals"]
+                await tg_send(
+                    f"🟣✅ *[Aerodrome] Куплено авто* — {info['symbol']}\n"
+                    f"`{token_address}`\n\n"
+                    f"Получено: {amount_fmt:.4f} {info['symbol']}\n"
+                    f"Цена входа: {entry_price:.8f} ETH\n"
+                    f"Tx: `{buy_result['tx_hash']}`\n\n"
+                    f"TP1: +{config.TAKE_PROFIT_1}% → {config.TAKE_PROFIT_1_PCT:.0f}%  "
+                    f"| SL: -{config.STOP_LOSS}%"
+                )
+            else:
+                await tg_send(
+                    f"❌ [Aerodrome] Авто: ошибка покупки *{info['symbol']}*: {buy_result['reason']}"
+                )
+        finally:
+            _buying_tokens.discard(token_address)
+        return
+
+    # Manual mode: send notification
     await tg_send(text)
 
 
@@ -4769,6 +5064,22 @@ async def main(need_polling_grace: bool = False):
         ))
         log.info(f"BaseSwap watcher started (factory={config.BASESWAP_FACTORY_BASE[:10]}…)")
 
+    if config.AERODROME_ENABLED and pos_manager_aerodrome and w3_base:
+        asyncio.create_task(_resilient_task(pos_manager_aerodrome.monitor, "pos_monitor_aerodrome"))
+        asyncio.create_task(_resilient_task(
+            lambda: watch_pairs(
+                config.BASE_WS_RPC,
+                on_aerodrome_pair_found,
+                factory_address=config.AERODROME_FACTORY_BASE,
+                base_tokens=config.BASE_TOKENS_BASE,
+                ws_rpcs=config.BASE_WS_RPCS,
+                event_topic=AERODROME_POOL_CREATED_TOPIC,
+                volatile_only=True,
+            ),
+            "watch_pairs_aerodrome",
+        ))
+        log.info(f"Aerodrome watcher started (factory={config.AERODROME_FACTORY_BASE[:10]}…)")
+
     asyncio.create_task(_lock_refresher(app))
 
     # Graceful shutdown on SIGTERM (Railway zero-downtime deploys) and SIGINT.
@@ -4790,6 +5101,8 @@ async def main(need_polling_grace: bool = False):
         pos_manager_biswap.load()
     if pos_manager_baseswap:
         pos_manager_baseswap.load()
+    if pos_manager_aerodrome:
+        pos_manager_aerodrome.load()
 
     # Clean up only true "zombie" positions on startup:
     # buy_price_bnb == 0 or tokens_amount == 0 → unmonitorable, can never trigger SL/TP.

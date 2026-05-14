@@ -7,6 +7,59 @@ from web3 import Web3
 import config
 from config import PANCAKE_ROUTER_V2, WBNB, SLIPPAGE_BUY, SLIPPAGE_SELL, TX_DEADLINE_SEC
 
+AERODROME_ROUTER_ABI = [
+    {
+        "name": "swapExactETHForTokens",
+        "type": "function",
+        "stateMutability": "payable",
+        "inputs": [
+            {"name": "amountOutMin", "type": "uint256"},
+            {"name": "routes", "type": "tuple[]", "components": [
+                {"name": "from",    "type": "address"},
+                {"name": "to",      "type": "address"},
+                {"name": "stable",  "type": "bool"},
+                {"name": "factory", "type": "address"},
+            ]},
+            {"name": "to",       "type": "address"},
+            {"name": "deadline", "type": "uint256"},
+        ],
+        "outputs": [{"name": "amounts", "type": "uint256[]"}],
+    },
+    {
+        "name": "swapExactTokensForETHSupportingFeeOnTransferTokens",
+        "type": "function",
+        "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "amountIn",     "type": "uint256"},
+            {"name": "amountOutMin", "type": "uint256"},
+            {"name": "routes", "type": "tuple[]", "components": [
+                {"name": "from",    "type": "address"},
+                {"name": "to",      "type": "address"},
+                {"name": "stable",  "type": "bool"},
+                {"name": "factory", "type": "address"},
+            ]},
+            {"name": "to",       "type": "address"},
+            {"name": "deadline", "type": "uint256"},
+        ],
+        "outputs": [{"name": "amounts", "type": "uint256[]"}],
+    },
+    {
+        "name": "getAmountsOut",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [
+            {"name": "amountIn", "type": "uint256"},
+            {"name": "routes", "type": "tuple[]", "components": [
+                {"name": "from",    "type": "address"},
+                {"name": "to",      "type": "address"},
+                {"name": "stable",  "type": "bool"},
+                {"name": "factory", "type": "address"},
+            ]},
+        ],
+        "outputs": [{"name": "amounts", "type": "uint256[]"}],
+    },
+]
+
 log = logging.getLogger(__name__)
 
 ROUTER_ABI = [
@@ -500,5 +553,337 @@ class Trader:
 
         except Exception as e:
             log.error(f"sell_escalating({token_address}): {e}")
+            self.reset_nonce()
+            return {"ok": False, "reason": str(e)}
+
+
+class AerodromeTrader(Trader):
+    """Trader for Aerodrome V2 on Base — uses Route structs instead of path[]."""
+
+    def __init__(
+        self,
+        w3: Web3,
+        private_key: str,
+        gas_multiplier: float,
+        chain_id: int = 8453,
+        router_address: str = None,
+        native_token: str = None,
+        factory_address: str = None,
+    ):
+        super().__init__(
+            w3, private_key, gas_multiplier,
+            chain_id=chain_id,
+            router_address=router_address,
+            native_token=native_token,
+        )
+        self._aero_router = w3.eth.contract(
+            address=Web3.to_checksum_address(router_address),
+            abi=AERODROME_ROUTER_ABI,
+        )
+        self._aero_factory = Web3.to_checksum_address(factory_address)
+
+    def _route(self, from_token: str, to_token: str, stable: bool = False) -> tuple:
+        return (
+            Web3.to_checksum_address(from_token),
+            Web3.to_checksum_address(to_token),
+            stable,
+            self._aero_factory,
+        )
+
+    def get_price(self, token_address: str, base: str = None) -> float:
+        """Return price of 1 unit (1e18 wei) of base_token in tokens. Synchronous."""
+        if base is None:
+            base = self.native_token
+        try:
+            amount_in = int(1e18)
+            route = self._route(base, token_address)
+            amounts = self._aero_router.functions.getAmountsOut(amount_in, [route]).call()
+            if amounts and len(amounts) >= 2 and amounts[-1] > 0:
+                return amount_in / amounts[-1]
+        except Exception as e:
+            log.debug(f"Aerodrome get_price failed: {e}")
+        return 0.0
+
+    def buy(self, token_address: str, amount_bnb: float) -> dict:
+        """
+        Buy token with ETH via Aerodrome V2 volatile pool.
+        In DEMO_MODE: simulates buy at current market price, no real tx.
+        Synchronous — call via asyncio.to_thread from async code.
+        """
+        try:
+            token_address = Web3.to_checksum_address(token_address)
+            amount_in_wei = Web3.to_wei(amount_bnb, "ether")
+            route = self._route(self.native_token, token_address)
+
+            amounts = self._aero_router.functions.getAmountsOut(amount_in_wei, [route]).call()
+            min_out = int(amounts[-1] * (1 - SLIPPAGE_BUY / 100))
+
+            if config.DEMO_MODE:
+                token    = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
+                decimals = token.functions.decimals().call()
+                virtual_tokens = amounts[-1]
+                log.info(f"[DEMO] Aerodrome Buy {token_address}: virtual {virtual_tokens / 10**decimals:.4f} tokens")
+                return {
+                    "ok":              True,
+                    "tx_hash":         f"DEMO-AERO-{token_address[:8].lower()}",
+                    "tokens_received": virtual_tokens,
+                    "decimals":        decimals,
+                    "block_number":    self.w3.eth.block_number,
+                    "gas_bnb":         0.0,
+                    "demo":            True,
+                }
+
+            deadline  = int(time.time()) + TX_DEADLINE_SEC
+            gas_price = self._gas_price_buy()
+            nonce     = self._nonce()
+
+            tx = self._aero_router.functions.swapExactETHForTokens(
+                min_out,
+                [route],
+                self.wallet,
+                deadline,
+            ).build_transaction({
+                "from":     self.wallet,
+                "value":    amount_in_wei,
+                "gas":      config.GAS_LIMIT_BUY,
+                "gasPrice": gas_price,
+                "nonce":    nonce,
+                "chainId":  self.chain_id,
+            })
+
+            signed  = self.account.sign_transaction(tx)
+            raw_tx  = getattr(signed, "rawTransaction", None) or signed.raw_transaction
+            tx_hash = self.w3.eth.send_raw_transaction(raw_tx)
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+
+            if receipt.status != 1:
+                return {"ok": False, "reason": "Транзакция отклонена сетью (status=0)"}
+
+            token    = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
+            balance  = token.functions.balanceOf(self.wallet).call()
+            decimals = token.functions.decimals().call()
+
+            gas_used_bnb = receipt.gasUsed * gas_price / 1e18
+            log.info(
+                f"[Aerodrome] Buy OK: {token_address}, received={balance}, "
+                f"gas={gas_used_bnb:.4f} ETH, tx={tx_hash.hex()}"
+            )
+            return {
+                "ok":              True,
+                "tx_hash":         tx_hash.hex(),
+                "tokens_received": balance,
+                "decimals":        decimals,
+                "block_number":    receipt.blockNumber,
+                "gas_bnb":         gas_used_bnb,
+            }
+        except Exception as e:
+            log.error(f"[Aerodrome] buy({token_address}): {e}")
+            self.reset_nonce()
+            return {"ok": False, "reason": str(e)}
+
+    def sell(self, token_address: str, amount_tokens: int, slippage_pct: float = None) -> dict:
+        """
+        Sell exact token amount back to ETH via Aerodrome V2.
+        In DEMO_MODE: simulates sell at current price, no real tx.
+        Synchronous — call via asyncio.to_thread from async code.
+        """
+        if config.DEMO_MODE:
+            log.info(f"[DEMO] Aerodrome Sell {token_address}: virtual {amount_tokens} tokens")
+            return {"ok": True, "tx_hash": f"DEMO-AERO-SELL-{token_address[:8].lower()}", "demo": True}
+
+        if slippage_pct is None:
+            slippage_pct = SLIPPAGE_SELL
+
+        try:
+            token_address = Web3.to_checksum_address(token_address)
+
+            if amount_tokens <= 0:
+                return {"ok": False, "reason": "Нет токенов для продажи"}
+
+            token = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
+            allowance = token.functions.allowance(self.wallet, self.router_address).call()
+            if allowance < amount_tokens:
+                approve_tx = token.functions.approve(
+                    self.router_address, 2 ** 256 - 1
+                ).build_transaction({
+                    "from":     self.wallet,
+                    "gas":      config.GAS_LIMIT_APPROVE,
+                    "gasPrice": self._gas_price_normal(),
+                    "nonce":    self._nonce(),
+                    "chainId":  self.chain_id,
+                })
+                signed  = self.account.sign_transaction(approve_tx)
+                raw_tx  = getattr(signed, "rawTransaction", None) or signed.raw_transaction
+                tx_hash = self.w3.eth.send_raw_transaction(raw_tx)
+                self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+                log.info(f"[Aerodrome] Approved {token_address}")
+
+            route = self._route(token_address, self.native_token)
+            amounts = self._aero_router.functions.getAmountsOut(amount_tokens, [route]).call()
+            min_out = int(amounts[-1] * (1 - slippage_pct / 100))
+
+            deadline  = int(time.time()) + TX_DEADLINE_SEC
+            gas_price = self._gas_price_normal()
+            nonce     = self._nonce()
+
+            tx = self._aero_router.functions.swapExactTokensForETHSupportingFeeOnTransferTokens(
+                amount_tokens,
+                min_out,
+                [route],
+                self.wallet,
+                deadline,
+            ).build_transaction({
+                "from":     self.wallet,
+                "gas":      config.GAS_LIMIT_SELL,
+                "gasPrice": gas_price,
+                "nonce":    nonce,
+                "chainId":  self.chain_id,
+            })
+
+            signed  = self.account.sign_transaction(tx)
+            raw_tx  = getattr(signed, "rawTransaction", None) or signed.raw_transaction
+            tx_hash = self.w3.eth.send_raw_transaction(raw_tx)
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+
+            if receipt.status != 1:
+                if slippage_pct < 49:
+                    log.warning(f"[Aerodrome] Sell status=0 at {slippage_pct}%, retrying at 49%")
+                    return self.sell(token_address, amount_tokens, slippage_pct=49)
+                return {"ok": False, "reason": f"Продажа отклонена сетью (slip={slippage_pct:.0f}%)"}
+
+            gas_sell_bnb = receipt.gasUsed * gas_price / 1e18
+            log.info(
+                f"[Aerodrome] Sell OK: {token_address}, slippage={slippage_pct}%, "
+                f"gas={gas_sell_bnb:.4f} ETH, tx={tx_hash.hex()}"
+            )
+            return {"ok": True, "tx_hash": tx_hash.hex(), "gas_bnb": gas_sell_bnb}
+
+        except Exception as e:
+            log.error(f"[Aerodrome] sell({token_address}): {e}")
+            self.reset_nonce()
+            return {"ok": False, "reason": str(e)}
+
+    def sell_escalating(self, token_address: str, amount_tokens: int) -> dict:
+        """
+        Sell with Replace-By-Fee gas escalation for Aerodrome V2.
+        In DEMO_MODE: simulates sell instantly, no real tx.
+        Synchronous — call via asyncio.to_thread from async code.
+        """
+        if config.DEMO_MODE:
+            log.info(f"[DEMO] Aerodrome sell_escalating {token_address}")
+            return {"ok": True, "tx_hash": f"DEMO-AERO-SELL-{token_address[:8].lower()}", "demo": True}
+
+        try:
+            token_address = Web3.to_checksum_address(token_address)
+
+            if amount_tokens <= 0:
+                return {"ok": False, "reason": "Нет токенов для продажи"}
+
+            token = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
+            allowance = token.functions.allowance(self.wallet, self.router_address).call()
+            if allowance < amount_tokens:
+                approve_tx = token.functions.approve(
+                    self.router_address, 2 ** 256 - 1
+                ).build_transaction({
+                    "from":     self.wallet,
+                    "gas":      config.GAS_LIMIT_APPROVE,
+                    "gasPrice": self._gas_price_buy(),
+                    "nonce":    self._nonce(),
+                    "chainId":  self.chain_id,
+                })
+                signed  = self.account.sign_transaction(approve_tx)
+                raw_tx  = getattr(signed, "rawTransaction", None) or signed.raw_transaction
+                tx_hash = self.w3.eth.send_raw_transaction(raw_tx)
+                self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+                log.info(f"[Aerodrome] Approved {token_address}")
+
+            sell_nonce = self._nonce()
+            market_gas = int(self.w3.eth.gas_price)
+            max_gas    = max(
+                Web3.to_wei(config.GAS_SELL_MAX_GWEI, "gwei"),
+                int(market_gas * 5),
+            )
+
+            schedule = [
+                (int(market_gas * 1.5),  SLIPPAGE_SELL),
+                (int(market_gas * 3.0),  min(SLIPPAGE_SELL * 2, 30.0)),
+                (max_gas,                49.0),
+            ]
+
+            route = self._route(token_address, self.native_token)
+            escalation_sec = config.GAS_SELL_ESCALATION_SEC
+            last_reason    = ""
+
+            for attempt, (gas_price, slippage) in enumerate(schedule):
+                try:
+                    amounts = self._aero_router.functions.getAmountsOut(amount_tokens, [route]).call()
+                    min_out = int(amounts[-1] * (1 - slippage / 100))
+
+                    tx = self._aero_router.functions \
+                        .swapExactTokensForETHSupportingFeeOnTransferTokens(
+                            amount_tokens,
+                            min_out,
+                            [route],
+                            self.wallet,
+                            int(time.time()) + TX_DEADLINE_SEC,
+                        ).build_transaction({
+                            "from":     self.wallet,
+                            "gas":      config.GAS_LIMIT_SELL,
+                            "gasPrice": gas_price,
+                            "nonce":    sell_nonce,
+                            "chainId":  self.chain_id,
+                        })
+
+                    signed  = self.account.sign_transaction(tx)
+                    raw_tx  = getattr(signed, "rawTransaction", None) or signed.raw_transaction
+                    tx_hash = self.w3.eth.send_raw_transaction(raw_tx)
+                    log.info(
+                        f"[Aerodrome] sell_escalating #{attempt+1}/3: {token_address}, "
+                        f"gas={gas_price/1e9:.1f}gwei, slip={slippage:.0f}%, "
+                        f"tx={tx_hash.hex()}"
+                    )
+
+                except Exception as send_err:
+                    err_msg = str(send_err).lower()
+                    if "nonce too low" in err_msg or "already known" in err_msg:
+                        log.info(f"[Aerodrome] sell_escalating #{attempt+1}: previous tx already mined")
+                        break
+                    log.warning(f"[Aerodrome] sell_escalating #{attempt+1} send error: {send_err}")
+                    last_reason = str(send_err)
+                    if attempt < 2:
+                        time.sleep(escalation_sec)
+                    continue
+
+                wait_timeout = escalation_sec if attempt < 2 else 60
+                try:
+                    receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=wait_timeout)
+                    if receipt.status == 1:
+                        gas_sell_bnb = receipt.gasUsed * gas_price / 1e18
+                        log.info(
+                            f"[Aerodrome] sell_escalating OK at attempt #{attempt+1}: "
+                            f"{token_address}, gas={gas_sell_bnb:.4f} ETH, tx={tx_hash.hex()}"
+                        )
+                        return {"ok": True, "tx_hash": tx_hash.hex(), "gas_bnb": gas_sell_bnb}
+                    else:
+                        return {
+                            "ok": False,
+                            "reason": f"Продажа отклонена контрактом (slip={slippage:.0f}%)",
+                        }
+                except Exception:
+                    if attempt < 2:
+                        log.info(
+                            f"[Aerodrome] sell_escalating #{attempt+1} timeout after "
+                            f"{wait_timeout}s — escalating gas…"
+                        )
+                    else:
+                        return {
+                            "ok": False,
+                            "reason": "Таймаут продажи после 3 попыток эскалации газа",
+                        }
+
+            return {"ok": False, "reason": last_reason or "Продажа не выполнена"}
+
+        except Exception as e:
+            log.error(f"[Aerodrome] sell_escalating({token_address}): {e}")
             self.reset_nonce()
             return {"ok": False, "reason": str(e)}
